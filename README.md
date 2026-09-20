@@ -117,6 +117,8 @@ C2 adds provider capability profiles (unknown model-specific limits remain `null
 
 The interactive TUI exposes provider-free overlays for `/tools`, `/memory`, `/usage`, `/cost`, and `/context`; tool and memory entries are bounded, searchable, and show enabled/status, permission, category, confidence, and estimated schema-cost metadata only when available.
 
+C3 adds local `/plan`, `/review [security|performance|tests]`, `/config`, `/settings`, `/keybindings`, `/verbose`, `/focus`, `/export PATH`, and `/changelog` actions. Plan mode persists the read-only permission boundary, reviews use bounded read-only git data, exports stay inside the workspace and refuse overwrite, and prompt custom commands may be declared as `[commands.NAME]` with `type = "prompt"` without invoking a shell.
+
 Runtime extensions are also controlled through typed `providers`, `permissions`, `mcp`, `lsp`, `hooks`, `skills`, `subagents`, and `status` commands. Hooks, skills, and subagents use their real runtime boundaries; MCP/LSP test commands perform bounded configured handshakes and require explicit network policy for HTTP.
 
 Terminal cancellation and timeouts kill the Unix process group, so descendants do not remain running. Background jobs have deterministic IDs, bounded concurrency, cancellation, wait/reap, and bounded output spill. PTY mode is intentionally opt-in and remains a small non-interactive boundary; full interactive terminal UX is postponed.

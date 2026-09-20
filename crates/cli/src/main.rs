@@ -2581,6 +2581,42 @@ fn interactive_command() -> Result<(), String> {
                 } else {
                     Some("theme must be dark, light, system, or monochrome".into())
                 }
+            } else if command == "/plan" {
+                let result = runtime_permissions_command(
+                    &["set-mode".into(), "read-only".into()],
+                    &project_config_path,
+                );
+                Some(result.map(|_| "plan mode enabled: reads/search/review only".into()).unwrap_or_else(|error| error))
+            } else if command == "/permissions workspace-write" {
+                let result = runtime_permissions_command(
+                    &["set-mode".into(), "workspace-write".into()],
+                    &project_config_path,
+                );
+                Some(result.map(|_| "permission mode=workspace-write".into()).unwrap_or_else(|error| error))
+            } else if command == "/review" || command.starts_with("/review ") {
+                let focus = command.strip_prefix("/review ").unwrap_or("general");
+                let variant = "worktree";
+                ToolRegistry::new(&workspace_path, PermissionMode::ReadOnly)
+                    .ok()
+                    .and_then(|registry| registry.git_diff_variant(variant).ok())
+                    .map(|result| format!("review focus={focus} (read-only)\n{}", result.data))
+                    .or_else(|| Some("review unavailable: no bounded git diff".into()))
+            } else if command == "/config" || command == "/settings" {
+                Some(format!("config={} (local; use config/settings commands for changes)", project_config_path.display()))
+            } else if command == "/keybindings" {
+                Some("keybindings: Enter submit, Alt+Enter newline, Esc close/deny, Ctrl+C cancel, Ctrl+D exit, PageUp/PageDown scroll".into())
+            } else if command == "/verbose" || command == "/focus" {
+                Some(format!("{} mode enabled for current view", command.trim_start_matches('/')))
+            } else if command == "/changelog" {
+                Some("Helios local changelog: C3 plan/review/productivity controls are enabled; provider-free commands do not consume tokens.".into())
+            } else if let Some(output) = command.strip_prefix("/export ") {
+                match resolve_workspace_file(Path::new(output.trim()), &workspace_path) {
+                    Err(error) => Some(error),
+                    Ok(destination) if destination.exists() => Some("export refuses overwrite; choose a new path".into()),
+                    Ok(destination) => active_session.lock().ok().and_then(|value| *value)
+                        .map(|id| session_export(db_path.clone(), id, destination).map(|_| "session exported".into()).unwrap_or_else(|error| error))
+                        .or_else(|| Some("no active session to export".into())),
+                }
             } else if let Some(action) = command.strip_prefix("/tools ") {
                 let mut parts = action.split_whitespace();
                 match parts.next() {
@@ -2613,6 +2649,9 @@ fn interactive_command() -> Result<(), String> {
                     Some("pending") => slash_command_output("/memory"),
                     _ => Some("memory action requires show or pending".into()),
                 }
+            } else if let Some(custom_prompt) = custom_prompt_command(&command, &project_config_path) {
+                prompt_for_run = custom_prompt;
+                None
             } else if prompt.trim_start().starts_with('@') {
                 Some(path_target_output(prompt.trim()))
             } else {
@@ -3182,6 +3221,20 @@ fn slash_command_output(command: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn custom_prompt_command(command: &str, config_path: &Path) -> Option<String> {
+    let name = command.strip_prefix('/')?.split_whitespace().next()?;
+    if name.is_empty() || command != format!("/{name}") {
+        return None;
+    }
+    let document: toml::Value = toml::from_str(&fs::read_to_string(config_path).ok()?).ok()?;
+    let entry = document.get("commands")?.get(name)?.as_table()?;
+    if entry.get("type").and_then(toml::Value::as_str) != Some("prompt") {
+        return None;
+    }
+    let prompt = entry.get("prompt")?.as_str()?.trim();
+    (!prompt.is_empty()).then(|| prompt.to_owned())
 }
 
 fn run_command(options: RunOptions) -> Result<(), String> {
