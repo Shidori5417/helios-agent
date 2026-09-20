@@ -3571,7 +3571,13 @@ fn print_command_help(path: &[String]) {
         "mcp" => ("agent-cli mcp list|add|remove|enable|disable|show|test".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
         "mcp add" => ("agent-cli mcp add ID (--command CMD | --url HTTPS_URL) [--arg ARG] [--auth-env ENV]".into(), "Only argv and secret environment-name references are accepted; literal secrets and shell strings are rejected."),
         "permissions" => ("agent-cli permissions show|set-mode|add-network-host|remove-network-host".into(), "Permission changes are atomic and feed the runtime policy."),
+        "permissions set-mode" => ("agent-cli permissions set-mode read-only|workspace-write".into(), "Changes the effective permission mode atomically."),
+        "permissions add-network-host" => ("agent-cli permissions add-network-host HOST".into(), "Adds one normalized exact host to the network allowlist."),
+        "permissions remove-network-host" => ("agent-cli permissions remove-network-host HOST".into(), "Removes one exact host from the network allowlist."),
         "permissions env-allow" => ("agent-cli permissions env-allow NAME".into(), "Environment inheritance is allowlisted; secret-like names are rejected."),
+        "permissions env-deny" => ("agent-cli permissions env-deny NAME".into(), "Adds one environment name to the deny list; secret-like names remain denied."),
+        "providers set-default" => ("agent-cli providers set-default PROVIDER".into(), "Sets the configured provider profile; credentials remain in keyring or explicit environment fallback."),
+        "completion install" => ("agent-cli completion install SHELL [--path ABSOLUTE_PATH]".into(), "Installs completion atomically at an explicit absolute path."),
         "subagents" => ("agent-cli subagents config|show|run|test".into(), "Subagents inherit permissions and use bounded scheduler budgets."),
         "subagents run" => ("agent-cli subagents run --objective TEXT [--provider fake|openai|anthropic|gemini|generic] [--scope PATH] [--session ID|latest] [--context-file PATH] [--memory-query TEXT] [--worktree --ref REF]".into(), "Selected context is bounded; worktree results are never auto-applied to the parent tree."),
         "jobs" => ("agent-cli jobs start|list|status|logs|cancel|wait|reap".into(), "Jobs use explicit argv, bounded logs, process-group cleanup, and workspace ownership checks."),
@@ -3579,9 +3585,33 @@ fn print_command_help(path: &[String]) {
         "tui" => ("agent-cli tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
         "perf run" => ("agent-cli perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
         "status" => ("agent-cli status [--json]".into(), "Shows bounded aggregate state without secret values."),
-        _ => (format!("agent-cli {key} --help"), "See the command family help for available actions and required identifiers."),
+        _ => (generated_help_usage(path), "This action uses exact identifiers and bounded typed options; see the command family for available values."),
     };
     println!("Usage: {usage}\n\n{body}");
+}
+
+fn generated_help_usage(path: &[String]) -> String {
+    let base = format!("agent-cli {}", path.join(" "));
+    let action = path.get(1).map(String::as_str);
+    let suffix = match action {
+        Some("list" | "show" | "status" | "version" | "path" | "validate" | "keys") => "",
+        Some("get") => " KEY",
+        Some("set" | "unset" | "set-default") => " KEY VALUE",
+        Some(
+            "add" | "enable" | "disable" | "revoke" | "remove" | "archive" | "unarchive" | "delete"
+            | "cancel" | "wait" | "logs",
+        ) => " ID [OPTIONS]",
+        Some("generate") => " SHELL",
+        Some("install") => " [OPTIONS]",
+        Some("login" | "logout") => " PROVIDER [OPTIONS]",
+        Some("test") => " ID [OPTIONS]",
+        Some(
+            "run" | "start" | "update" | "restore" | "backup" | "export" | "import" | "verify"
+            | "reset" | "compare" | "create",
+        ) => " [OPTIONS]",
+        _ => " [OPTIONS]",
+    };
+    format!("{base}{suffix}")
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
