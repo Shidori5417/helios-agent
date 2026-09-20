@@ -49,10 +49,14 @@ Avoid a runtime Node/Python dependency for the core binary. MCP servers/plugins 
 Follow XDG:
 
 ```text
-$XDG_CONFIG_HOME/<agent>/config.toml
-$XDG_DATA_HOME/<agent>/state.db
-$XDG_CACHE_HOME/<agent>/...
-$XDG_STATE_HOME/<agent>/logs/
+$XDG_CONFIG_HOME/helios/config.toml
+$XDG_DATA_HOME/helios/state.db
+$XDG_CACHE_HOME/helios/...
+$XDG_STATE_HOME/helios/logs/
+
+Project configuration is stored in `.helios/config.toml`. The former
+`.agent/config.toml` path is read for migration compatibility but is never
+overwritten automatically.
 ```
 
 Do not scatter state across `$HOME` unnecessarily.

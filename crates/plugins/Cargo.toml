@@ -13,3 +13,4 @@ agent-terminal = { path = "../terminal" }
 ed25519-dalek.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+agent-paths = { path = "../paths" }

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "agent-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "helios"
+path = "src/bin/helios.rs"
+
 [dependencies]
 agent-context = { path = "../context" }
 agent-core = { path = "../core" }
@@ -22,6 +30,7 @@ agent-terminal = { path = "../terminal" }
 agent-lsp = { path = "../lsp" }
 agent-skills = { path = "../skills" }
 agent-subagents = { path = "../subagents" }
+agent-paths = { path = "../paths" }
 serde_json.workspace = true
 serde.workspace = true
 rusqlite.workspace = true

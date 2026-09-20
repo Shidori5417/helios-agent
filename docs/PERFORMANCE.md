@@ -1,6 +1,6 @@
 # Performance evidence
 
-`agent-perf` measures release-binary process wall time and Linux peak RSS without making model or network calls. It also runs the deterministic offline benchmark when a suite is supplied.
+`agent-perf` measures the `helios` release-binary process wall time and Linux peak RSS without making model or network calls. It also runs the deterministic offline benchmark when a suite is supplied.
 
 Run the bounded manual harness with:
 
@@ -8,7 +8,7 @@ Run the bounded manual harness with:
 scripts/run-perf.sh
 ```
 
-Useful overrides are `AGENT_PERF_RUNS`, `AGENT_CLI_BINARY`, and `AGENT_PERF_REPORT`. The JSON report contains environment/toolchain metadata, all startup samples, p50/p95 startup time, short fake-session wall time and optional peak RSS. Benchmark reports additionally include task-level validation-child peak RSS and aggregate maximum/p95 RSS, plus benchmark p50/p95, token estimates, tool calls, diff bytes and regressions. Unsupported RSS platforms use `null`; they are never reported as zero.
+Useful overrides are `AGENT_PERF_RUNS`, `HELIOS_BINARY`, and `AGENT_PERF_REPORT`. The JSON report contains environment/toolchain metadata, all startup samples, p50/p95 startup time, short fake-session wall time and optional peak RSS. Benchmark reports additionally include task-level validation-child peak RSS and aggregate maximum/p95 RSS, plus benchmark p50/p95, token estimates, tool calls, diff bytes and regressions. Unsupported RSS platforms use `null`; they are never reported as zero.
 
 ## Reference smoke measurement
 

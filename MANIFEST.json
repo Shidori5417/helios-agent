@@ -410,5 +410,17 @@
   {
     "path": "docs/CLI_RUNTIME_CONTROL.md",
     "bytes": 745
+  },
+  {
+    "path": "crates/paths/Cargo.toml",
+    "bytes": 149
+  },
+  {
+    "path": "crates/paths/src/lib.rs",
+    "bytes": 5821
+  },
+  {
+    "path": "crates/cli/src/bin/helios.rs",
+    "bytes": 173
   }
 ]

@@ -631,6 +631,10 @@ pub struct PluginRegistry {
     plugins: Vec<Plugin>,
 }
 
+pub fn default_plugin_root(paths: &agent_paths::AppPaths) -> &Path {
+    &paths.plugins_dir
+}
+
 impl PluginRegistry {
     pub fn discover(root: impl AsRef<Path>) -> Result<Self, PluginError> {
         let mut plugins = Vec::new();

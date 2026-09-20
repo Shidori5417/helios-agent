@@ -4,12 +4,12 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
-binary="${AGENT_CLI_BINARY:-$root_dir/target/release/agent-cli}"
+binary="${HELIOS_BINARY:-$root_dir/target/release/helios}"
 runs="${AGENT_PERF_RUNS:-10}"
 report="${AGENT_PERF_REPORT:-/tmp/agent-perf.json}"
 
 if [[ ! -x "$binary" ]]; then
-  cargo build --release -p agent-cli
+  cargo build --release -p agent-cli --bin helios
 fi
 
 cargo run --release -p agent-perf -- \

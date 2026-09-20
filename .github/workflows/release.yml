@@ -20,30 +20,30 @@ jobs:
       - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - run: |
           mkdir -p dist
-          install -Dm755 target/x86_64-unknown-linux-gnu/release/agent-cli dist/agent-cli-x86_64-unknown-linux-gnu
-          sha256sum dist/agent-cli-x86_64-unknown-linux-gnu > dist/SHA256SUMS
+          install -Dm755 target/x86_64-unknown-linux-gnu/release/helios dist/helios-x86_64-unknown-linux-gnu
+          sha256sum dist/helios-x86_64-unknown-linux-gnu > dist/SHA256SUMS
       - name: Generate SPDX SBOM
         uses: anchore/sbom-action@v0.24.0
         with:
-          path: dist/agent-cli-x86_64-unknown-linux-gnu
+          path: dist/helios-x86_64-unknown-linux-gnu
           format: spdx-json
-          output-file: dist/agent-cli-x86_64-unknown-linux-gnu.spdx.json
-          artifact-name: agent-cli-linux-x86_64-sbom
+          output-file: dist/helios-x86_64-unknown-linux-gnu.spdx.json
+          artifact-name: helios-linux-x86_64-sbom
       - name: Install cosign
         uses: sigstore/cosign-installer@v4.1.0
       - name: Sign artifact with GitHub OIDC
         run: |
           cosign sign-blob --yes \
-            --bundle dist/agent-cli-x86_64-unknown-linux-gnu.bundle \
-            dist/agent-cli-x86_64-unknown-linux-gnu
+            --bundle dist/helios-x86_64-unknown-linux-gnu.bundle \
+            dist/helios-x86_64-unknown-linux-gnu
       - name: Verify keyless signature in CI
         run: |
           cosign verify-blob \
-            --bundle dist/agent-cli-x86_64-unknown-linux-gnu.bundle \
+            --bundle dist/helios-x86_64-unknown-linux-gnu.bundle \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp 'https://github.com/.+/.github/workflows/release.yml@.*' \
-            dist/agent-cli-x86_64-unknown-linux-gnu
+            dist/helios-x86_64-unknown-linux-gnu
       - uses: actions/upload-artifact@v4
         with:
-          name: agent-cli-linux-x86_64
+          name: helios-linux-x86_64
           path: dist/

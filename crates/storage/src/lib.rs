@@ -53,6 +53,14 @@ pub struct Database {
 }
 
 impl Database {
+    pub fn open_paths(paths: &agent_paths::AppPaths) -> SqlResult<Self> {
+        if let Some(parent) = paths.db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
+        Self::open(&paths.db_path)
+    }
+
     pub fn open(path: impl AsRef<Path>) -> SqlResult<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;

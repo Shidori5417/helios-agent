@@ -86,7 +86,7 @@ pub fn run_full_report(
             .status()
             .map_err(|e| PerfError::Command(e.to_string()))?;
         if !status.success() {
-            return Err(PerfError::Command("agent-cli --help failed".into()));
+            return Err(PerfError::Command("helios --help failed".into()));
         }
         samples.push(started.elapsed().as_millis());
     }
@@ -202,7 +202,7 @@ pub fn run_report(binary: &Path, runs: usize) -> Result<PerfReport, PerfError> {
             .output()
             .map_err(|error| PerfError::Command(error.to_string()))?;
         if !status.status.success() {
-            return Err(PerfError::Command("agent-cli --help failed".into()));
+            return Err(PerfError::Command("helios --help failed".into()));
         }
         samples.push(started.elapsed().as_millis());
     }

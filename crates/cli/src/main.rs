@@ -8,6 +8,7 @@ use agent_mcp::{
     load_config as load_mcp_config, normalize_host, HostAllowlist, McpClient, PermissionPolicy,
 };
 use agent_memory::{MemoryEntry, MemoryStore, SqliteMemoryStore};
+use agent_paths::AppPaths;
 use agent_plugins::{
     fetch_registry_manifest, install_from_registry, load_signed_registry, load_trust_store,
     uninstall_exact, verify_registry_entry, verify_signed_registry, TrustStore,
@@ -43,6 +44,11 @@ use std::{
     time::Duration,
 };
 use zeroize::Zeroizing;
+
+thread_local! {
+    static WORKSPACE_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -170,7 +176,7 @@ async fn main() -> ExitCode {
     }
 }
 fn fail(error: String) -> ExitCode {
-    eprintln!("agent error: {error}");
+    eprintln!("helios error: {error}");
     ExitCode::from(1)
 }
 
@@ -658,6 +664,7 @@ enum RuntimeCommand {
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigCommand {
     List,
+    Sources,
     Get { key: String },
     Set { key: String, value: String },
     Unset { key: String },
@@ -784,6 +791,7 @@ struct RunOptions {
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
+    let args = extract_workspace_flag(args)?;
     if args.is_empty() || args[0] == "run" {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(if args.is_empty() {
@@ -868,10 +876,36 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
     }
 }
 
+fn extract_workspace_flag(args: Vec<String>) -> Result<Vec<String>, String> {
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--workspace" {
+            let value = args.get(index + 1).ok_or("--workspace requires a path")?;
+            if value.starts_with('-') {
+                return Err("--workspace requires a path".into());
+            }
+            let path = PathBuf::from(value)
+                .canonicalize()
+                .map_err(|error| format!("invalid --workspace: {error}"))?;
+            if !path.is_dir() {
+                return Err("--workspace must point to a directory".into());
+            }
+            WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(path));
+            index += 2;
+            continue;
+        }
+        filtered.push(args[index].clone());
+        index += 1;
+    }
+    Ok(filtered)
+}
+
 fn parse_config_command(args: &[String]) -> Result<Command, String> {
     let action = args.first().map(String::as_str).unwrap_or("list");
     let command = match action {
         "list" => ConfigCommand::List,
+        "sources" => ConfigCommand::Sources,
         "get" => ConfigCommand::Get {
             key: value_after(&args[1..], "--key")?
                 .or_else(|| args.get(1).cloned())
@@ -1173,7 +1207,7 @@ fn parse_self_command(args: &[String]) -> Result<Command, String> {
 }
 
 fn default_trust_path() -> Result<PathBuf, String> {
-    Ok(workspace_root()?.join(".agent/trust-store.json"))
+    Ok(app_paths()?.trust_store)
 }
 
 fn trust_path(args: &[String]) -> Result<PathBuf, String> {
@@ -1217,7 +1251,7 @@ fn parse_trust_command(args: &[String]) -> Result<Command, String> {
 
 fn parse_registry_command(args: &[String]) -> Result<Command, String> {
     let action = args.first().map(String::as_str).unwrap_or("status");
-    let state = workspace_root()?.join(".agent/registry-state.json");
+    let state = app_paths()?.registry_state;
     match action {
         "status" => Ok(Command::Registry(RegistryCommand::Status {
             path: state,
@@ -1442,9 +1476,7 @@ fn path_option(args: &[String], name: &str) -> Result<PathBuf, String> {
         .unwrap_or(default_db_path()?))
 }
 fn default_db_path() -> Result<PathBuf, String> {
-    Ok(env::current_dir()
-        .map_err(|error| error.to_string())?
-        .join(".agent/state.db"))
+    Ok(app_paths()?.db_path)
 }
 
 fn run_command(mut options: RunOptions) -> Result<(), String> {
@@ -1457,10 +1489,13 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let config_path = options
         .config
-        .clone()
-        .unwrap_or_else(|| workspace.join(".agent/config.toml"));
+        .as_deref()
+        .map(|path| resolve_workspace_file(path, &workspace))
+        .transpose()?
+        .unwrap_or_else(|| workspace.join(".helios/config.toml"));
     let configured = load_user_config(&config_path)?;
-    let runtime_policy = load_runtime_policy(&config_path)?;
+    let runtime_config_path = effective_config_path(&config_path)?;
+    let runtime_policy = load_runtime_policy(&runtime_config_path)?;
     let permission_mode = runtime_policy.mode;
     if !options.provider_explicit {
         if let Some(provider) = configured.provider {
@@ -1516,7 +1551,7 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
             Vec::new(),
         )
     };
-    let config_path = config_path.is_file().then_some(config_path);
+    let config_path = runtime_config_path.is_file().then_some(runtime_config_path);
     let mut servers = config_path
         .as_ref()
         .map(|path| load_mcp_config(path, &workspace))
@@ -2144,7 +2179,7 @@ fn database_command(command: DatabaseCommand) -> Result<(), String> {
             {
                 return Err("source database failed integrity/schema validation".into());
             }
-            let target = current_workspace()?.join(".agent/state.db");
+            let target = app_paths()?.db_path;
             if input.canonicalize().ok() == target.canonicalize().ok() {
                 return Err("restore input must differ from active database".into());
             }
@@ -2223,7 +2258,9 @@ struct JobMeta {
 }
 
 fn jobs_dir(workspace: &Path) -> PathBuf {
-    workspace.join(".agent/jobs")
+    AppPaths::discover(workspace)
+        .map(|paths| paths.jobs_dir)
+        .unwrap_or_else(|_| workspace.join(".helios/jobs"))
 }
 fn job_path(workspace: &Path, id: &str) -> PathBuf {
     jobs_dir(workspace).join(format!("{id}.json"))
@@ -2508,8 +2545,11 @@ fn run_job_supervisor(args: &[String]) -> Result<(), String> {
 }
 
 fn report_path(workspace: &Path, kind: &str, explicit: Option<PathBuf>) -> Result<PathBuf, String> {
-    let path = explicit
-        .unwrap_or_else(|| workspace.join(format!(".agent/reports/{kind}-{}.json", job_id())));
+    let path = explicit.unwrap_or_else(|| {
+        app_paths()
+            .map(|paths| paths.reports_dir.join(format!("{kind}-{}.json", job_id())))
+            .unwrap_or_else(|_| workspace.join(format!(".helios/reports/{kind}-{}.json", job_id())))
+    });
     if path.exists() {
         return Err("report output already exists; choose another path".into());
     }
@@ -3333,7 +3373,7 @@ fn plugins_command(command: PluginCommand) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     match command {
         PluginCommand::List => {
-            let registry = PluginRegistry::discover(workspace.join(".agent/plugins"))
+            let registry = PluginRegistry::discover(plugin_root(&workspace))
                 .map_err(|error| error.to_string())?;
             for plugin in registry.plugins() {
                 println!(
@@ -3348,7 +3388,7 @@ fn plugins_command(command: PluginCommand) -> Result<(), String> {
             id,
         } => {
             let trust = load_trust_store(&trust_store).map_err(|error| error.to_string())?;
-            let state = workspace.join(".agent/registry-state.json");
+            let state = app_paths()?.registry_state;
             let index = load_signed_registry(&registry, &trust, state)
                 .map_err(|error| error.to_string())?;
             let entry = index
@@ -3415,7 +3455,7 @@ fn load_runtime_hooks(
     env_allow: &[String],
     env_deny: &[String],
 ) -> Result<Option<Box<dyn HookRunner>>, String> {
-    let plugins_root = workspace.join(".agent/plugins");
+    let plugins_root = plugin_root(workspace);
     if !plugins_root.is_dir() {
         return Ok(None);
     }
@@ -3520,10 +3560,10 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:");
+    println!("helios [run|exec] [OPTIONS] [PROMPT]\n\nCommands:");
     for line in [
         "  init",
-        "  config",
+        "  config (list|get|set|unset|sources|path|validate)",
         "  auth",
         "  doctor",
         "  completion",
@@ -3556,42 +3596,42 @@ fn print_help() {
     ] {
         println!("{line}");
     }
-    println!("\nGlobal options: --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui\nUse `agent-cli COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
+    println!("\nGlobal options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui\nUse `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
 }
 
 fn print_command_help(path: &[String]) {
     let key = path.join(" ");
     let (usage, body) = match key.as_str() {
-        "run" => ("agent-cli run [OPTIONS] PROMPT".into(), "Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config."),
-        "auth" => ("agent-cli auth status|login|logout PROVIDER [--token-stdin]".into(), "login uses hidden TTY input or explicit non-TTY --token-stdin; token values are never arguments or output."),
-        "auth login" => ("agent-cli auth login PROVIDER [--token-stdin]".into(), "Stores the token in the OS keyring; plaintext fallback is refused."),
-        "self" => ("agent-cli self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
-        "self install" => ("agent-cli self install [--prefix PATH] [--name NAME] [--compat-agent-cli]".into(), "Default prefix is ~/.local; installation is atomic and creates an identity marker."),
-        "self update" => ("agent-cli self update --from PATH --sha256 HEX".into(), "Local update requires an exact SHA-256; release update additionally requires external cosign verification."),
-        "mcp" => ("agent-cli mcp list|add|remove|enable|disable|show|test".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
-        "mcp add" => ("agent-cli mcp add ID (--command CMD | --url HTTPS_URL) [--arg ARG] [--auth-env ENV]".into(), "Only argv and secret environment-name references are accepted; literal secrets and shell strings are rejected."),
-        "permissions" => ("agent-cli permissions show|set-mode|add-network-host|remove-network-host".into(), "Permission changes are atomic and feed the runtime policy."),
-        "permissions set-mode" => ("agent-cli permissions set-mode read-only|workspace-write".into(), "Changes the effective permission mode atomically."),
-        "permissions add-network-host" => ("agent-cli permissions add-network-host HOST".into(), "Adds one normalized exact host to the network allowlist."),
-        "permissions remove-network-host" => ("agent-cli permissions remove-network-host HOST".into(), "Removes one exact host from the network allowlist."),
-        "permissions env-allow" => ("agent-cli permissions env-allow NAME".into(), "Environment inheritance is allowlisted; secret-like names are rejected."),
-        "permissions env-deny" => ("agent-cli permissions env-deny NAME".into(), "Adds one environment name to the deny list; secret-like names remain denied."),
-        "providers set-default" => ("agent-cli providers set-default PROVIDER".into(), "Sets the configured provider profile; credentials remain in keyring or explicit environment fallback."),
-        "completion install" => ("agent-cli completion install SHELL [--path ABSOLUTE_PATH]".into(), "Installs completion atomically at an explicit absolute path."),
-        "subagents" => ("agent-cli subagents config|show|run|test".into(), "Subagents inherit permissions and use bounded scheduler budgets."),
-        "subagents run" => ("agent-cli subagents run --objective TEXT [--provider fake|openai|anthropic|gemini|generic] [--scope PATH] [--session ID|latest] [--context-file PATH] [--memory-query TEXT] [--worktree --ref REF]".into(), "Selected context is bounded; worktree results are never auto-applied to the parent tree."),
-        "jobs" => ("agent-cli jobs start|list|status|logs|cancel|wait|reap".into(), "Jobs use explicit argv, bounded logs, process-group cleanup, and workspace ownership checks."),
-        "jobs start" => ("agent-cli jobs start -- COMMAND ARGS...".into(), "Shell interpolation is not used; secret-like arguments are rejected."),
-        "tui" => ("agent-cli tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
-        "perf run" => ("agent-cli perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
-        "status" => ("agent-cli status [--json]".into(), "Shows bounded aggregate state without secret values."),
+        "run" => ("helios run [OPTIONS] PROMPT".into(), "Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config."),
+        "auth" => ("helios auth status|login|logout PROVIDER [--token-stdin]".into(), "login uses hidden TTY input or explicit non-TTY --token-stdin; token values are never arguments or output."),
+        "auth login" => ("helios auth login PROVIDER [--token-stdin]".into(), "Stores the token in the OS keyring; plaintext fallback is refused."),
+        "self" => ("helios self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
+        "self install" => ("helios self install [--prefix PATH] [--name NAME] [--compat-agent-cli]".into(), "Default prefix is ~/.local; installation is atomic and creates an identity marker."),
+        "self update" => ("helios self update --from PATH --sha256 HEX".into(), "Local update requires an exact SHA-256; release update additionally requires external cosign verification."),
+        "mcp" => ("helios mcp list|add|remove|enable|disable|show|test".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
+        "mcp add" => ("helios mcp add ID (--command CMD | --url HTTPS_URL) [--arg ARG] [--auth-env ENV]".into(), "Only argv and secret environment-name references are accepted; literal secrets and shell strings are rejected."),
+        "permissions" => ("helios permissions show|set-mode|add-network-host|remove-network-host".into(), "Permission changes are atomic and feed the runtime policy."),
+        "permissions set-mode" => ("helios permissions set-mode read-only|workspace-write".into(), "Changes the effective permission mode atomically."),
+        "permissions add-network-host" => ("helios permissions add-network-host HOST".into(), "Adds one normalized exact host to the network allowlist."),
+        "permissions remove-network-host" => ("helios permissions remove-network-host HOST".into(), "Removes one exact host from the network allowlist."),
+        "permissions env-allow" => ("helios permissions env-allow NAME".into(), "Environment inheritance is allowlisted; secret-like names are rejected."),
+        "permissions env-deny" => ("helios permissions env-deny NAME".into(), "Adds one environment name to the deny list; secret-like names remain denied."),
+        "providers set-default" => ("helios providers set-default PROVIDER".into(), "Sets the configured provider profile; credentials remain in keyring or explicit environment fallback."),
+        "completion install" => ("helios completion install SHELL [--path ABSOLUTE_PATH]".into(), "Installs completion atomically at an explicit absolute path."),
+        "subagents" => ("helios subagents config|show|run|test".into(), "Subagents inherit permissions and use bounded scheduler budgets."),
+        "subagents run" => ("helios subagents run --objective TEXT [--provider fake|openai|anthropic|gemini|generic] [--scope PATH] [--session ID|latest] [--context-file PATH] [--memory-query TEXT] [--worktree --ref REF]".into(), "Selected context is bounded; worktree results are never auto-applied to the parent tree."),
+        "jobs" => ("helios jobs start|list|status|logs|cancel|wait|reap".into(), "Jobs use explicit argv, bounded logs, process-group cleanup, and workspace ownership checks."),
+        "jobs start" => ("helios jobs start -- COMMAND ARGS...".into(), "Shell interpolation is not used; secret-like arguments are rejected."),
+        "tui" => ("helios tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
+        "perf run" => ("helios perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
+        "status" => ("helios status [--json]".into(), "Shows bounded aggregate state without secret values."),
         _ => (generated_help_usage(path), "Arguments are typed and bounded; values are validated before mutation, and secrets are never displayed."),
     };
     println!("Usage: {usage}\n\n{body}");
 }
 
 fn generated_help_usage(path: &[String]) -> String {
-    let base = format!("agent-cli {}", path.join(" "));
+    let base = format!("helios {}", path.join(" "));
     let action = path.get(1).map(String::as_str);
     let suffix = match action {
         Some("list" | "show" | "status" | "version" | "path" | "validate" | "keys") => "",
@@ -3616,21 +3656,69 @@ fn generated_help_usage(path: &[String]) -> String {
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
+    if let Some(path) = WORKSPACE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Ok(path);
+    }
     env::current_dir()
         .map_err(|error| error.to_string())?
         .canonicalize()
         .map_err(|error| error.to_string())
 }
 
+fn app_paths() -> Result<AppPaths, String> {
+    AppPaths::discover(workspace_root()?).map_err(|error| error.to_string())
+}
+
+fn plugin_root(workspace: &Path) -> PathBuf {
+    AppPaths::discover(workspace)
+        .map(|paths| {
+            let primary = agent_plugins::default_plugin_root(&paths).to_path_buf();
+            if primary.exists() {
+                primary
+            } else if paths.legacy_project_dir.join("plugins").exists() {
+                paths.legacy_project_dir.join("plugins")
+            } else {
+                paths.plugins_dir
+            }
+        })
+        .unwrap_or_else(|_| workspace.join(".helios/plugins"))
+}
+
+fn resolve_workspace_file(path: &Path, workspace: &Path) -> Result<PathBuf, String> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    let parent = candidate
+        .parent()
+        .ok_or("invalid workspace path")?
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let resolved = parent.join(candidate.file_name().ok_or("invalid workspace path")?);
+    if !resolved.starts_with(workspace) {
+        return Err("path escapes workspace".into());
+    }
+    Ok(resolved)
+}
+
+fn effective_config_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(app_paths()?.effective_project_config().to_path_buf())
+}
+
 fn config_path() -> Result<PathBuf, String> {
-    Ok(workspace_root()?.join(".agent/config.toml"))
+    Ok(app_paths()?.project_config)
 }
 
 fn init_command(force: bool) -> Result<(), String> {
+    app_paths()?.ensure_dirs().map_err(|e| e.to_string())?;
     let path = config_path()?;
     fs::create_dir_all(path.parent().ok_or("invalid config path")?).map_err(|e| e.to_string())?;
     if path.exists() && !force {
-        return Err(".agent/config.toml already exists; use --force to overwrite".into());
+        return Err(".helios/config.toml already exists; use --force to overwrite".into());
     }
     atomic_write(&path, b"# Helios Agent workspace configuration\n")?;
     println!("{}", path.display());
@@ -3642,11 +3730,40 @@ fn valid_config_key(key: &str) -> bool {
 }
 
 fn load_user_config(path: &Path) -> Result<UserConfig, String> {
-    if !path.exists() {
-        return Ok(UserConfig::default());
+    let mut config = UserConfig::default();
+    let mut candidates = Vec::new();
+    if let Ok(paths) = app_paths() {
+        candidates.push(paths.global_config);
+        candidates.push(paths.legacy_config);
     }
-    toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("invalid config: {e}"))
+    candidates.push(path.to_path_buf());
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let next: UserConfig =
+            toml::from_str(&fs::read_to_string(&candidate).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("invalid config: {e}"))?;
+        if next.provider.is_some() {
+            config.provider = next.provider;
+        }
+        if next.model.is_some() {
+            config.model = next.model;
+        }
+        if next.base_url.is_some() {
+            config.base_url = next.base_url;
+        }
+    }
+    if let Some(value) = env::var_os("HELIOS_PROVIDER") {
+        config.provider = Some(value.to_string_lossy().into_owned());
+    }
+    if let Some(value) = env::var_os("HELIOS_MODEL") {
+        config.model = Some(value.to_string_lossy().into_owned());
+    }
+    if let Some(value) = env::var_os("HELIOS_BASE_URL") {
+        config.base_url = Some(value.to_string_lossy().into_owned());
+    }
+    Ok(config)
 }
 
 fn load_runtime_policy(path: &Path) -> Result<RuntimePolicy, String> {
@@ -3717,6 +3834,13 @@ fn config_command(command: ConfigCommand) -> Result<(), String> {
                 toml::to_string_pretty(&config).map_err(|e| e.to_string())?
             );
         }
+        ConfigCommand::Sources => {
+            let paths = app_paths()?;
+            for key in ["provider", "model", "base_url"] {
+                let source = config_source(key, &path, &paths);
+                println!("{key}\t{source}");
+            }
+        }
         ConfigCommand::Get { key } => {
             if !valid_config_key(&key) {
                 return Err(format!("unknown config key: {key}"));
@@ -3765,6 +3889,35 @@ fn config_command(command: ConfigCommand) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn config_source(key: &str, project: &Path, paths: &AppPaths) -> &'static str {
+    let env_name = match key {
+        "provider" => "HELIOS_PROVIDER",
+        "model" => "HELIOS_MODEL",
+        "base_url" => "HELIOS_BASE_URL",
+        _ => return "unknown",
+    };
+    if env::var_os(env_name).is_some() {
+        return "environment";
+    }
+    let contains_key = |path: &Path| -> bool {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+            .and_then(|value| value.get(key).cloned())
+            .is_some()
+    };
+    if contains_key(project) {
+        return "project";
+    }
+    if contains_key(&paths.legacy_config) {
+        return "legacy-project";
+    }
+    if contains_key(&paths.global_config) {
+        return "global";
+    }
+    "default"
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -3922,7 +4075,7 @@ fn auth_command(command: AuthCommand) -> Result<(), String> {
 
 fn doctor_command() -> Result<(), String> {
     let workspace = workspace_root()?;
-    println!("binary=agent-cli version=0.1.0");
+    println!("binary=helios version=0.1.0 compatibility=agent-cli");
     println!("workspace={}", workspace.display());
     println!("config={}", config_path()?.display());
     println!("config_valid={}", load_user_config(&config_path()?).is_ok());
@@ -3930,7 +4083,7 @@ fn doctor_command() -> Result<(), String> {
         "keyring_available={}",
         !KeyringSecretStore.get("openai").is_err()
     );
-    println!("db_present={}", workspace.join(".agent/state.db").is_file());
+    println!("db_present={}", app_paths()?.db_path.is_file());
     for command in ["git", "rg"] {
         println!("{command}_available={}", command_available(command));
     }
@@ -3958,9 +4111,9 @@ fn completion_command(command: CompletionCommand) -> Result<(), String> {
         CompletionCommand::Generate { .. } => print!("{source}"),
         CompletionCommand::Install { path, .. } => {
             let target = path.unwrap_or_else(|| match shell.as_str() {
-                "bash" => PathBuf::from("~/.local/share/bash-completion/completions/agent-cli"),
-                "zsh" => PathBuf::from("~/.zfunc/_agent-cli"),
-                _ => PathBuf::from("~/.config/fish/completions/agent-cli.fish"),
+                "bash" => PathBuf::from("~/.local/share/bash-completion/completions/helios"),
+                "zsh" => PathBuf::from("~/.zfunc/_helios"),
+                _ => PathBuf::from("~/.config/fish/completions/helios.fish"),
             });
             if target.to_string_lossy().starts_with("~") {
                 return Err("completion install requires an explicit absolute --path".into());
@@ -3986,7 +4139,8 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
             .then(|| fs::read_to_string(&config).ok())
             .flatten()
             .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
-        let db_path = workspace.join(".agent/state.db");
+        let paths = AppPaths::discover(&workspace).map_err(|e| e.to_string())?;
+        let db_path = paths.db_path.clone();
         let sessions = if db_path.is_file() {
             agent_storage::Database::open(&db_path)
                 .ok()
@@ -4028,7 +4182,7 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
             })
             .map(|name| std::env::var_os(name).is_some())
             .unwrap_or(false);
-        let reports = workspace.join(".agent/reports");
+        let reports = paths.reports_dir.clone();
         let latest_report = fs::read_dir(&reports)
             .ok()
             .and_then(|entries| {
@@ -4043,7 +4197,7 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
             "workspace": workspace.display().to_string(),
             "config": config.display().to_string(),
             "config_valid": load_user_config(&config).is_ok(),
-            "db_present": workspace.join(".agent/state.db").is_file(),
+            "db_present": db_path.is_file(),
             "provider_default": provider,
             "provider_model": config_value.as_ref().and_then(|value| value.get("model")).and_then(toml::Value::as_str),
             "auth_source": if provider_env { "env" } else { "absent" },
@@ -4051,12 +4205,12 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
             "network_hosts": config_value.as_ref().and_then(|value| value.get("permissions")).and_then(|value| value.get("allowed_network_hosts")).and_then(toml::Value::as_array).map_or(0, Vec::len),
             "secret_values_included": false,
             "sessions": {"active": sessions.iter().filter(|session| !session.archived && session.deleted_at.is_none()).count(), "archived": sessions.iter().filter(|session| session.archived).count(), "total": sessions.len()},
-            "jobs": {"entries": count_dirs(&workspace.join(".agent/jobs"))},
+            "jobs": {"entries": count_dirs(&paths.jobs_dir)},
             "mcp": {"configured": mcp_count, "enabled": mcp_count},
             "lsp": {"configured": lsp_count, "enabled": lsp_count},
-            "plugins": {"installed": count_dirs(&workspace.join(".agent/plugins")), "enabled": enabled_plugins},
+            "plugins": {"installed": count_dirs(&plugin_root(&workspace)), "enabled": enabled_plugins},
             "skills": {"workspace": count_dirs(&workspace.join("skills")) + count_dirs(&workspace.join(".agent/skills"))},
-            "trust": {"store_present": workspace.join(".agent/trust-store.json").is_file(), "registry_state_present": workspace.join(".agent/registry-state.json").is_file()},
+            "trust": {"store_present": paths.trust_store.is_file(), "registry_state_present": paths.registry_state.is_file()},
             "latest_report": latest_report,
         });
         if args.iter().any(|arg| arg == "--json") {
@@ -4376,8 +4530,8 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
     let workspace = workspace_root()?;
     match section {
         "hooks" => {
-            let mut registry = PluginRegistry::discover(workspace.join(".agent/plugins"))
-                .map_err(|e| e.to_string())?;
+            let mut registry =
+                PluginRegistry::discover(plugin_root(&workspace)).map_err(|e| e.to_string())?;
             let enabled = enabled_plugin_names(path)?;
             for id in &enabled {
                 registry.enable(id).map_err(|e| e.to_string())?;
@@ -4458,7 +4612,10 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
         "skills" => {
             let permissions = PermissionEngine::new(&workspace, PermissionMode::ReadOnly)
                 .map_err(|e| e.to_string())?;
-            let mut roots = vec![workspace.join("skills"), workspace.join(".agent/skills")];
+            let mut roots = vec![workspace.join("skills"), workspace.join(".helios/skills")];
+            if !workspace.join(".helios/skills").is_dir() {
+                roots.push(workspace.join(".agent/skills"));
+            }
             if let Some(root) = value_after(args, "--root")? {
                 roots = vec![workspace.join(root)];
             }
@@ -5522,6 +5679,36 @@ mod tests {
                 0o600
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_flag_uses_helios_config_and_reads_legacy_without_overwrite() {
+        let root = std::env::temp_dir().join(format!("helios-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".agent")).expect("legacy dir");
+        fs::write(root.join(".agent/config.toml"), "provider = 'fake'\n").expect("legacy config");
+        parse_args(vec![
+            "--workspace".into(),
+            root.display().to_string(),
+            "config".into(),
+            "path".into(),
+        ])
+        .expect("workspace flag");
+        let paths = app_paths().expect("paths");
+        assert_eq!(
+            paths.project_config,
+            root.canonicalize().unwrap().join(".helios/config.toml")
+        );
+        assert_eq!(
+            load_user_config(&paths.project_config)
+                .unwrap()
+                .provider
+                .as_deref(),
+            Some("fake")
+        );
+        assert!(!paths.project_config.exists());
+        WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = fs::remove_dir_all(root);
     }
 

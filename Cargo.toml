@@ -19,6 +19,7 @@ members = [
   "crates/subagents",
   "crates/perf",
   "crates/lsp",
+  "crates/paths",
 ]
 
 [workspace.package]

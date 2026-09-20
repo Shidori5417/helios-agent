@@ -6,8 +6,8 @@ Install the Arch development packages from `docs/13_ARCH_LINUX.md`, then run:
 
 ```sh
 cargo build --release --locked
-./target/release/agent-cli self install --prefix ~/.local --name helios --compat-agent-cli
-./target/release/agent-cli doctor
+./target/release/helios self install --prefix ~/.local --name helios --compat-agent-cli
+./target/release/helios doctor
 ```
 
 The preferred user-facing path is CLI-controlled: `self install` performs an
@@ -16,6 +16,7 @@ explicit shell completion path. The legacy `install -Dm755` command below is
 kept as a manual fallback for minimal systems.
 
 ```sh
+install -Dm755 target/release/helios ~/.local/bin/helios
 install -Dm755 target/release/agent-cli ~/.local/bin/agent-cli
 ```
 
@@ -28,10 +29,10 @@ OIDC issuer used by GitHub Actions:
 ```bash
 sha256sum --check SHA256SUMS
 cosign verify-blob \
-  --bundle agent-cli-x86_64-unknown-linux-gnu.bundle \
+  --bundle helios-x86_64-unknown-linux-gnu.bundle \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   --certificate-identity-regexp 'https://github.com/.+/.github/workflows/release.yml@.*' \
-  agent-cli-x86_64-unknown-linux-gnu
+  helios-x86_64-unknown-linux-gnu
 ```
 
 The workflows use the official `sigstore/cosign-installer@v4.1.0` and
@@ -63,10 +64,10 @@ helios self uninstall --confirm helios
 For a manual source install, remove the explicitly installed binary:
 
 ```sh
-rm -f ~/.local/bin/agent-cli
+rm -f ~/.local/bin/helios ~/.local/bin/agent-cli
 ```
 
-For an Arch package, use `sudo pacman -R agent-cli`. User state under XDG directories
+For an Arch package, use `sudo pacman -R helios-agent`. User state under XDG directories
 is intentionally not removed; delete it separately only after reviewing its contents.
 
 ## Plugin registry format

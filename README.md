@@ -53,13 +53,13 @@ Read in this order:
 The workspace now includes a bounded coding loop with fake, OpenAI Responses, Anthropic Messages, Gemini, and generic OpenAI-compatible provider selection, permission-checked native tools, exact-preimage patches, safe direct-argv verification, bounded terminal output with spill files, Unix process-group cleanup, bounded background jobs, and read-only git diff display. Direct argv execution is the default; PTY allocation is explicit (`requires_pty`) and is never inferred from a command string.
 
 ```bash
-cargo run -p agent-cli -- "inspect this repository"
-cargo run -p agent-cli -- --provider openai --model gpt-5 "fix the failing test"
+cargo run -p agent-cli --bin helios -- "inspect this repository"
+cargo run -p agent-cli --bin helios -- --provider openai --model gpt-5 "fix the failing test"
 ```
 
 Provider adapters resolve credentials keyring-first through `auth login PROVIDER`, with separate environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `GENERIC_API_KEY`) as an explicit compatibility fallback. Their `*_BASE_URL` variables (or CLI `--base-url`) select a test/local endpoint. Secret values are never put in errors, logs, or model context. Provider profiles expose typed tool-shape, caching, compaction, reasoning, and streaming capabilities while keeping wire formats outside core.
 
-For example: `cargo run -p agent-cli -- --provider anthropic --model claude-3-5-sonnet "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.
+For example: `cargo run -p agent-cli --bin helios -- --provider anthropic --model claude-3-5-sonnet "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.
 
 Context planning is provider-neutral: `ContextSegment`/`ContextPlan` provide deterministic ordering, bounded selection, stable-prefix fingerprints, saturating usage accounting, and a compaction boundary.
 
@@ -69,13 +69,13 @@ Memory can be managed with `memory list`, `memory search --query TEXT`, `memory 
 
 Run `usage [--session ID|latest] [--json]` for durable normalized token totals, or `context [--session ID|latest] [--json]` for bounded-plan budget/fingerprint/selection summaries. Lifecycle events are stored with deterministic turn sequence, bounded payloads, and secret-like redaction; raw model/tool deltas are not persisted.
 
-Optional workspace runtime configuration lives at `.agent/config.toml` (or an explicit `--config PATH` inside the workspace). `[[mcp_server]]` entries provide typed stdio/streamable-HTTP settings, tool include/exclude catalogues, and environment-variable names for secrets; literal secret values are not accepted. HTTP calls require an explicit `allowed_hosts` entry. Enabled plugin hook names are listed under `[plugins].enabled`; hooks run through the shared permission/process boundary and fail-closed hooks stop the turn while fail-open results remain observable.
+Optional workspace runtime configuration lives at `.helios/config.toml` (or an explicit `--config PATH` inside the workspace); legacy `.agent/config.toml` is read-only compatibility input. `[[mcp_server]]` entries provide typed stdio/streamable-HTTP settings, tool include/exclude catalogues, and environment-variable names for secrets; literal secret values are not accepted. HTTP calls require an explicit `allowed_hosts` entry. Enabled plugin hook names are listed under `[plugins].enabled`; hooks run through the shared permission/process boundary and fail-closed hooks stop the turn while fail-open results remain observable.
 
-Plugin trust is explicit: `plugins verify/install/update` require a signed, fresh, monotonic registry envelope and public-key-only trust store, verify SHA-256 plus Ed25519 before atomic installation, and accept local files or HTTPS only. Accepted sequence/digest state is persisted atomically in `.agent/registry-state.json`; rollback and same-sequence equivocation are rejected. `plugins uninstall --id ID` moves the exact plugin to `.agent/plugins/.trash` for recovery. The package format is intentionally a single signed `plugin.json` manifest; arbitrary archives and private signing keys are not handled.
+Plugin trust is explicit: `plugins verify/install/update` require a signed, fresh, monotonic registry envelope and public-key-only trust store, verify SHA-256 plus Ed25519 before atomic installation, and accept local files or HTTPS only. Accepted sequence/digest state is persisted atomically in XDG state `helios/registry-state.json`; rollback and same-sequence equivocation are rejected. `plugins uninstall --id ID` moves the exact plugin to the configured plugin trash for recovery. The package format is intentionally a single signed `plugin.json` manifest; arbitrary archives and private signing keys are not handled.
 
 Performance evidence is collected offline with `scripts/run-perf.sh` (release startup samples, short fake-session wall/RSS, and the checked 100-task benchmark). It records unsupported RSS as `null`, keeps warm-filesystem caveats explicit, and only applies thresholds when requested.
 
-The LSP extension is a lazy stdio JSON-RPC boundary configured by `[[lsp_server]]` entries in `.agent/config.toml`. It exposes bounded provider-neutral symbol/definition/reference/diagnostic metadata without always-on indexing; direct argv, workspace-canonical cwd and environment allowlists are enforced.
+The LSP extension is a lazy stdio JSON-RPC boundary configured by `[[lsp_server]]` entries in `.helios/config.toml`. It exposes bounded provider-neutral symbol/definition/reference/diagnostic metadata without always-on indexing; direct argv, workspace-canonical cwd and environment allowlists are enforced.
 
 Phase 4 adds isolated extension boundaries: lazy MCP stdio and streamable-HTTP JSON-RPC clients with bounded responses and permission policies, metadata-first/lazy-body skill discovery, and deterministic plugin manifests with explicit lifecycle and typed hook policies. Plugin execution remains limited to declared hook argv through the shared permission/process boundary; arbitrary in-process plugin code is not enabled.
 
@@ -110,7 +110,7 @@ Recoverable tool failures such as patch conflicts are bounded and fed back to th
 ## Proposed repository layout
 
 ```text
-agent-cli/
+helios-agent/
 ├── Cargo.toml
 ├── AGENTS.md
 ├── crates/

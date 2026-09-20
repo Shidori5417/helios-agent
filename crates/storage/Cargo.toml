@@ -9,3 +9,4 @@ rusqlite.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+agent-paths = { path = "../paths" }

@@ -4,6 +4,8 @@
 # Agent runtime state and workspace-local configuration
 /.agent/
 **/.agent/
+/.helios/
+**/.helios/
 *.db
 *.sqlite
 *.sqlite3

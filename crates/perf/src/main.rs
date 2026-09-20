@@ -216,7 +216,7 @@ fn parse_positive(value: &str) -> Result<usize, PerfError> {
 }
 
 fn default_agent_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/agent-cli")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/helios")
 }
 
 fn measure_startup(binary: &Path, runs: usize) -> Result<StartupMetrics, PerfError> {
@@ -229,7 +229,7 @@ fn measure_startup(binary: &Path, runs: usize) -> Result<StartupMetrics, PerfErr
             .stderr(Stdio::null())
             .status()?;
         if !status.success() {
-            return Err(PerfError::Child("agent-cli --help failed".into()));
+            return Err(PerfError::Child("helios --help failed".into()));
         }
         samples.push(started.elapsed().as_millis());
     }

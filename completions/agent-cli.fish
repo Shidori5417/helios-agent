@@ -1,5 +1,23 @@
-complete -c agent-cli -l provider -r -f -a 'fake openai anthropic gemini generic openai-compatible'
-complete -c agent-cli -l model -r -f
+complete -c helios -l provider -r -f -a 'fake openai anthropic gemini generic openai-compatible'
+complete -c helios -l workspace -r -f
+complete -c helios -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
+complete -c helios -l model -r -f
+complete -c helios -l base-url -r -f
+complete -c helios -l db-path -r -f
+complete -c helios -l resume -r -f
+complete -c helios -l config -r -f
+complete -c helios -l json
+complete -c helios -l prefix -r -f
+complete -c helios -l name -r -f
+complete -c helios -l output -r -f
+complete -c helios -l input -r -f
+complete -c helios -l query -r -f
+complete -c helios -l objective -r -f
+complete -c helios -l scope -r -f
+complete -c helios -l worktree
+complete -c helios -l ref -r -f
+complete -c helios -l token-stdin
+complete -c helios -l model -r -f
 complete -c agent-cli -l base-url -r -f
 complete -c agent-cli -l db-path -r -f
 complete -c agent-cli -l config -r -f

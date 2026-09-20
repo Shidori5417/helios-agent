@@ -1,7 +1,8 @@
-#compdef agent-cli
-_agent_cli() {
+#compdef helios agent-cli
+_helios() {
   _arguments \
     '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff)' \
+    '--workspace[workspace root]:path:_files' \
     '--provider[provider adapter]:provider:(fake openai anthropic gemini generic openai-compatible)' \
     '--model[model name]:model:' \
     '--base-url[provider endpoint]:url:' \
@@ -30,4 +31,4 @@ _agent_cli() {
     '--wall-clock[subagent wall clock seconds]:count:' \
     '*:prompt:_message'
 }
-_agent_cli "$@"
+_helios "$@"
