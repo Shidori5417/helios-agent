@@ -2,8 +2,8 @@ use agent_context::{
     CompactionRequest, Compactor, ContextSegment, LocalCompactor, Priority, SegmentKind, Stability,
 };
 use agent_core::{
-    AgentLoop, EventSink, HookRunner, LifecycleEvent, MemoryRetriever, RetrievedMemory,
-    SteeringChannel, ToolExecution, ToolExecutor, ToolFailure,
+    AgentLoop, EventSink, ForegroundTaskController, HookRunner, LifecycleEvent, MemoryRetriever,
+    RetrievedMemory, SteeringChannel, ToolExecution, ToolExecutor, ToolFailure,
 };
 use agent_lsp::{load_config as load_lsp_config, LspClient, LspServerConfig, StdioTransport};
 use agent_mcp::{
@@ -2308,10 +2308,12 @@ fn interactive_command() -> Result<(), String> {
     let session_effort = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
     let steering = SteeringChannel::bounded(8, 8 * 1024);
+    let controller = ForegroundTaskController::default();
     let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
     let workspace_path = paths.workspace.clone();
     let steering_for_ui = steering.clone();
+    let controller_for_ui = controller.clone();
     agent_tui::run_interactive_with_context_and_approval(
         receiver,
         sender.clone(),
@@ -2325,6 +2327,7 @@ fn interactive_command() -> Result<(), String> {
                 return agent_tui::SubmitAction::Exit;
             }
             if command == "/stop" {
+                let _ = controller_for_ui.cancel();
                 turn_cancellation.cancel();
                 let _ = events.send(agent_protocol::Event::Error("active turn cancellation requested".into()));
                 return agent_tui::SubmitAction::Continue;
@@ -2333,7 +2336,7 @@ fn interactive_command() -> Result<(), String> {
                 let instruction = instruction.trim();
                 if instruction.is_empty() {
                     let _ = events.send(agent_protocol::Event::Error("/steer requires an instruction".into()));
-                } else if steering_for_ui.push(instruction.chars().take(4096).collect::<String>()) {
+                } else if controller_for_ui.steer(instruction.chars().take(4096).collect::<String>()).unwrap_or(false) {
                     let _ = events.send(agent_protocol::Event::ModelDelta("steer queued for the next safe iteration boundary".into()));
                 } else {
                     let _ = events.send(agent_protocol::Event::Error("steer queue is full or instruction is too large".into()));
@@ -2994,17 +2997,27 @@ fn interactive_command() -> Result<(), String> {
                     return agent_tui::SubmitAction::Continue;
                 }
             };
+            let task_turn_id = output_timestamp();
+            let task_session_id = active_session.lock().ok().and_then(|value| *value).unwrap_or(0);
+            if controller_for_ui.start(task_turn_id, task_session_id).is_err() {
+                let _ = events.send(agent_protocol::Event::Error("foreground task is already active".into()));
+                return agent_tui::SubmitAction::Continue;
+            }
             let worker_db_path = db_path.clone();
             let worker_workspace = workspace_path.clone();
             let worker_active_session = active_session.clone();
             let worker_approval = approval.clone();
             let worker_steering = steering_for_ui.clone();
+            let worker_controller = controller_for_ui.clone();
             std::thread::spawn(move || {
                 let run_cancel = turn_cancellation.clone();
                 let result = run_command_with_cancellation(options, run_cancel);
                 let cancelled = turn_cancellation.is_cancelled();
                 if let Err(error) = result {
                     let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
+                    let _ = worker_controller.fail(task_turn_id);
+                } else {
+                    let _ = worker_controller.complete(task_turn_id);
                 }
                 let Ok(db) = Database::open(&worker_db_path) else { return; };
                 let Ok(Some(record)) = db.latest_session(&worker_workspace.display().to_string()) else { return; };

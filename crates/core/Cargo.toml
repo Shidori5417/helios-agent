@@ -8,6 +8,7 @@ license.workspace = true
 agent-protocol = { path = "../protocol" }
 agent-providers = { path = "../providers" }
 agent-context = { path = "../context" }
+agent-terminal = { path = "../terminal" }
 thiserror.workspace = true
 serde_json.workspace = true
 

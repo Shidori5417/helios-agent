@@ -15,6 +15,126 @@ pub struct SteeringChannel {
     max_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForegroundTaskState {
+    Idle,
+    Running,
+    Cancelling,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone)]
+pub struct ForegroundTaskController {
+    inner: Arc<Mutex<ForegroundTaskInner>>,
+    pub steering: SteeringChannel,
+}
+
+struct ForegroundTaskInner {
+    state: ForegroundTaskState,
+    turn_id: Option<u64>,
+    session_id: Option<i64>,
+    cancellation: Option<agent_terminal::CancellationToken>,
+}
+
+impl Default for ForegroundTaskController {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ForegroundTaskInner {
+                state: ForegroundTaskState::Idle,
+                turn_id: None,
+                session_id: None,
+                cancellation: None,
+            })),
+            steering: SteeringChannel::bounded(8, 8 * 1024),
+        }
+    }
+}
+
+impl ForegroundTaskController {
+    pub fn start(
+        &self,
+        turn_id: u64,
+        session_id: i64,
+    ) -> Result<agent_terminal::CancellationToken, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "controller lock poisoned".to_owned())?;
+        if matches!(
+            inner.state,
+            ForegroundTaskState::Running | ForegroundTaskState::Cancelling
+        ) {
+            return Err("foreground task already active".into());
+        }
+        let cancellation = agent_terminal::CancellationToken::default();
+        inner.state = ForegroundTaskState::Running;
+        inner.turn_id = Some(turn_id);
+        inner.session_id = Some(session_id);
+        inner.cancellation = Some(cancellation.clone());
+        Ok(cancellation)
+    }
+
+    pub fn cancel(&self) -> Result<bool, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "controller lock poisoned".to_owned())?;
+        if inner.state == ForegroundTaskState::Cancelling {
+            return Ok(false);
+        }
+        if inner.state != ForegroundTaskState::Running {
+            return Ok(false);
+        }
+        if let Some(token) = &inner.cancellation {
+            token.cancel();
+        }
+        inner.state = ForegroundTaskState::Cancelling;
+        Ok(true)
+    }
+
+    pub fn complete(&self, turn_id: u64) -> Result<bool, String> {
+        self.finish(turn_id, ForegroundTaskState::Completed)
+    }
+    pub fn fail(&self, turn_id: u64) -> Result<bool, String> {
+        self.finish(turn_id, ForegroundTaskState::Failed)
+    }
+    fn finish(&self, turn_id: u64, state: ForegroundTaskState) -> Result<bool, String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "controller lock poisoned".to_owned())?;
+        if inner.turn_id != Some(turn_id) {
+            return Ok(false);
+        }
+        inner.state = state;
+        inner.cancellation = None;
+        Ok(true)
+    }
+    pub fn steer(&self, instruction: impl Into<String>) -> Result<bool, String> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "controller lock poisoned".to_owned())?;
+        if inner.state != ForegroundTaskState::Running {
+            return Ok(false);
+        }
+        Ok(self.steering.push(instruction))
+    }
+    pub fn state(&self) -> ForegroundTaskState {
+        self.inner
+            .lock()
+            .map(|inner| inner.state)
+            .unwrap_or(ForegroundTaskState::Failed)
+    }
+    pub fn active_ids(&self) -> Option<(u64, i64)> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|inner| Some((inner.turn_id?, inner.session_id?)))
+    }
+}
+
 impl SteeringChannel {
     pub fn bounded(max_items: usize, max_bytes: usize) -> Self {
         Self {
@@ -1042,6 +1162,21 @@ mod tests {
             .iter()
             .any(|message| message.content.contains("focus on the failing test")));
         assert!(steering.drain().is_empty());
+    }
+
+    #[test]
+    fn foreground_controller_rejects_stale_completion_and_repeated_stop() {
+        let controller = ForegroundTaskController::default();
+        let token = controller.start(7, 11).expect("start");
+        assert!(!token.is_cancelled());
+        assert!(controller.steer("focus").expect("steer"));
+        assert!(controller.cancel().expect("cancel"));
+        assert!(!controller.cancel().expect("repeat"));
+        assert!(token.is_cancelled());
+        assert!(!controller.complete(6).expect("stale"));
+        assert!(controller.complete(7).expect("complete"));
+        assert_eq!(controller.state(), ForegroundTaskState::Completed);
+        assert!(!controller.steer("late").expect("late steer"));
     }
 
     struct OneMemory;

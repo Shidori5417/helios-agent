@@ -52,6 +52,7 @@ dependencies = [
  "agent-context",
  "agent-protocol",
  "agent-providers",
+ "agent-terminal",
  "serde_json",
  "thiserror 1.0.69",
 ]
