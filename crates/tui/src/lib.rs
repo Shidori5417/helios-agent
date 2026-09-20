@@ -49,6 +49,7 @@ pub struct TuiModel {
     pub overlay: Option<OverlayState>,
     pub theme: TuiTheme,
     pub diff: Option<String>,
+    pub diff_variants: Vec<(String, String)>,
     pub permission_request: Option<PermissionPrompt>,
     pub tool_cards: Vec<ToolCard>,
 }
@@ -84,6 +85,7 @@ impl Default for TuiModel {
             overlay: None,
             theme: TuiTheme::System,
             diff: None,
+            diff_variants: Vec::new(),
             permission_request: None,
             tool_cards: Vec::new(),
         }
@@ -433,6 +435,15 @@ impl TuiModel {
         self.diff = Some(diff.into().chars().take(128 * 1024).collect());
     }
 
+    pub fn set_diff_variant(&mut self, variant: &str) -> bool {
+        if let Some((_, diff)) = self.diff_variants.iter().find(|(name, _)| name == variant) {
+            self.set_diff(diff.clone());
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn open_permission(&mut self, prompt: PermissionPrompt) {
         self.permission_request = Some(prompt);
         self.overlay = Some(OverlayState {
@@ -708,6 +719,7 @@ impl TuiModel {
         self.models = context.models;
         self.sessions = context.sessions;
         self.diff = context.diff.clone();
+        self.diff_variants = context.diff_variants;
         if let Some(diff) = context.diff {
             self.set_diff(diff);
         }
@@ -956,6 +968,7 @@ pub struct TuiContext {
     pub models: Vec<ModelOption>,
     pub sessions: Vec<SessionOption>,
     pub diff: Option<String>,
+    pub diff_variants: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1408,7 +1421,16 @@ where
                     match model.composer.handle_key(key) {
                         ComposerAction::Submit(prompt) => {
                             needs_draw = true;
-                            if prompt.trim() == "/diff" {
+                            if let Some(variant) = prompt.trim().strip_prefix("/diff") {
+                                let variant = variant.trim();
+                                let variant = if variant.is_empty() {
+                                    "worktree"
+                                } else {
+                                    variant
+                                };
+                                if !model.set_diff_variant(variant) {
+                                    model.set_diff(format!("diff variant unavailable: {variant}"));
+                                }
                                 model.open_overlay(OverlayKind::Diff);
                                 continue;
                             }

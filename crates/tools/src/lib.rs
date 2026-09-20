@@ -102,6 +102,11 @@ impl ApprovalBroker {
         pending.response.send(decision).is_ok()
     }
 
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(Duration::from_millis(1));
+        self
+    }
+
     fn approve(
         &self,
         class: PermissionClass,
@@ -428,11 +433,33 @@ impl ToolRegistry {
     }
 
     pub fn git_diff(&self) -> Result<ToolOutcome, ToolError> {
+        self.git_diff_variant("worktree")
+    }
+
+    pub fn git_diff_variant(&self, variant: &str) -> Result<ToolOutcome, ToolError> {
         self.permissions.authorize(PermissionClass::ReadOnly)?;
+        let args = match variant {
+            "worktree" | "unstaged" => vec!["diff", "--no-ext-diff", "--"],
+            "staged" => vec!["diff", "--cached", "--no-ext-diff", "--"],
+            "all" => vec!["diff", "HEAD", "--no-ext-diff", "--"],
+            "stat" => vec!["diff", "--stat", "--no-ext-diff", "--"],
+            "session" => {
+                return Err(ToolError::InvalidArguments {
+                    tool: "git_diff".into(),
+                    reason: "session baseline is unavailable for this workspace".into(),
+                })
+            }
+            other => {
+                return Err(ToolError::InvalidArguments {
+                    tool: "git_diff".into(),
+                    reason: format!("unsupported diff variant: {other}"),
+                })
+            }
+        };
         let result = run(
             CommandSpec {
                 program: "git".into(),
-                args: vec!["diff".into(), "--no-ext-diff".into(), "--".into()],
+                args: args.into_iter().map(String::from).collect(),
                 cwd: self.permissions.root().to_path_buf(),
                 timeout: self.timeout,
                 output_limit: self.output_budget,
@@ -750,7 +777,7 @@ mod tests {
         let file = root.join("file.txt");
         fs::write(&file, "old").expect("write");
         let (events, receiver) = mpsc::sync_channel(4);
-        let broker = ApprovalBroker::new(events);
+        let broker = ApprovalBroker::new(events).with_timeout(Duration::from_millis(10));
         let worker_broker = broker.clone();
         let worker_root = root.clone();
         let worker = std::thread::spawn(move || {
@@ -777,6 +804,83 @@ mod tests {
         assert!(broker.decide(id, ApprovalDecision::AllowOnce));
         worker.join().expect("worker").expect("approved");
         assert_eq!(fs::read_to_string(file).expect("after approval"), "new");
+    }
+
+    #[test]
+    fn approval_timeout_and_cancellation_fail_closed() {
+        let root = root("approval-timeout");
+        fs::write(root.join("file.txt"), "old").expect("write");
+        let (events, _receiver) = mpsc::sync_channel(4);
+        let broker = ApprovalBroker::new(events).with_timeout(Duration::from_millis(10));
+        let result = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_approval_broker(broker)
+            .execute(
+                "apply_patch",
+                json!({"path":"file.txt","expected_content":"old","replacement":"new"}),
+                &CancellationToken::default(),
+            );
+        assert!(matches!(result, Err(ToolError::Approval(_))));
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let (events, _receiver) = mpsc::sync_channel(4);
+        let result = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_approval_broker(ApprovalBroker::new(events))
+            .execute(
+                "apply_patch",
+                json!({"path":"file.txt","expected_content":"old","replacement":"new"}),
+                &cancellation,
+            );
+        assert!(matches!(result, Err(ToolError::Approval(_))));
+        assert_eq!(
+            fs::read_to_string(root.join("file.txt")).expect("unchanged"),
+            "old"
+        );
+    }
+
+    #[test]
+    fn approval_session_scope_is_exact_and_high_risk_not_persistent() {
+        let root = root("approval-session");
+        fs::write(root.join("file.txt"), "old").expect("write");
+        let (events, receiver) = mpsc::sync_channel(8);
+        let broker = ApprovalBroker::new(events).with_timeout(Duration::from_millis(10));
+        let first = {
+            let broker = broker.clone();
+            let root = root.clone();
+            std::thread::spawn(move || {
+                ToolRegistry::new(root, PermissionMode::WorkspaceWrite)
+                    .expect("registry")
+                    .with_approval_broker(broker)
+                    .execute(
+                        "apply_patch",
+                        json!({"path":"file.txt","expected_content":"old","replacement":"new"}),
+                        &CancellationToken::default(),
+                    )
+            })
+        };
+        let event = receiver.recv().expect("first request");
+        let agent_protocol::Event::PermissionRequested(text) = event else {
+            panic!("request")
+        };
+        let id = text
+            .split(';')
+            .find_map(|part| part.strip_prefix("id=")?.parse().ok())
+            .unwrap();
+        assert!(broker.decide(id, ApprovalDecision::AllowSession));
+        first.join().expect("join").expect("first allowed");
+        let second = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_approval_broker(broker.clone())
+            .execute(
+                "apply_patch",
+                json!({"path":"file.txt","expected_content":"new","replacement":"newer"}),
+                &CancellationToken::default(),
+            );
+        assert!(
+            second.is_err(),
+            "different preimage must not inherit approval"
+        );
     }
 
     #[cfg(unix)]
@@ -827,5 +931,10 @@ mod tests {
         let diff = registry.git_diff().expect("diff");
         assert!(diff.data.contains("-before"));
         assert!(diff.data.contains("+after"));
+        assert!(registry.git_diff_variant("stat").is_ok());
+        assert!(matches!(
+            registry.git_diff_variant("session"),
+            Err(ToolError::InvalidArguments { .. })
+        ));
     }
 }

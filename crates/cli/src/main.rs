@@ -2308,6 +2308,20 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         .ok()
         .and_then(|registry| registry.git_diff().ok())
         .map(|result| result.data);
+    let diff_variants = ToolRegistry::new(&paths.workspace, PermissionMode::ReadOnly)
+        .ok()
+        .map(|registry| {
+            ["worktree", "staged", "all", "stat", "session"]
+                .into_iter()
+                .filter_map(|variant| {
+                    registry
+                        .git_diff_variant(variant)
+                        .ok()
+                        .map(|result| (variant.to_owned(), result.data))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -2324,6 +2338,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         models,
         sessions,
         diff,
+        diff_variants,
         ..agent_tui::TuiContext::default()
     }
 }
@@ -2517,10 +2532,14 @@ fn slash_command_output(command: &str) -> Option<String> {
                 plan.truncated_count
             ))
         }),
-        "/diff" => {
+        command if command == "/diff" || command.starts_with("/diff ") => {
             let workspace = workspace_root().ok()?;
             let registry = ToolRegistry::new(workspace, PermissionMode::ReadOnly).ok()?;
-            registry.git_diff().ok().map(|result| result.data)
+            let variant = command.strip_prefix("/diff ").unwrap_or("worktree");
+            registry
+                .git_diff_variant(variant)
+                .ok()
+                .map(|result| result.data)
         }
         _ => None,
     }
