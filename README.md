@@ -57,7 +57,7 @@ cargo run -p agent-cli -- "inspect this repository"
 cargo run -p agent-cli -- --provider openai --model gpt-5 "fix the failing test"
 ```
 
-Provider adapters read credentials only from their separate environment variables: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `GENERIC_API_KEY`. Their `*_BASE_URL` variables (or CLI `--base-url`) select a test/local endpoint. Secret values are never put in errors, logs, or model context. Provider profiles expose typed tool-shape, caching, compaction, reasoning, and streaming capabilities while keeping wire formats outside core.
+Provider adapters resolve credentials keyring-first through `auth login PROVIDER`, with separate environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `GENERIC_API_KEY`) as an explicit compatibility fallback. Their `*_BASE_URL` variables (or CLI `--base-url`) select a test/local endpoint. Secret values are never put in errors, logs, or model context. Provider profiles expose typed tool-shape, caching, compaction, reasoning, and streaming capabilities while keeping wire formats outside core.
 
 For example: `cargo run -p agent-cli -- --provider anthropic --model claude-3-5-sonnet "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.
 
@@ -91,7 +91,7 @@ cargo run -p agent-evals --bin agent-eval -- --report /tmp/agent-eval-report.jso
 
 It runs in isolated fixture copies, emits JSON metrics, and exits nonzero on failure. The checked 100-task suite is available with `--suite crates/evals/fixtures/benchmark-100.json`; it covers ten archetypes and reports category totals, p50/p95 wall time, token/tool/diff totals, and baseline regressions. Use `--baseline PATH --max-regressions N` to enforce a configurable regression threshold.
 
-Session prompts and model/tool messages are intentionally persisted in the selected SQLite database so `--resume`, `sessions`, and `search` can work. API keys are provider environment inputs only and are never journaled. The CLI records the canonical workspace path with each session, rejects resume from another workspace, and applies best-effort `0600` permissions to the database on Unix.
+Session prompts and model/tool messages are intentionally persisted in the selected SQLite database so `--resume`, `sessions`, and `search` can work. API keys are keyring/environment runtime inputs only and are never journaled. The CLI records the canonical workspace path with each session, rejects resume from another workspace, and applies best-effort `0600` permissions to the database on Unix.
 
 The CLI remains non-interactive by default; `--tui` enters the ratatui/crossterm UI only on an interactive TTY and restores the terminal on exit. TUI bounds and key display are controlled with `tui show|set|keys`. The producer and renderer communicate through a bounded event channel; q/Esc/Ctrl-C cancellation propagates to provider, native process and MCP execution. Resize and bounded scroll state are reducer-tested. Provider adapters implement bounded chunked SSE/JSON streaming with assembled tool calls and usage events; malformed, oversized, timed-out, or cancelled streams fail with typed errors. The offline fake provider retains the complete-response fallback path.
 

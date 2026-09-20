@@ -18,7 +18,7 @@ Plugin trust is controlled with `trust list|show|add|disable|enable|revoke|remov
 
 Configured extension smoke tests use `mcp test --id ID` and `lsp test --id ID`. MCP tests initialize and list tools without calling them; HTTP MCP additionally requires `--allow-network` and an exact configured host allowlist entry. LSP tests initialize and shut down the configured process, and `--file PATH` enables bounded document-open/symbol probing after workspace permission checks.
 
-Hooks, skills, and subagents use their real runtime boundaries: `hooks list|enable|disable|test`, `skills list|show|validate`, and `subagents show|config|run|test`. Hook enablement is persisted under `[plugins].enabled`; skills are discovered metadata-first from `skills/` and `.agent/skills`; subagent runs use the selected fake or configured provider, persisted budgets, inherited permissions, and optional manager-owned detached worktrees.
+Hooks, skills, and subagents use their real runtime boundaries: `hooks list|enable|disable|test`, `skills list|show|validate`, and `subagents show|config|run|test`. Hook enablement is persisted under `[plugins].enabled`; skills are discovered metadata-first from `skills/` and `.agent/skills`; subagent runs use the selected fake or configured provider, persisted budgets, inherited permissions, optional bounded `--context-file`, `--session`, or `--memory-query` context, and optional manager-owned detached worktrees.
 
 TUI preferences are controlled by `tui show|set|keys`; safe bounds cover tick interval, event-channel capacity, scroll step, and `auto|always|never` color mode.
 

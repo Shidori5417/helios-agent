@@ -11,6 +11,8 @@ _agent_cli() {
     '--trust-store[public key trust store]:path:_files' \
     '--resume[session id or latest]:selector:' \
     '--session[session id or latest]:selector:' \
+    '--context-file[bounded workspace context file]:path:_files' \
+    '--memory-query[bounded workspace memory query]:query:' \
     '--json[JSON output]' \
     '--query[FTS query]:query:' \
     '--allow-network[allow configured MCP network host]' \
@@ -19,6 +21,8 @@ _agent_cli() {
     '--objective[subagent objective]:text:' \
     '--scope[subagent scope]:path:_files' \
     '--worktree[request worktree isolation]' \
+    '--keep-worktree[keep exact manager-owned worktree]' \
+    '--ref[explicit worktree base ref]:ref:' \
     '--concurrency[subagent concurrency]:count:' \
     '--max-iterations[subagent iteration budget]:count:' \
     '--max-tokens[subagent token budget]:count:' \

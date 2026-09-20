@@ -6,6 +6,11 @@ complete -c agent-cli -l config -r -f
 complete -c agent-cli -l resume -r -f
 complete -c agent-cli -l query -r -f
 complete -c agent-cli -l session -r -f
+complete -c agent-cli -l context-file -r -f
+complete -c agent-cli -l memory-query -r -f
+complete -c agent-cli -l worktree
+complete -c agent-cli -l keep-worktree
+complete -c agent-cli -l ref -r -f
 complete -c agent-cli -l json
 complete -c agent-cli -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
 complete -c agent-cli -l prefix -r -f

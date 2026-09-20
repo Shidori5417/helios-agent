@@ -1,4 +1,4 @@
-use agent_context::LocalCompactor;
+use agent_context::{ContextSegment, LocalCompactor, Priority, SegmentKind, Stability};
 use agent_core::{
     AgentLoop, EventSink, HookRunner, LifecycleEvent, MemoryRetriever, RetrievedMemory,
     ToolExecution, ToolExecutor, ToolFailure,
@@ -4474,13 +4474,36 @@ fn subagents_command(args: &[String], path: &Path, workspace: &Path) -> Result<(
         }
         "run" | "test" => {
             let objective = if action == "test" { "complete offline subagent smoke".to_owned() } else { value_after(args, "--objective")?.ok_or("subagents run requires --objective TEXT")? };
-            let provider = value_after(args, "--provider")?.unwrap_or_else(|| "fake".into());
+            let configured = load_user_config(path)?;
+            let explicit_provider = value_after(args, "--provider")?;
+            let provider = explicit_provider.clone().or(configured.provider).unwrap_or_else(|| "fake".into());
             if provider != "fake" && !valid_provider(&provider) { return Err(format!("unknown provider: {provider}")); }
-            let model = value_after(args, "--model")?.unwrap_or_else(|| "offline-subagent".into());
-            let base_url = value_after(args, "--base-url")?;
+            let model = value_after(args, "--model")?.or(configured.model).unwrap_or_else(|| "offline-subagent".into());
+            let base_url = value_after(args, "--base-url")?.or(configured.base_url);
             let scope = value_after(args, "--scope")?.map(|value| workspace.join(value)).unwrap_or_else(|| workspace.to_path_buf());
             let policy = load_runtime_policy(path)?;
-            let mut task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_permission(policy.mode).with_budgets(subagent_budgets(path)?);
+            let mut context = Vec::new();
+            if let Some(file) = value_after(args, "--context-file")? {
+                let context_path = workspace.join(file).canonicalize().map_err(|e| e.to_string())?;
+                if !context_path.starts_with(workspace) { return Err("context file escapes workspace".into()); }
+                let content = fs::read_to_string(&context_path).map_err(|e| e.to_string())?;
+                if content.len() > 64 * 1024 { return Err("context file exceeds 64 KiB".into()); }
+                context.push(ContextSegment::new(SegmentKind::Source, Priority::Normal, Stability::Static, content));
+            }
+            if let Some(selector) = value_after(args, "--session")? {
+                let db = open_database(&default_db_path()?)?;
+                let id = if selector == "latest" { db.latest_session(&workspace.display().to_string()).map_err(|e| e.to_string())?.ok_or("no latest session")?.id } else { selector.parse::<i64>().map_err(|_| "--session expects an integer id or latest")? };
+                for (role, content) in db.session_messages(id).map_err(|e| e.to_string())?.into_iter().take(32) {
+                    context.push(ContextSegment::new(SegmentKind::Conversation, Priority::Normal, Stability::SessionStable, format!("{role}: {content}")));
+                }
+            }
+            if let Some(query) = value_after(args, "--memory-query")? {
+                let store = SqliteMemoryStore::open(default_db_path()?, 128, 16 * 1024).map_err(|e| e.to_string())?;
+                for memory in store.search_scoped(&workspace.display().to_string(), &query, 8).map_err(|e| e.to_string())? {
+                    context.push(ContextSegment::new(SegmentKind::Memory, Priority::Normal, Stability::Static, format!("[{}] {}", memory.entry.key, memory.entry.content)));
+                }
+            }
+            let mut task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_context(context).with_permission(policy.mode).with_budgets(subagent_budgets(path)?);
             let cancellation = SubagentCancellation::default();
             let keep_worktree = args.iter().any(|arg| arg == "--keep-worktree");
             let mut manager = None;
@@ -4525,6 +4548,10 @@ impl agent_subagents::Executor for RealSubagentExecutor {
             .map(|segment| segment.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        let context = context
+            .chars()
+            .take(task.budgets.max_tokens.saturating_mul(4) as usize)
+            .collect::<String>();
         let prompt = if context.is_empty() {
             task.objective.clone()
         } else {
@@ -4625,12 +4652,40 @@ fn execute_subagent_provider<P: ModelProvider>(
     if cancellation.is_cancelled() {
         return failed_result(task, 0, 0, 0, StopReason::Cancelled);
     }
+    let root = task
+        .scope
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let terminal_cancel = CancellationToken::default();
+    let builtin = match ToolRegistry::new(&root, task.permission_mode) {
+        Ok(registry) => registry.with_cancellation(terminal_cancel.clone()),
+        Err(error) => return failed_subagent(task, error.to_string()),
+    };
+    let mut tools = match RuntimeExecutor::new(
+        builtin,
+        Vec::new(),
+        &root,
+        terminal_cancel,
+        Vec::new(),
+        task.permission_mode,
+    ) {
+        Ok(tools) => tools,
+        Err(error) => return failed_subagent(task, error),
+    };
     let mut agent = AgentLoop::new(provider).with_context_budget(task.budgets.max_tokens);
     let mut sink = SubagentSink {
         events: Vec::new(),
         cancellation,
     };
-    let result = agent.run_once_streaming(prompt.to_owned(), &mut sink);
+    let result = agent.run_coding_loop(
+        prompt.to_owned(),
+        &mut tools,
+        task.budgets
+            .max_iterations
+            .min(task.budgets.max_tool_calls.max(1)) as usize,
+        &mut sink,
+    );
     let tokens = result
         .as_ref()
         .map(|text| text.len() as u64 / 4)
@@ -4646,8 +4701,19 @@ fn execute_subagent_provider<P: ModelProvider>(
     } else {
         StopReason::PermissionDenied
     };
-    failed_result(task, 1, tokens.min(task.budgets.max_tokens), 0, reason)
-        .with_summary(result.unwrap_or_else(|error| error.to_string()))
+    let tool_calls = sink
+        .events
+        .iter()
+        .filter(|event| matches!(event, agent_protocol::Event::ToolRequested(_)))
+        .count() as u32;
+    failed_result(
+        task,
+        1,
+        tokens.min(task.budgets.max_tokens),
+        tool_calls,
+        reason,
+    )
+    .with_summary(result.unwrap_or_else(|error| error.to_string()))
 }
 
 fn failed_subagent(task: &TaskSpec, error: String) -> TaskResult {
