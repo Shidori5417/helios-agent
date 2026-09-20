@@ -46,6 +46,7 @@ pub struct TuiModel {
     pub palette: Vec<PaletteCommand>,
     pub models: Vec<ModelOption>,
     pub sessions: Vec<SessionOption>,
+    pub checkpoints: Vec<CheckpointOption>,
     pub overlay: Option<OverlayState>,
     pub theme: TuiTheme,
     pub diff: Option<String>,
@@ -91,6 +92,7 @@ impl Default for TuiModel {
             palette: Vec::new(),
             models: Vec::new(),
             sessions: Vec::new(),
+            checkpoints: Vec::new(),
             overlay: None,
             theme: TuiTheme::System,
             diff: None,
@@ -143,6 +145,25 @@ pub struct SessionOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointFileOption {
+    pub path: String,
+    pub action: String,
+    pub size: u64,
+    pub available: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointOption {
+    pub id: i64,
+    pub label: String,
+    pub reason: String,
+    pub created_at: i64,
+    pub pinned: bool,
+    pub current: bool,
+    pub files: Vec<CheckpointFileOption>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOption {
     pub name: String,
     pub description: String,
@@ -185,6 +206,8 @@ pub enum OverlayKind {
     Help,
     Model,
     Sessions,
+    Checkpoints,
+    CheckpointConfirm,
     Context,
     Status,
     Permission,
@@ -207,6 +230,7 @@ pub struct OverlayState {
     pub query: String,
     pub selected: usize,
     pub commands: Vec<PaletteCommand>,
+    pub checkpoint_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -231,6 +255,8 @@ pub enum SubmitAction {
     Continue,
     Exit,
     ReplaceComposer(String),
+    OpenOverlay(OverlayKind),
+    OpenCheckpointConfirm(i64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -521,6 +547,7 @@ impl TuiModel {
             query: String::new(),
             selected: 0,
             commands: Vec::new(),
+            checkpoint_id: None,
         });
     }
 
@@ -538,6 +565,7 @@ impl TuiModel {
             query: String::new(),
             selected: 0,
             commands,
+            checkpoint_id: None,
         });
     }
 
@@ -580,6 +608,28 @@ impl TuiModel {
                             .unwrap_or_default()
                     ),
                     category: "Session".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else if kind == OverlayKind::Checkpoints {
+            self.checkpoints
+                .iter()
+                .map(|checkpoint| PaletteCommand {
+                    name: checkpoint.id.to_string(),
+                    description: format!(
+                        "{} · {} · files={}{}{}",
+                        checkpoint.label,
+                        checkpoint.reason,
+                        checkpoint.files.len(),
+                        if checkpoint.pinned { " · pinned" } else { "" },
+                        if checkpoint.current {
+                            " · current"
+                        } else {
+                            ""
+                        }
+                    ),
+                    category: "Checkpoint".into(),
                     arguments: String::new(),
                     local: true,
                 })
@@ -677,6 +727,17 @@ impl TuiModel {
             query: String::new(),
             selected: 0,
             commands,
+            checkpoint_id: None,
+        });
+    }
+
+    pub fn open_checkpoint_confirm(&mut self, id: i64) {
+        self.overlay = Some(OverlayState {
+            kind: OverlayKind::CheckpointConfirm,
+            query: String::new(),
+            selected: 0,
+            commands: Vec::new(),
+            checkpoint_id: Some(id),
         });
     }
 
@@ -705,6 +766,8 @@ impl TuiModel {
             OverlayKind::Help => "Help",
             OverlayKind::Model => "Models",
             OverlayKind::Sessions => "Sessions",
+            OverlayKind::Checkpoints => "Checkpoints",
+            OverlayKind::CheckpointConfirm => "Rollback confirmation",
             OverlayKind::Context => "Context",
             OverlayKind::Status => "Status",
             OverlayKind::Permission => "Permission request",
@@ -727,6 +790,33 @@ impl TuiModel {
                     request.action, request.risk, request.class
                 );
             }
+        }
+        if overlay.kind == OverlayKind::CheckpointConfirm {
+            let id = overlay.checkpoint_id.unwrap_or_default();
+            let detail = self
+                .checkpoints
+                .iter()
+                .find(|checkpoint| checkpoint.id == id)
+                .map(|checkpoint| {
+                    checkpoint
+                        .files
+                        .iter()
+                        .take(32)
+                        .map(|file| {
+                            format!(
+                                "{} {}{}",
+                                file.action,
+                                file.path,
+                                if file.available { "" } else { " [unavailable]" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| "checkpoint details unavailable".into());
+            return format!(
+                "Rollback checkpoint {id}\n{detail}\n\n[A]/Enter confirm  [D]/Esc deny"
+            );
         }
         if overlay.kind == OverlayKind::Diff {
             return bounded_diff_text(self.diff.as_deref().unwrap_or(""), overlay.query.as_str());
@@ -789,6 +879,35 @@ impl TuiModel {
                 return OverlayAction::Permission(decision);
             }
             return OverlayAction::None;
+        }
+        if overlay.kind == OverlayKind::CheckpointConfirm {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Enter => {
+                    let id = overlay.checkpoint_id.unwrap_or_default();
+                    self.overlay = None;
+                    return OverlayAction::Execute(format!("/rollback-confirm {id}"));
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    self.overlay = None;
+                    return OverlayAction::Close;
+                }
+                _ => return OverlayAction::None,
+            }
+        }
+        if overlay.kind == OverlayKind::Checkpoints && key.code == KeyCode::Char('p') {
+            let query = overlay.query.to_ascii_lowercase();
+            if let Some(command) = overlay
+                .commands
+                .iter()
+                .filter(|command| {
+                    query.is_empty()
+                        || command.name.to_ascii_lowercase().contains(&query)
+                        || command.description.to_ascii_lowercase().contains(&query)
+                })
+                .nth(overlay.selected)
+            {
+                return OverlayAction::Execute(format!("/checkpoint pin {}", command.name));
+            }
         }
         if overlay.kind == OverlayKind::Theme {
             let theme = match key.code {
@@ -878,6 +997,7 @@ impl TuiModel {
                     let tools_overlay = overlay.kind == OverlayKind::Tools;
                     let memory_overlay = overlay.kind == OverlayKind::Memory;
                     let mcp_overlay = overlay.kind == OverlayKind::Mcp;
+                    let checkpoint_overlay = overlay.kind == OverlayKind::Checkpoints;
                     self.overlay = None;
                     return if command.local {
                         if model_overlay {
@@ -890,6 +1010,9 @@ impl TuiModel {
                             OverlayAction::Execute(format!("/memory show {}", command.name))
                         } else if mcp_overlay {
                             OverlayAction::Execute(format!("/mcp warm {}", command.name))
+                        } else if checkpoint_overlay {
+                            self.open_checkpoint_confirm(command.name.parse().unwrap_or_default());
+                            OverlayAction::Open(OverlayKind::CheckpointConfirm)
                         } else {
                             OverlayAction::Execute(format!("/{}", command.name))
                         }
@@ -916,6 +1039,7 @@ impl TuiModel {
         self.palette = context.palette;
         self.models = context.models;
         self.sessions = context.sessions;
+        self.checkpoints = context.checkpoints;
         self.diff = context.diff.clone();
         self.diff_variants = context.diff_variants;
         self.tools = context.tools;
@@ -1200,6 +1324,7 @@ pub struct TuiContext {
     pub palette: Vec<PaletteCommand>,
     pub models: Vec<ModelOption>,
     pub sessions: Vec<SessionOption>,
+    pub checkpoints: Vec<CheckpointOption>,
     pub diff: Option<String>,
     pub diff_variants: Vec<(String, String)>,
     pub tools: Vec<ToolOption>,
@@ -1619,6 +1744,14 @@ where
                                         model.composer.cursor = model.composer.text.len();
                                         model.active_turn = false;
                                     }
+                                    SubmitAction::OpenOverlay(kind) => {
+                                        model.open_overlay(kind);
+                                        model.active_turn = false;
+                                    }
+                                    SubmitAction::OpenCheckpointConfirm(id) => {
+                                        model.open_checkpoint_confirm(id);
+                                        model.active_turn = false;
+                                    }
                                     SubmitAction::Continue => {}
                                 }
                             }
@@ -1721,6 +1854,16 @@ where
                                     model.composer.text = text;
                                     model.composer.cursor = model.composer.text.len();
                                     model.active_turn = false;
+                                }
+                                SubmitAction::OpenOverlay(kind) => {
+                                    model.open_overlay(kind);
+                                    model.active_turn = false;
+                                    needs_draw = true;
+                                }
+                                SubmitAction::OpenCheckpointConfirm(id) => {
+                                    model.open_checkpoint_confirm(id);
+                                    model.active_turn = false;
+                                    needs_draw = true;
                                 }
                                 SubmitAction::Continue => {}
                             }
@@ -2095,6 +2238,44 @@ mod tests {
         assert_eq!(
             model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             OverlayAction::Execute("/mcp warm local".into())
+        );
+    }
+
+    #[test]
+    fn checkpoint_overlay_search_pin_and_confirmation_are_bounded() {
+        let mut model = TuiModel {
+            checkpoints: vec![CheckpointOption {
+                id: 7,
+                label: "before-edit".into(),
+                reason: "automatic".into(),
+                created_at: 1,
+                pinned: false,
+                current: true,
+                files: vec![CheckpointFileOption {
+                    path: "src/main.rs".into(),
+                    action: "modify".into(),
+                    size: 12,
+                    available: true,
+                }],
+            }],
+            ..TuiModel::default()
+        };
+        model.open_overlay(OverlayKind::Checkpoints);
+        assert!(model.overlay_text().contains("current"));
+        assert!(model.overlay_text().contains("before-edit"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            OverlayAction::Execute("/checkpoint pin 7".into())
+        );
+        model.open_overlay(OverlayKind::Checkpoints);
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Open(OverlayKind::CheckpointConfirm)
+        );
+        assert!(model.overlay_text().contains("src/main.rs"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            OverlayAction::Close
         );
     }
 }

@@ -2329,6 +2329,19 @@ fn interactive_command() -> Result<(), String> {
             if command == "/exit" || command == "/quit" {
                 return agent_tui::SubmitAction::Exit;
             }
+            if command == "/checkpoint" || command == "/rollback" || command == "/rewind" {
+                return agent_tui::SubmitAction::OpenOverlay(agent_tui::OverlayKind::Checkpoints);
+            }
+            if let Some(value) = command.strip_prefix("/rollback-confirm ") {
+                let id = value
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| "rollback checkpoint ID is invalid".to_owned());
+                let mode = load_runtime_policy(&project_config_path).map(|value| value.mode).unwrap_or(PermissionMode::ReadOnly);
+                let result = id.and_then(|checkpoint| rollback_checkpoint(&db_path, checkpoint, &workspace_path, mode, &rollback_approval, &turn_cancellation));
+                let _ = events.send(agent_protocol::Event::ModelDelta(result.unwrap_or_else(|error| format!("rollback error: {error}"))));
+                return agent_tui::SubmitAction::Continue;
+            }
             if command == "/stop" {
                 let _ = controller_for_ui.cancel();
                 turn_cancellation.cancel();
@@ -2389,10 +2402,10 @@ fn interactive_command() -> Result<(), String> {
                 let id = prompt.split_whitespace().nth(1).and_then(|value| value.parse::<i64>().ok());
                 let filesystem = command.starts_with("/rollback") || prompt.split_whitespace().nth(2).is_some_and(|value| matches!(value, "filesystem" | "all"));
                 if filesystem {
-                    let mode = load_runtime_policy(&project_config_path).map(|value| value.mode).unwrap_or(PermissionMode::ReadOnly);
-                    let result = id.ok_or_else(|| "rollback requires checkpoint ID".to_owned()).and_then(|checkpoint| rollback_checkpoint(&db_path, checkpoint, &workspace_path, mode, &rollback_approval, &turn_cancellation));
-                    let _ = events.send(agent_protocol::Event::ModelDelta(result.unwrap_or_else(|error| format!("rollback error: {error}"))));
-                    return agent_tui::SubmitAction::Continue;
+                    if let Some(checkpoint) = id {
+                        return agent_tui::SubmitAction::OpenCheckpointConfirm(checkpoint);
+                    }
+                    return agent_tui::SubmitAction::OpenOverlay(agent_tui::OverlayKind::Checkpoints);
                 }
                 let result = Database::open(&db_path).and_then(|db| {
                     let session = active_session.lock().ok().and_then(|value| *value).ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
@@ -3366,6 +3379,47 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
                 .flatten()
         })
         .map(|session| session.id);
+    let checkpoints = active_session
+        .and_then(|session_id| {
+            Database::open(&paths.db_path).ok().and_then(|db| {
+                let workspace = paths.workspace.display().to_string();
+                db.checkpoints(session_id, &workspace).ok().map(|items| {
+                    let current_id = items.first().map(|item| item.id);
+                    items
+                        .into_iter()
+                        .map(|checkpoint| {
+                            let files = db
+                                .checkpoint_files(checkpoint.id, &workspace)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|file| agent_tui::CheckpointFileOption {
+                                    path: file.relative_path,
+                                    action: if !file.existed {
+                                        "create".into()
+                                    } else if file.post_hash.is_some() {
+                                        "modify".into()
+                                    } else {
+                                        "snapshot".into()
+                                    },
+                                    size: file.size,
+                                    available: file.available,
+                                })
+                                .collect();
+                            agent_tui::CheckpointOption {
+                                id: checkpoint.id,
+                                label: checkpoint.label,
+                                reason: checkpoint.reason,
+                                created_at: checkpoint.created_at,
+                                pinned: checkpoint.pinned,
+                                current: Some(checkpoint.id) == current_id,
+                                files,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+        })
+        .unwrap_or_default();
     let session_tool_override = active_session.and_then(|session_id| {
         Database::open(&paths.db_path).ok().and_then(|db| {
             db.session_tool_override(session_id, &paths.workspace.display().to_string())
@@ -3582,6 +3636,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         palette,
         models,
         sessions,
+        checkpoints,
         diff,
         diff_variants,
         tools,
