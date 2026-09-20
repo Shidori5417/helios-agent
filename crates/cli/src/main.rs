@@ -2085,6 +2085,63 @@ fn interactive_command() -> Result<(), String> {
             if command == "/exit" || command == "/quit" {
                 return true;
             }
+            if command.starts_with('!') {
+                let input = prompt.trim().to_owned();
+                let worker_events = events.clone();
+                let worker_workspace = workspace_path.clone();
+                let worker_approval = approval.clone();
+                let worker_cancellation = turn_cancellation.clone();
+                std::thread::spawn(move || {
+                    let argv = match parse_direct_argv(&input) {
+                        Ok(argv) => argv,
+                        Err(error) => {
+                            let _ = worker_events.send(agent_protocol::Event::Error(error));
+                            return;
+                        }
+                    };
+                    let policy = app_paths()
+                        .ok()
+                        .and_then(|paths| {
+                            load_runtime_policy(paths.effective_project_config()).ok()
+                        })
+                        .unwrap_or_default();
+                    let registry = match ToolRegistry::new(&worker_workspace, policy.mode) {
+                        Ok(registry) => registry
+                            .with_cancellation(worker_cancellation.clone())
+                            .with_approval_broker(worker_approval),
+                        Err(error) => {
+                            let _ =
+                                worker_events.send(agent_protocol::Event::Error(error.to_string()));
+                            return;
+                        }
+                    };
+                    let name = argv.first().cloned().unwrap_or_default();
+                    let _ = worker_events.send(agent_protocol::Event::ToolStarted(name.clone()));
+                    let args = serde_json::json!({
+                        "program": name,
+                        "args": argv.iter().skip(1).cloned().collect::<Vec<_>>(),
+                        "cwd": worker_workspace.display().to_string(),
+                        "requires_pty": false,
+                    });
+                    match registry.execute("shell", args, &worker_cancellation) {
+                        Ok(result) => {
+                            let _ = worker_events
+                                .send(agent_protocol::Event::ToolOutputDelta(result.data));
+                            let _ = worker_events.send(agent_protocol::Event::ToolCompleted(
+                                format!("{:?}", result.status),
+                            ));
+                        }
+                        Err(error) => {
+                            let _ = worker_events.send(agent_protocol::Event::Error(
+                                redact_output(&error.to_string()),
+                            ));
+                            let _ = worker_events
+                                .send(agent_protocol::Event::ToolCompleted("error".into()));
+                        }
+                    }
+                });
+                return false;
+            }
             let local_output = if let Some(selector) = command.strip_prefix("/session-resume ") {
                 match selector.parse::<i64>() {
                     Ok(id) => match Database::open(&db_path)
@@ -2154,8 +2211,6 @@ fn interactive_command() -> Result<(), String> {
                 } else {
                     Some("theme must be dark, light, system, or monochrome".into())
                 }
-            } else if command.starts_with('!') {
-                Some(direct_command_output(prompt.trim(), &turn_cancellation))
             } else if prompt.trim_start().starts_with('@') {
                 Some(path_target_output(prompt.trim()))
             } else {
@@ -2408,7 +2463,7 @@ fn git_state_snapshot(workspace: &Path) -> (Option<String>, Option<usize>) {
     (branch, dirty_files)
 }
 
-fn direct_command_output(input: &str, cancellation: &CancellationToken) -> String {
+fn parse_direct_argv(input: &str) -> Result<Vec<String>, String> {
     let argv = input
         .trim_start_matches('!')
         .split_whitespace()
@@ -2419,30 +2474,9 @@ fn direct_command_output(input: &str, cancellation: &CancellationToken) -> Strin
                 .any(|character| matches!(character, '\'' | '"' | '`' | ';' | '|' | '&'))
         })
     {
-        return "direct command requires explicit unquoted argv".into();
+        return Err("direct command requires explicit unquoted argv".into());
     }
-    let workspace = match workspace_root() {
-        Ok(path) => path,
-        Err(error) => return format!("error: {error}"),
-    };
-    let policy = app_paths()
-        .ok()
-        .and_then(|paths| load_runtime_policy(paths.effective_project_config()).ok())
-        .unwrap_or_default();
-    let registry = match ToolRegistry::new(&workspace, policy.mode) {
-        Ok(registry) => registry,
-        Err(error) => return format!("error: {error}"),
-    };
-    let args = serde_json::json!({
-        "program": argv[0],
-        "args": argv[1..],
-        "cwd": workspace.display().to_string(),
-        "requires_pty": false,
-    });
-    match registry.execute("shell", args, cancellation) {
-        Ok(result) => result.data,
-        Err(error) => format!("permission or command error: {error}"),
-    }
+    Ok(argv.into_iter().map(str::to_owned).collect())
 }
 
 fn path_target_output(input: &str) -> String {
