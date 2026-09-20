@@ -94,7 +94,7 @@ impl ApprovalBroker {
             .ok()
             .and_then(|mut values| values.remove(&id));
         let Some(pending) = pending else { return false };
-        if decision == ApprovalDecision::AllowSession {
+        if decision == ApprovalDecision::AllowSession && pending.request.risk != "high" {
             if let Ok(mut values) = self.session.lock() {
                 values.insert(session_key(&pending.request), true);
             }
