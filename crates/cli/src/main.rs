@@ -643,7 +643,8 @@ enum RuntimeCommand {
     Hooks(Vec<String>),
     Skills(Vec<String>),
     Subagents(Vec<String>),
-    Status,
+    Tui(Vec<String>),
+    Status(Vec<String>),
 }
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigCommand {
@@ -775,11 +776,21 @@ struct RunOptions {
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "run" {
+        if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+            return Ok(Command::Help);
+        }
         return parse_run(if args.first().is_some_and(|arg| arg == "run") {
             &args[1..]
         } else {
             &args
         });
+    }
+    if args
+        .iter()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(Command::Help);
     }
     match args[0].as_str() {
         "--help" | "-h" | "help" => Ok(Command::Help),
@@ -833,7 +844,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "subagents" => Ok(Command::Runtime(RuntimeCommand::Subagents(
             args[1..].to_vec(),
         ))),
-        "status" => Ok(Command::Runtime(RuntimeCommand::Status)),
+        "tui" => Ok(Command::Runtime(RuntimeCommand::Tui(args[1..].to_vec()))),
+        "status" => Ok(Command::Runtime(RuntimeCommand::Status(args[1..].to_vec()))),
         _ => parse_run(&args),
     }
 }
@@ -3430,6 +3442,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
+    println!("TUI controls: tui show|set|keys");
     println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare; self version|install|update|uninstall; trust list|show|add|disable|enable|revoke|remove; registry status|reset|verify");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
@@ -3796,9 +3809,23 @@ fn completion_source(shell: &str) -> Result<String, String> {
 }
 
 fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
-    if matches!(&command, RuntimeCommand::Status) {
-        println!("workspace={}", workspace_root()?.display());
-        println!("config={}", config_path()?.display());
+    if let RuntimeCommand::Status(args) = &command {
+        let workspace = workspace_root()?;
+        let config = config_path()?;
+        let payload = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "workspace": workspace.display().to_string(),
+            "config": config.display().to_string(),
+            "config_valid": load_user_config(&config).is_ok(),
+            "db_present": workspace.join(".agent/state.db").is_file(),
+            "provider_default": load_user_config(&config).ok().and_then(|value| value.provider),
+            "secret_values_included": false,
+        });
+        if args.iter().any(|arg| arg == "--json") {
+            println!("{}", payload);
+        } else {
+            println!("workspace={}\nconfig={}\nconfig_valid={}\ndb_present={}\nprovider_default={}\nsecret_values_included=false", payload["workspace"], payload["config"], payload["config_valid"], payload["db_present"], payload["provider_default"].as_str().unwrap_or("unset"));
+        }
         return Ok(());
     }
     let (section, args) = match command {
@@ -3809,7 +3836,8 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
         RuntimeCommand::Hooks(args) => ("hooks", args),
         RuntimeCommand::Skills(args) => ("skills", args),
         RuntimeCommand::Subagents(args) => ("subagents", args),
-        RuntimeCommand::Status => unreachable!(),
+        RuntimeCommand::Tui(args) => ("tui", args),
+        RuntimeCommand::Status(_) => unreachable!(),
     };
     let action = args.first().map(String::as_str).unwrap_or("list");
     let path = config_path()?;
@@ -3821,6 +3849,9 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     }
     if section == "permissions" {
         return runtime_permissions_command(&args, &path);
+    }
+    if section == "tui" {
+        return tui_config_command(&args, &path);
     }
     if matches!(section, "hooks" | "skills" | "subagents") {
         return runtime_extensions_command(section, &args, &path);
@@ -3957,6 +3988,68 @@ fn enabled_plugin_names(path: &Path) -> Result<Vec<String>, String> {
                 .collect()
         })
         .unwrap_or_default())
+}
+
+fn tui_config_command(args: &[String], path: &Path) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("show");
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let current = document
+        .get("tui")
+        .cloned()
+        .unwrap_or(toml::Value::Table(Default::default()));
+    if action == "show" || action == "keys" {
+        println!(
+            "{}",
+            if action == "keys" {
+                toml::Value::String("q Esc Ctrl-C cancel; Up Down scroll".into())
+            } else {
+                current
+            }
+        );
+        return Ok(());
+    }
+    if action != "set" {
+        return Err(format!("unknown tui action: {action}"));
+    }
+    let tui = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?
+        .entry("tui")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("tui config must be a table")?;
+    for (flag, key, min, max) in [
+        ("--tick-ms", "tick_ms", 10, 1000),
+        ("--channel-capacity", "channel_capacity", 1, 4096),
+        ("--scroll-step", "scroll_step", 1, 100),
+    ] {
+        if let Some(value) = value_after(args, flag)? {
+            let parsed: i64 = value
+                .parse()
+                .map_err(|_| format!("{flag} must be an integer"))?;
+            if parsed < min || parsed > max {
+                return Err(format!("{flag} outside safe bounds"));
+            }
+            tui.insert(key.into(), toml::Value::Integer(parsed));
+        }
+    }
+    if let Some(color) = value_after(args, "--color")? {
+        if !matches!(color.as_str(), "auto" | "always" | "never") {
+            return Err("--color must be auto, always, or never".into());
+        }
+        tui.insert("color".into(), toml::Value::String(color));
+    }
+    atomic_write(
+        path,
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
 }
 
 fn set_enabled_plugin(path: &Path, id: &str, enabled: bool) -> Result<(), String> {
