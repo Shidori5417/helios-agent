@@ -1299,6 +1299,30 @@ impl PartialEq for RunOptions {
 
 impl Eq for RunOptions {}
 
+fn default_run_options(
+    prompt: String,
+    db_path: PathBuf,
+    resume: Option<String>,
+    event_sender: Option<SyncSender<agent_protocol::Event>>,
+) -> RunOptions {
+    RunOptions {
+        provider: "fake".into(),
+        model: "gpt-5".into(),
+        base_url: None,
+        prompt,
+        db_path,
+        resume,
+        tui: false,
+        config: None,
+        provider_explicit: false,
+        model_explicit: false,
+        base_url_explicit: false,
+        output_format: OutputFormat::Text,
+        exec: false,
+        event_sender,
+    }
+}
+
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     let args = extract_workspace_flag(args)?;
     if args.len() == 1 && args[0] == "--version" {
@@ -2067,22 +2091,8 @@ fn interactive_command() -> Result<(), String> {
             } else {
                 Some("latest".into())
             };
-            let options = RunOptions {
-                provider: "fake".into(),
-                model: "gpt-5".into(),
-                base_url: None,
-                prompt,
-                db_path: db_path.clone(),
-                resume,
-                tui: false,
-                config: None,
-                provider_explicit: false,
-                model_explicit: false,
-                base_url_explicit: false,
-                output_format: OutputFormat::Text,
-                exec: false,
-                event_sender: Some(events.clone()),
-            };
+            let options =
+                default_run_options(prompt, db_path.clone(), resume, Some(events.clone()));
             let options = match resolve_runtime_options(options) {
                 Ok((options, _policy, _workspace)) => options,
                 Err(error) => {
