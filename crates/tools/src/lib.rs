@@ -301,7 +301,7 @@ impl ToolRegistry {
             permissions: PermissionEngine::new(&root, mode)?,
             output_budget: 8 * 1024,
             timeout: Duration::from_secs(30),
-            spill_dir: root.join(".agent/spill"),
+            spill_dir: tool_output_cache_dir(&root),
             cancellation: CancellationToken::default(),
             approval: None,
         })
@@ -638,6 +638,14 @@ impl ToolRegistry {
             spill_ref: result.stdout.spill_ref.or(result.stderr.spill_ref),
         })
     }
+}
+
+fn tool_output_cache_dir(root: &Path) -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(|| root.join(".agent"));
+    base.join("helios/tool-output")
 }
 
 fn safe_action(name: &str, args: &Value) -> String {

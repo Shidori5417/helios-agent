@@ -353,6 +353,11 @@ fn collect<R: Read>(
         let keep = limit.saturating_sub(text.len()).min(count);
         if keep < count && spill.is_none() {
             std::fs::create_dir_all(spill_dir).map_err(TerminalError::Read)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(spill_dir, std::fs::Permissions::from_mode(0o700));
+            }
             let sequence = SPILL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = spill_dir.join(format!(
                 "spill-{}-{}-{}",
@@ -361,6 +366,11 @@ fn collect<R: Read>(
                 stream
             ));
             let mut file = std::fs::File::create(&path).map_err(TerminalError::Read)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            }
             file.write_all(&text).map_err(TerminalError::Read)?;
             spill = Some((path, file));
         }
