@@ -9,7 +9,7 @@
   },
   {
     "path": "README.md",
-    "bytes": 15452
+    "bytes": 15948
   },
   {
     "path": ".gitignore",
@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 286037
+    "bytes": 299559
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -197,7 +197,7 @@
   },
   {
     "path": "crates/memory/src/lib.rs",
-    "bytes": 10577
+    "bytes": 13124
   },
   {
     "path": "crates/protocol/Cargo.toml",
@@ -213,7 +213,7 @@
   },
   {
     "path": "crates/providers/src/lib.rs",
-    "bytes": 46119
+    "bytes": 48171
   },
   {
     "path": "crates/sandbox/Cargo.toml",
@@ -229,7 +229,7 @@
   },
   {
     "path": "crates/storage/src/lib.rs",
-    "bytes": 41998
+    "bytes": 45525
   },
   {
     "path": "crates/terminal/Cargo.toml",
@@ -245,7 +245,7 @@
   },
   {
     "path": "crates/tools/src/lib.rs",
-    "bytes": 36041
+    "bytes": 36542
   },
   {
     "path": "crates/tui/Cargo.toml",

@@ -3,6 +3,7 @@ use agent_terminal::{run, CancellationToken, CommandSpec, CommandStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -236,12 +237,14 @@ pub struct ToolRegistry {
     spill_dir: PathBuf,
     cancellation: CancellationToken,
     approval: Option<ApprovalBroker>,
+    disabled: BTreeSet<String>,
 }
 
 impl agent_core::ToolExecutor for ToolRegistry {
     fn definitions(&self) -> Vec<agent_protocol::ToolDefinition> {
         CORE_TOOL_NAMES
             .iter()
+            .filter(|name| !self.disabled.contains(**name))
             .filter_map(|name| self.metadata(name))
             .map(|metadata| agent_protocol::ToolDefinition {
                 name: metadata.id,
@@ -306,6 +309,7 @@ impl ToolRegistry {
             spill_dir: tool_output_cache_dir(&root),
             cancellation: CancellationToken::default(),
             approval: None,
+            disabled: BTreeSet::new(),
         })
     }
 
@@ -316,6 +320,15 @@ impl ToolRegistry {
 
     pub fn with_approval_broker(mut self, approval: ApprovalBroker) -> Self {
         self.approval = Some(approval);
+        self
+    }
+
+    pub fn with_disabled_tools<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.disabled = names.into_iter().map(Into::into).collect();
         self
     }
 
@@ -395,6 +408,9 @@ impl ToolRegistry {
         args: Value,
         cancellation: &CancellationToken,
     ) -> Result<ToolOutcome, ToolError> {
+        if self.disabled.contains(name) {
+            return Err(ToolError::UnknownTool(name.into()));
+        }
         let metadata = self
             .metadata(name)
             .ok_or_else(|| ToolError::UnknownTool(name.into()))?;

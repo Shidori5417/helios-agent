@@ -18,8 +18,8 @@ use agent_plugins::{
 use agent_plugins::{HookEvent, PluginRegistry};
 use agent_protocol::{Message, Role};
 use agent_providers::{
-    anthropic_profile, gemini_profile, generic_profile, openai_profile, AnthropicProvider,
-    FakeProvider, GeminiProvider, ModelProvider, OpenAiCompatibleProvider, OpenAiProvider,
+    profile_for, AnthropicProvider, FakeProvider, GeminiProvider, ModelProvider,
+    OpenAiCompatibleProvider, OpenAiProvider,
 };
 use agent_sandbox::PermissionEngine;
 use agent_sandbox::PermissionMode;
@@ -1147,6 +1147,7 @@ enum RuntimeCommand {
     Skills(Vec<String>),
     Subagents(Vec<String>),
     Tui(Vec<String>),
+    Tools(Vec<String>),
     Status(Vec<String>),
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -1231,12 +1232,25 @@ enum MemoryCommand {
         content: String,
         kind: String,
         importance: i64,
+        pending: bool,
     },
     Supersede {
         db_path: PathBuf,
         id: i64,
     },
     Delete {
+        db_path: PathBuf,
+        id: i64,
+    },
+    Pending {
+        db_path: PathBuf,
+        limit: usize,
+    },
+    Approve {
+        db_path: PathBuf,
+        id: i64,
+    },
+    Reject {
         db_path: PathBuf,
         id: i64,
     },
@@ -1267,6 +1281,7 @@ enum PluginCommand {
 struct RunOptions {
     provider: String,
     model: String,
+    effort: Option<String>,
     base_url: Option<String>,
     prompt: String,
     db_path: PathBuf,
@@ -1286,6 +1301,7 @@ impl PartialEq for RunOptions {
     fn eq(&self, other: &Self) -> bool {
         self.provider == other.provider
             && self.model == other.model
+            && self.effort == other.effort
             && self.base_url == other.base_url
             && self.prompt == other.prompt
             && self.db_path == other.db_path
@@ -1311,6 +1327,7 @@ fn default_run_options(
     RunOptions {
         provider: "fake".into(),
         model: "gpt-5".into(),
+        effort: None,
         base_url: None,
         prompt,
         db_path,
@@ -1425,6 +1442,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
             args[1..].to_vec(),
         ))),
         "tui" => Ok(Command::Runtime(RuntimeCommand::Tui(args[1..].to_vec()))),
+        "tools" => Ok(Command::Runtime(RuntimeCommand::Tools(args[1..].to_vec()))),
         "status" => Ok(Command::Runtime(RuntimeCommand::Status(args[1..].to_vec()))),
         _ => parse_run(&args, false),
     }
@@ -1901,6 +1919,7 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
                 })
                 .transpose()?
                 .unwrap_or(1),
+            pending: args.iter().any(|arg| arg == "--pending"),
         })),
         "supersede" => Ok(Command::Memory(MemoryCommand::Supersede {
             db_path,
@@ -1909,6 +1928,15 @@ fn parse_memory(args: &[String]) -> Result<Command, String> {
         "delete" => Ok(Command::Memory(MemoryCommand::Delete {
             db_path,
             id: required_id(&args[1..], "--id")?,
+        })),
+        "pending" => Ok(Command::Memory(MemoryCommand::Pending { db_path, limit })),
+        "approve" => Ok(Command::Memory(MemoryCommand::Approve {
+            db_path,
+            id: required_id(&args[1..], "approve")?,
+        })),
+        "reject" => Ok(Command::Memory(MemoryCommand::Reject {
+            db_path,
+            id: required_id(&args[1..], "reject")?,
         })),
         other => Err(format!("unknown memory command: {other}")),
     }
@@ -1959,6 +1987,7 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
     let mut options = RunOptions {
         provider: "fake".into(),
         model: "gpt-5".into(),
+        effort: None,
         base_url: None,
         prompt: String::new(),
         db_path: default_db_path()?,
@@ -1985,6 +2014,11 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
             "--model" => {
                 options.model = required_value(args, &mut index, "--model")?;
                 options.model_explicit = true;
+            }
+            "--effort" => {
+                let value = required_value(args, &mut index, "--effort")?;
+                validate_effort(&value)?;
+                options.effort = Some(value);
             }
             "--base-url" => {
                 options.base_url = Some(required_value(args, &mut index, "--base-url")?);
@@ -2033,6 +2067,17 @@ fn required_value(args: &[String], index: &mut usize, name: &str) -> Result<Stri
         .filter(|value| !value.starts_with('-'))
         .ok_or_else(|| format!("{name} requires a value"))
 }
+
+fn validate_effort(value: &str) -> Result<(), String> {
+    if matches!(
+        value,
+        "auto" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    ) {
+        Ok(())
+    } else {
+        Err("--effort must be auto, minimal, low, medium, high, xhigh, or max".into())
+    }
+}
 fn value_after(args: &[String], name: &str) -> Result<Option<String>, String> {
     args.iter()
         .position(|arg| arg == name)
@@ -2072,6 +2117,7 @@ fn interactive_command() -> Result<(), String> {
     let first_turn = Arc::new(AtomicBool::new(true));
     let session_model = Arc::new(Mutex::new(None::<String>));
     let session_provider = Arc::new(Mutex::new(None::<String>));
+    let session_effort = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
     let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
@@ -2092,6 +2138,7 @@ fn interactive_command() -> Result<(), String> {
                 let input = prompt.trim().to_owned();
                 let worker_events = events.clone();
                 let worker_workspace = workspace_path.clone();
+                let worker_config = project_config_path.clone();
                 let worker_approval = approval.clone();
                 let worker_cancellation = turn_cancellation.clone();
                 std::thread::spawn(move || {
@@ -2110,6 +2157,9 @@ fn interactive_command() -> Result<(), String> {
                         .unwrap_or_default();
                     let registry = match ToolRegistry::new(&worker_workspace, policy.mode) {
                         Ok(registry) => registry
+                            .with_disabled_tools(
+                                disabled_tool_names(&worker_config).unwrap_or_default(),
+                            )
                             .with_cancellation(worker_cancellation.clone())
                             .with_approval_broker(worker_approval),
                         Err(error) => {
@@ -2281,6 +2331,9 @@ fn interactive_command() -> Result<(), String> {
                         if let Ok(mut model) = session_model.lock() {
                             *model = summary.model.clone();
                         }
+                        if let Ok(mut effort) = session_effort.lock() {
+                            *effort = summary.effort.clone();
+                        }
                         let _ = events.send(agent_protocol::Event::SessionReset(format!(
                             "resumed session #{}",
                             summary.id
@@ -2433,6 +2486,19 @@ fn interactive_command() -> Result<(), String> {
                             if let Ok(mut active) = active_session.lock() {
                                 *active = Some(id);
                             }
+                            if let Ok(mut effort) = session_effort.lock() {
+                                *effort = Database::open(&db_path)
+                                    .ok()
+                                    .and_then(|db| {
+                                        db.session_override(
+                                            id,
+                                            &workspace_path.display().to_string(),
+                                        )
+                                        .ok()
+                                        .flatten()
+                                    })
+                                    .and_then(|value| value.effort);
+                            }
                             first_turn.store(false, Ordering::Release);
                             Some(format!("resumed session #{}: {}", id, record.objective))
                         }
@@ -2475,6 +2541,30 @@ fn interactive_command() -> Result<(), String> {
                         }
                     }
                     Some(format!("session model={model}"))
+                }
+            } else if let Some(effort) = command.strip_prefix("/effort ") {
+                match validate_effort(effort) {
+                    Ok(()) => {
+                        if let Ok(mut selected) = session_effort.lock() {
+                            *selected = Some(effort.to_owned());
+                        }
+                        if let Ok(active) = active_session.lock() {
+                            if let Some(session_id) = *active {
+                                let _ = Database::open(&db_path).and_then(|db| {
+                                    db.set_session_override(
+                                        session_id,
+                                        &workspace_path.display().to_string(),
+                                        None,
+                                        None,
+                                        Some(effort),
+                                        None,
+                                    )
+                                });
+                            }
+                        }
+                        Some(format!("effort={effort}"))
+                    }
+                    Err(error) => Some(error),
                 }
             } else if let Some(theme) = command.strip_prefix("/theme ") {
                 if matches!(theme, "dark" | "light" | "system" | "monochrome") {
@@ -2535,6 +2625,11 @@ fn interactive_command() -> Result<(), String> {
                     options.model_explicit = true;
                 }
             }
+            if let Ok(selected) = session_effort.lock() {
+                if let Some(effort) = selected.clone() {
+                    options.effort = Some(effort);
+                }
+            }
             let options = match resolve_runtime_options(options) {
                 Ok((options, _policy, _workspace)) => options,
                 Err(error) => {
@@ -2588,6 +2683,10 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         ("diff", "show bounded read-only git diff"),
         ("model", "show the configured model"),
         ("effort", "show provider effort support"),
+        ("usage", "show normalized provider usage"),
+        ("cost", "show configured cost or unavailable"),
+        ("tools", "inspect enabled tool catalog"),
+        ("memory", "inspect bounded project memory"),
         ("version", "show Helios version"),
         ("new", "start a new workspace session"),
         ("clear", "clear active context and retain durable history"),
@@ -2729,15 +2828,13 @@ fn help_category(category: &str) -> &'static str {
 }
 
 fn provider_capability_summary(provider: &str) -> String {
-    let capabilities = match provider {
-        "openai" => openai_profile().capabilities,
-        "anthropic" => anthropic_profile().capabilities,
-        "gemini" => gemini_profile().capabilities,
-        "generic" | "openai-compatible" => generic_profile().capabilities,
-        _ => return "capabilities=unknown".into(),
+    let Some(profile) = profile_for(provider) else {
+        return "capabilities=unknown".into();
     };
+    let capabilities = profile.capabilities;
     format!(
-        "tools,caching={},compaction={},reasoning={},streaming={}",
+        "context_window={:?},tools,caching={},compaction={},reasoning={},streaming={}",
+        capabilities.context_window,
         capabilities.prompt_caching,
         capabilities.native_compaction,
         capabilities.reasoning_controls,
@@ -2820,6 +2917,42 @@ fn slash_command_output(command: &str) -> Option<String> {
                 .unwrap_or_else(|| "model=unavailable".into())
         }),
         "/effort" => Some("effort=provider-default (no session override)".into()),
+        "/usage" => app_paths().ok().and_then(|paths| {
+            let db = Database::open(&paths.db_path).ok()?;
+            let session = db
+                .latest_session(&paths.workspace.display().to_string())
+                .ok()??;
+            let usage = db.usage_for_session(session.id).ok()?;
+            Some(format!(
+                "usage input={} output={} cache_read={} cache_write={} reasoning={} total={}",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.reasoning_tokens,
+                usage.total_tokens
+            ))
+        }),
+        "/cost" => Some("cost=unavailable (configure explicit provider pricing)".into()),
+        "/tools" | "/tools list" => app_paths().ok().and_then(|paths| {
+            let policy = load_runtime_policy(paths.effective_project_config()).ok()?;
+            let registry = ToolRegistry::new(&paths.workspace, policy.mode).ok()?;
+            Some(
+                registry
+                    .definitions()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        }),
+        "/memory" | "/memory list" => app_paths().ok().and_then(|paths| {
+            let store = SqliteMemoryStore::open(&paths.db_path, 128, 16 * 1024).ok()?;
+            let entries = store
+                .list(&paths.workspace.display().to_string(), 20)
+                .ok()?;
+            Some(format!("memory={}", entries.len()))
+        }),
         "/status" => app_paths().ok().map(|paths| {
             format!(
                 "workspace={}\nconfig={}\ndb_present={}",
@@ -2989,6 +3122,9 @@ fn run_command_with_cancellation(
                     options.model = model;
                 }
             }
+            if options.effort.is_none() {
+                options.effort = override_config.effort;
+            }
         }
     }
     database
@@ -2997,11 +3133,13 @@ fn run_command_with_cancellation(
             &workspace_id,
             Some(&options.provider),
             Some(&options.model),
-            None,
+            options.effort.as_deref(),
             None,
         )
         .map_err(|error| error.to_string())?;
-    let config_path = runtime_config_path.is_file().then_some(runtime_config_path);
+    let config_path = runtime_config_path
+        .is_file()
+        .then_some(runtime_config_path.clone());
     let mut servers = config_path
         .as_ref()
         .map(|path| load_mcp_config(path, &workspace))
@@ -3038,8 +3176,10 @@ fn run_command_with_cancellation(
             });
         }
     }
+    let disabled_tools = disabled_tool_names(&runtime_config_path)?;
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
+        .with_disabled_tools(disabled_tools)
         .with_cancellation(cancellation.clone());
     let builtin = if let Some(approval) = options.approval.clone() {
         builtin.with_approval_broker(approval)
@@ -3230,6 +3370,9 @@ fn run_selected_provider(
     live_stdout: bool,
     cancellation: CancellationToken,
 ) -> Result<RunOutcome, String> {
+    let context_budget = profile_for(&options.provider)
+        .and_then(|profile| profile.capabilities.context_window)
+        .unwrap_or(16_000);
     match options.provider.as_str() {
         "fake" => run_provider(
             FakeProvider,
@@ -3244,6 +3387,7 @@ fn run_selected_provider(
             live_stdout,
             live_events,
             cancellation.clone(),
+            context_budget,
         ),
         "openai" => run_provider(
             OpenAiProvider::with_credentials(
@@ -3266,6 +3410,7 @@ fn run_selected_provider(
             live_stdout,
             live_events,
             cancellation.clone(),
+            context_budget,
         ),
         "anthropic" => run_provider(
             AnthropicProvider::with_credentials(
@@ -3288,6 +3433,7 @@ fn run_selected_provider(
             live_stdout,
             live_events,
             cancellation.clone(),
+            context_budget,
         ),
         "gemini" => run_provider(
             GeminiProvider::with_credentials(
@@ -3312,6 +3458,7 @@ fn run_selected_provider(
             live_stdout,
             live_events,
             cancellation.clone(),
+            context_budget,
         ),
         "generic" | "openai-compatible" => run_provider(
             OpenAiCompatibleProvider::with_credentials(
@@ -3334,6 +3481,7 @@ fn run_selected_provider(
             live_stdout,
             live_events,
             cancellation,
+            context_budget,
         ),
         other => Err(format!("unknown provider: {other}")),
     }
@@ -3353,10 +3501,12 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
     live_stdout: bool,
     live_events: Option<SyncSender<agent_protocol::Event>>,
     cancellation: CancellationToken,
+    context_budget: u64,
 ) -> Result<RunOutcome, String> {
     let previous = messages.len();
     let memory_scope = workspace_root()?.display().to_string();
     let mut agent = AgentLoop::new(provider)
+        .with_context_budget(context_budget)
         .with_memory_scope(memory_scope)
         .with_memory_retriever(Box::new(StaticMemory(startup_memory)))
         .with_compactor(Box::new(LocalCompactor));
@@ -4791,18 +4941,38 @@ fn context_command(db_path: PathBuf, selector: Option<String>, json: bool) -> Re
     } else {
         for (index, record) in records.iter().enumerate() {
             println!(
-                "turn={} budget={} estimated={} selected={} dropped={} truncated={} fingerprint={}",
+                "turn={} budget={} estimated={} selected={} dropped={} truncated={}{} fingerprint={}",
                 index + 1,
                 record.budget,
                 record.estimated_tokens,
                 record.selected_count,
                 record.dropped_count,
                 record.truncated_count,
+                context_warning(record.estimated_tokens, record.budget),
                 record.fingerprint
             );
         }
     }
     Ok(())
+}
+
+fn context_warning(estimated: u64, budget: u64) -> String {
+    if budget == 0 {
+        return "".into();
+    }
+    let percent = estimated
+        .saturating_mul(100)
+        .checked_div(budget)
+        .unwrap_or(100);
+    if percent >= 95 {
+        " warning=95%".into()
+    } else if percent >= 85 {
+        " warning=85%".into()
+    } else if percent >= 70 {
+        " warning=70%".into()
+    } else {
+        String::new()
+    }
 }
 
 fn usage_command(db_path: PathBuf, selector: Option<String>, json: bool) -> Result<(), String> {
@@ -4893,20 +5063,25 @@ fn memory_command(command: MemoryCommand) -> Result<(), String> {
             content,
             kind,
             importance,
+            pending,
         } => {
             let mut store = SqliteMemoryStore::open(db_path, 128, 16 * 1024)
                 .map_err(|error| error.to_string())?;
-            let id = store
-                .put(MemoryEntry {
-                    scope: workspace,
-                    kind,
-                    key,
-                    content,
-                    confidence: 1.0,
-                    importance,
-                    source_session_id: None,
-                })
-                .map_err(|error| error.to_string())?;
+            let entry = MemoryEntry {
+                scope: workspace,
+                kind,
+                key,
+                content,
+                confidence: 1.0,
+                importance,
+                source_session_id: None,
+            };
+            let id = if pending {
+                store.propose(entry)
+            } else {
+                store.put(entry)
+            }
+            .map_err(|error| error.to_string())?;
             println!("{id}");
         }
         MemoryCommand::Supersede { db_path, id } => {
@@ -4922,6 +5097,39 @@ fn memory_command(command: MemoryCommand) -> Result<(), String> {
             store
                 .delete_scoped(&workspace, id)
                 .map_err(|error| error.to_string())?;
+        }
+        MemoryCommand::Pending { db_path, limit } => {
+            let store = SqliteMemoryStore::open(db_path, 128, 16 * 1024)
+                .map_err(|error| error.to_string())?;
+            for memory in store
+                .pending(&workspace, limit)
+                .map_err(|error| error.to_string())?
+            {
+                println!(
+                    "{}\t{}\t{}",
+                    memory.id, memory.entry.key, memory.entry.content
+                );
+            }
+        }
+        MemoryCommand::Approve { db_path, id } => {
+            let mut store = SqliteMemoryStore::open(db_path, 128, 16 * 1024)
+                .map_err(|error| error.to_string())?;
+            if !store
+                .approve_pending(&workspace, id)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("pending memory entry not found in this workspace".into());
+            }
+        }
+        MemoryCommand::Reject { db_path, id } => {
+            let mut store = SqliteMemoryStore::open(db_path, 128, 16 * 1024)
+                .map_err(|error| error.to_string())?;
+            if !store
+                .reject_pending(&workspace, id)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("pending memory entry not found in this workspace".into());
+            }
         }
     }
     Ok(())
@@ -5352,6 +5560,27 @@ fn load_runtime_policy(path: &Path) -> Result<RuntimePolicy, String> {
     })
 }
 
+fn disabled_tool_names(path: &Path) -> Result<Vec<String>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?;
+    Ok(document
+        .get("tools")
+        .and_then(|value| value.get("disabled"))
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 fn config_command(command: ConfigCommand) -> Result<(), String> {
     let path = config_path()?;
     match command {
@@ -5778,6 +6007,7 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
         RuntimeCommand::Skills(args) => ("skills", args),
         RuntimeCommand::Subagents(args) => ("subagents", args),
         RuntimeCommand::Tui(args) => ("tui", args),
+        RuntimeCommand::Tools(args) => ("tools", args),
         RuntimeCommand::Status(_) => unreachable!(),
     };
     let action = args.first().map(String::as_str).unwrap_or("list");
@@ -5793,6 +6023,9 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     }
     if section == "tui" {
         return tui_config_command(&args, &path);
+    }
+    if section == "tools" {
+        return tools_config_command(&args, &path);
     }
     if matches!(section, "hooks" | "skills" | "subagents") {
         return runtime_extensions_command(section, &args, &path);
@@ -5908,6 +6141,72 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     }
     let bytes = toml::to_string_pretty(&document).map_err(|e| e.to_string())?;
     atomic_write(&path, bytes.as_bytes())
+}
+
+fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let workspace = workspace_root()?;
+    let policy = load_runtime_policy(path).unwrap_or_default();
+    let registry = ToolRegistry::new(&workspace, policy.mode).map_err(|e| e.to_string())?;
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    if action == "list" || action == "info" {
+        let disabled = disabled_tool_names(path)?;
+        let requested = args.get(1).cloned();
+        for definition in registry
+            .definitions()
+            .into_iter()
+            .filter(|tool| requested.as_deref().is_none_or(|name| name == tool.name))
+        {
+            println!(
+                "{}\tenabled={}\t{}",
+                definition.name,
+                !disabled.iter().any(|name| name == &definition.name),
+                definition.description
+            );
+        }
+        return Ok(());
+    }
+    let id = value_after(&args[1..], "--id")?
+        .or_else(|| args.get(1).cloned())
+        .ok_or("tools action requires exact tool id")?;
+    if registry.metadata(&id).is_none() {
+        return Err("unknown tool".into());
+    }
+    let table = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?
+        .entry("tools")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("tools config must be a table")?;
+    let disabled = table
+        .entry("disabled")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("tools.disabled must be an array")?;
+    match action {
+        "enable" => disabled.retain(|value| value.as_str() != Some(id.as_str())),
+        "disable" => {
+            if !disabled
+                .iter()
+                .any(|value| value.as_str() == Some(id.as_str()))
+            {
+                disabled.push(toml::Value::String(id));
+            }
+        }
+        _ => return Err(format!("unsupported tools action: {action}")),
+    }
+    atomic_write(
+        path,
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
 }
 
 fn enabled_plugin_names(path: &Path) -> Result<Vec<String>, String> {
@@ -7134,6 +7433,7 @@ mod tests {
         let options = RunOptions {
             provider: "fake".into(),
             model: "gpt-5".into(),
+            effort: None,
             base_url: None,
             prompt: "hello".into(),
             db_path: root.join("state.db"),
@@ -7503,6 +7803,63 @@ mod tests {
         assert!(
             runtime_permissions_command(&["env-allow".into(), "API_TOKEN".into()], &path,).is_err()
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn effort_is_typed_and_persisted_on_session_override() {
+        assert!(validate_effort("xhigh").is_ok());
+        assert!(validate_effort("turbo").is_err());
+        let db = Database::in_memory().expect("db");
+        let id = db
+            .create_session_for_workspace("task", "/workspace")
+            .expect("session");
+        db.set_session_override(
+            id,
+            "/workspace",
+            Some("fake"),
+            Some("gpt-5"),
+            Some("high"),
+            None,
+        )
+        .expect("override");
+        assert_eq!(
+            db.session_override(id, "/workspace")
+                .expect("read")
+                .expect("override")
+                .effort
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn disabled_tool_config_is_read_for_runtime() {
+        let root = std::env::temp_dir().join(format!("helios-tools-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("config.toml");
+        atomic_write(&path, b"[tools]\ndisabled = [\"shell\"]\n").expect("write");
+        assert_eq!(disabled_tool_names(&path).expect("read"), vec!["shell"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tools_disable_is_persisted_in_runtime_config() {
+        let root =
+            std::env::temp_dir().join(format!("helios-tools-disable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+        runtime_command(RuntimeCommand::Tools(vec![
+            "disable".into(),
+            "--id".into(),
+            "shell".into(),
+        ]))
+        .expect("disable");
+        let disabled = disabled_tool_names(&root.join(".helios/config.toml")).expect("read");
+        assert_eq!(disabled, vec!["shell"]);
+        WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
         let _ = fs::remove_dir_all(root);
     }
 }

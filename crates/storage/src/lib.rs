@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 7;
+pub const STORAGE_FORMAT_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -69,6 +69,17 @@ pub struct SessionOverride {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingMemoryRecord {
+    pub id: i64,
+    pub scope: String,
+    pub kind: String,
+    pub key: String,
+    pub content: String,
+    pub confidence: f64,
+    pub importance: i64,
 }
 
 pub struct Database {
@@ -194,6 +205,12 @@ impl Database {
                  CREATE TABLE IF NOT EXISTS context_boundaries (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id), message_id INTEGER NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL);
                  CREATE INDEX IF NOT EXISTS context_boundaries_session ON context_boundaries(session_id, id);
                  PRAGMA user_version = 7;",
+            )?;
+        }
+        if version < 8 {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS pending_memory (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, confidence REAL NOT NULL, importance INTEGER NOT NULL, created_at INTEGER NOT NULL);
+                 PRAGMA user_version = 8;",
             )?;
         }
         Ok(())
@@ -671,6 +688,56 @@ impl Database {
     pub fn active_memory_id(&self, scope: &str, kind: &str, key: &str) -> SqlResult<Option<i64>> {
         self.connection.query_row("SELECT id FROM memory WHERE scope = ?1 AND kind = ?2 AND key = ?3 AND status = 'active' ORDER BY id DESC LIMIT 1", params![scope, kind, key], |row| row.get(0)).optional()
     }
+
+    pub fn add_pending_memory(
+        &self,
+        scope: &str,
+        kind: &str,
+        key: &str,
+        content: &str,
+        confidence: f64,
+        importance: i64,
+    ) -> SqlResult<i64> {
+        self.connection.execute(
+            "INSERT INTO pending_memory(scope, kind, key, content, confidence, importance, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'))",
+            params![scope, kind, key, content, confidence, importance],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn pending_memory(&self, scope: &str, limit: usize) -> SqlResult<Vec<PendingMemoryRecord>> {
+        let mut statement = self.connection.prepare("SELECT id, scope, kind, key, content, confidence, importance FROM pending_memory WHERE scope = ?1 ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(params![scope, limit.min(1_000) as i64], |row| {
+            Ok(PendingMemoryRecord {
+                id: row.get(0)?,
+                scope: row.get(1)?,
+                kind: row.get(2)?,
+                key: row.get(3)?,
+                content: row.get(4)?,
+                confidence: row.get(5)?,
+                importance: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn approve_pending_memory(&self, id: i64, scope: &str) -> SqlResult<bool> {
+        let changed = self.connection.execute("INSERT INTO memory(scope, kind, key, content, confidence, importance, created_at, updated_at, last_accessed_at, access_count, status) SELECT scope, kind, key, content, confidence, importance, strftime('%s','now'), strftime('%s','now'), strftime('%s','now'), 0, 'active' FROM pending_memory WHERE id = ?1 AND scope = ?2", params![id, scope])?;
+        if changed == 1 {
+            self.connection.execute(
+                "DELETE FROM pending_memory WHERE id = ?1 AND scope = ?2",
+                params![id, scope],
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    pub fn reject_pending_memory(&self, id: i64, scope: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM pending_memory WHERE id = ?1 AND scope = ?2",
+            params![id, scope],
+        )? == 1)
+    }
 }
 
 pub fn bounded_event_payload(payload: &str) -> String {
@@ -1002,5 +1069,23 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_memory_roundtrip_is_workspace_scoped() {
+        let db = Database::in_memory().expect("db");
+        let id = db
+            .add_pending_memory("/workspace", "fact", "key", "value", 1.0, 2)
+            .expect("pending");
+        assert_eq!(db.pending_memory("/workspace", 10).expect("list")[0].id, id);
+        assert!(db.pending_memory("/other", 10).expect("other").is_empty());
+        assert!(db
+            .approve_pending_memory(id, "/workspace")
+            .expect("approve"));
+        assert!(db
+            .pending_memory("/workspace", 10)
+            .expect("empty")
+            .is_empty());
+        assert_eq!(db.memory_count().expect("memory"), 1);
     }
 }

@@ -35,6 +35,9 @@ pub enum MemoryError {
 
 pub trait MemoryStore {
     fn put(&mut self, entry: MemoryEntry) -> Result<i64, MemoryError>;
+    fn propose(&mut self, entry: MemoryEntry) -> Result<i64, MemoryError> {
+        self.put(entry)
+    }
     fn search(&self, query: &str, limit: usize) -> Result<Vec<StoredMemory>, MemoryError>;
     fn search_scoped(
         &self,
@@ -73,6 +76,15 @@ pub trait MemoryStore {
         Ok(())
     }
     fn count(&self) -> Result<usize, MemoryError>;
+    fn pending(&self, _scope: &str, _limit: usize) -> Result<Vec<StoredMemory>, MemoryError> {
+        Ok(Vec::new())
+    }
+    fn approve_pending(&mut self, _scope: &str, _id: i64) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
+    fn reject_pending(&mut self, _scope: &str, _id: i64) -> Result<bool, MemoryError> {
+        Ok(false)
+    }
 }
 
 pub struct SqliteMemoryStore {
@@ -132,6 +144,25 @@ impl MemoryStore for SqliteMemoryStore {
         Ok(id)
     }
 
+    fn propose(&mut self, entry: MemoryEntry) -> Result<i64, MemoryError> {
+        if entry.content.len() > self.max_content_bytes {
+            return Err(MemoryError::ContentTooLarge {
+                limit: self.max_content_bytes,
+            });
+        }
+        if is_secret_like(&entry.key) || is_secret_like(&entry.content) {
+            return Err(MemoryError::SecretLike);
+        }
+        Ok(self.database.add_pending_memory(
+            &entry.scope,
+            &entry.kind,
+            &entry.key,
+            &entry.content,
+            entry.confidence,
+            entry.importance,
+        )?)
+    }
+
     fn search(&self, query: &str, limit: usize) -> Result<Vec<StoredMemory>, MemoryError> {
         let mut statement = self.database.connection().prepare("SELECT m.id, m.scope, m.kind, m.key, m.content, m.confidence, m.importance, m.source_session_id FROM memory_fts f JOIN memory m ON m.id = f.rowid WHERE memory_fts MATCH ?1 AND m.status = 'active' ORDER BY bm25(memory_fts), m.importance DESC LIMIT ?2")?;
         let rows = statement.query_map(params![query, limit as i64], |row| {
@@ -153,6 +184,34 @@ impl MemoryStore for SqliteMemoryStore {
 
     fn count(&self) -> Result<usize, MemoryError> {
         Ok(self.database.memory_count()?)
+    }
+
+    fn pending(&self, scope: &str, limit: usize) -> Result<Vec<StoredMemory>, MemoryError> {
+        Ok(self
+            .database
+            .pending_memory(scope, limit)?
+            .into_iter()
+            .map(|memory| StoredMemory {
+                id: memory.id,
+                entry: MemoryEntry {
+                    scope: memory.scope,
+                    kind: memory.kind,
+                    key: memory.key,
+                    content: memory.content,
+                    confidence: memory.confidence,
+                    importance: memory.importance,
+                    source_session_id: None,
+                },
+            })
+            .collect())
+    }
+
+    fn approve_pending(&mut self, scope: &str, id: i64) -> Result<bool, MemoryError> {
+        Ok(self.database.approve_pending_memory(id, scope)?)
+    }
+
+    fn reject_pending(&mut self, scope: &str, id: i64) -> Result<bool, MemoryError> {
+        Ok(self.database.reject_pending_memory(id, scope)?)
     }
 
     fn list(&self, scope: &str, limit: usize) -> Result<Vec<StoredMemory>, MemoryError> {
@@ -294,5 +353,16 @@ mod tests {
             store.put(entry("safe", "Bearer abc")),
             Err(MemoryError::SecretLike)
         ));
+    }
+
+    #[test]
+    fn pending_entries_require_explicit_approval() {
+        let mut store = SqliteMemoryStore::in_memory(4, 1024).expect("store");
+        let id = store
+            .propose(entry("candidate", "safe fact"))
+            .expect("propose");
+        assert_eq!(store.pending("project", 10).expect("pending").len(), 1);
+        assert!(store.approve_pending("project", id).expect("approve"));
+        assert_eq!(store.list("project", 10).expect("list").len(), 1);
     }
 }

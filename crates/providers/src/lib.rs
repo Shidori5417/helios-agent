@@ -55,10 +55,22 @@ pub enum ToolShape {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderCapabilities {
     pub tool_shape: ToolShape,
+    pub context_window: Option<u64>,
+    pub reasoning_levels: &'static [ReasoningLevel],
     pub prompt_caching: bool,
     pub native_compaction: bool,
     pub reasoning_controls: bool,
     pub streaming: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReasoningLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +84,15 @@ pub fn openai_profile() -> ProviderProfile {
         name: "openai",
         capabilities: ProviderCapabilities {
             tool_shape: ToolShape::OpenAiResponses,
+            context_window: None,
+            reasoning_levels: &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
             prompt_caching: true,
             native_compaction: true,
             reasoning_controls: true,
@@ -84,6 +105,12 @@ pub fn anthropic_profile() -> ProviderProfile {
         name: "anthropic",
         capabilities: ProviderCapabilities {
             tool_shape: ToolShape::AnthropicMessages,
+            context_window: None,
+            reasoning_levels: &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ],
             prompt_caching: true,
             native_compaction: false,
             reasoning_controls: true,
@@ -96,6 +123,8 @@ pub fn gemini_profile() -> ProviderProfile {
         name: "gemini",
         capabilities: ProviderCapabilities {
             tool_shape: ToolShape::GeminiFunctions,
+            context_window: None,
+            reasoning_levels: &[],
             prompt_caching: true,
             native_compaction: false,
             reasoning_controls: true,
@@ -108,11 +137,35 @@ pub fn generic_profile() -> ProviderProfile {
         name: "generic",
         capabilities: ProviderCapabilities {
             tool_shape: ToolShape::OpenAiChatCompletions,
+            context_window: None,
+            reasoning_levels: &[],
             prompt_caching: false,
             native_compaction: false,
             reasoning_controls: false,
             streaming: true,
         },
+    }
+}
+
+pub fn profile_for(provider: &str) -> Option<ProviderProfile> {
+    match provider {
+        "openai" => Some(openai_profile()),
+        "anthropic" => Some(anthropic_profile()),
+        "gemini" => Some(gemini_profile()),
+        "generic" | "openai-compatible" => Some(generic_profile()),
+        "fake" => Some(ProviderProfile {
+            name: "fake",
+            capabilities: ProviderCapabilities {
+                tool_shape: ToolShape::OpenAiChatCompletions,
+                context_window: None,
+                reasoning_levels: &[],
+                prompt_caching: false,
+                native_compaction: false,
+                reasoning_controls: false,
+                streaming: true,
+            },
+        }),
+        _ => None,
     }
 }
 
@@ -1256,6 +1309,17 @@ data: [DONE]
             parse_chat_stream,
         );
         assert!(matches!(result, Err(ProviderError::Cancelled)));
+    }
+
+    #[test]
+    fn capability_profiles_are_explicit_about_unknowns() {
+        assert_eq!(openai_profile().capabilities.context_window, None);
+        assert!(openai_profile()
+            .capabilities
+            .reasoning_levels
+            .contains(&ReasoningLevel::XHigh));
+        assert_eq!(gemini_profile().capabilities.context_window, None);
+        assert!(profile_for("not-a-provider").is_none());
     }
 
     #[test]
