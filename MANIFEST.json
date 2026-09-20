@@ -157,7 +157,7 @@
   },
   {
     "path": "Cargo.toml",
-    "bytes": 1117
+    "bytes": 1129
   },
   {
     "path": "crates/cli/Cargo.toml",
@@ -257,7 +257,7 @@
   },
   {
     "path": "Cargo.lock",
-    "bytes": 61550
+    "bytes": 63092
   },
   {
     "path": "crates/mcp/Cargo.toml",
