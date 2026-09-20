@@ -85,7 +85,25 @@ impl Database {
     }
 
     pub fn open(path: impl AsRef<Path>) -> SqlResult<Self> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            let parent_existed = parent.is_dir();
+            std::fs::create_dir_all(parent)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            #[cfg(unix)]
+            if !parent_existed {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            }
+        }
         let connection = Connection::open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        }
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let database = Self { connection };
@@ -952,5 +970,37 @@ mod tests {
             db.session_context_messages(session).expect("context")[0].1,
             "checkpoint summary"
         );
+    }
+
+    #[test]
+    fn open_creates_xdg_style_parent_without_workspace_files() {
+        let root =
+            std::env::temp_dir().join(format!("helios-storage-first-use-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let db_path = root.join("data/helios/state.db");
+        let db = Database::open(&db_path).expect("first open");
+        drop(db);
+        assert!(db_path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&db_path)
+                    .expect("db metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(db_path.parent().expect("parent"))
+                    .expect("parent metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }

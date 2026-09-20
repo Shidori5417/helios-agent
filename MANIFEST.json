@@ -229,7 +229,7 @@
   },
   {
     "path": "crates/storage/src/lib.rs",
-    "bytes": 40067
+    "bytes": 41998
   },
   {
     "path": "crates/terminal/Cargo.toml",
