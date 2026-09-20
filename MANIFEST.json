@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 246175
+    "bytes": 248110
   },
   {
     "path": "crates/context/Cargo.toml",

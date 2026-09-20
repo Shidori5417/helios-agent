@@ -2049,7 +2049,14 @@ fn interactive_command() -> Result<(), String> {
             if command == "/exit" || command == "/quit" {
                 return true;
             }
-            if let Some(output) = slash_command_output(&command) {
+            let local_output = if command.starts_with('!') {
+                Some(direct_command_output(prompt.trim(), &turn_cancellation))
+            } else if prompt.trim_start().starts_with('@') {
+                Some(path_target_output(prompt.trim()))
+            } else {
+                slash_command_output(&command)
+            };
+            if let Some(output) = local_output {
                 let _ = events.send(agent_protocol::Event::TurnStarted);
                 let _ = events.send(agent_protocol::Event::ModelDelta(output));
                 let _ = events.send(agent_protocol::Event::TurnCompleted);
@@ -2085,6 +2092,54 @@ fn interactive_command() -> Result<(), String> {
         },
     )
     .map_err(|error| error.to_string())
+}
+
+fn direct_command_output(input: &str, cancellation: &CancellationToken) -> String {
+    let argv = input
+        .trim_start_matches('!')
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    if argv.is_empty()
+        || argv.iter().any(|part| {
+            part.chars()
+                .any(|character| matches!(character, '\'' | '"' | '`' | ';' | '|' | '&'))
+        })
+    {
+        return "direct command requires explicit unquoted argv".into();
+    }
+    let workspace = match workspace_root() {
+        Ok(path) => path,
+        Err(error) => return format!("error: {error}"),
+    };
+    let policy = app_paths()
+        .ok()
+        .and_then(|paths| load_runtime_policy(paths.effective_project_config()).ok())
+        .unwrap_or_default();
+    let registry = match ToolRegistry::new(&workspace, policy.mode) {
+        Ok(registry) => registry,
+        Err(error) => return format!("error: {error}"),
+    };
+    let args = serde_json::json!({
+        "program": argv[0],
+        "args": argv[1..],
+        "cwd": workspace.display().to_string(),
+        "requires_pty": false,
+    });
+    match registry.execute("shell", args, cancellation) {
+        Ok(result) => result.data,
+        Err(error) => format!("permission or command error: {error}"),
+    }
+}
+
+fn path_target_output(input: &str) -> String {
+    let target = input.trim_start_matches('@');
+    match workspace_root() {
+        Ok(workspace) => {
+            let path = workspace.join(target);
+            format!("path={} exists={}", path.display(), path.exists())
+        }
+        Err(error) => format!("error: {error}"),
+    }
 }
 
 fn slash_command_output(command: &str) -> Option<String> {
