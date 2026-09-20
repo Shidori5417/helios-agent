@@ -10,6 +10,8 @@ use std::{
     time::Duration,
 };
 
+static OUTPUT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub const CORE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "search_files",
@@ -697,13 +699,37 @@ fn bounded(status: ToolStatus, summary: &str, data: String, limit: usize) -> Too
             spill_ref: None,
         };
     }
+    let spill_ref = bounded_spill(&data);
     ToolOutcome {
         status,
         summary: summary.into(),
         data: data[..limit].to_owned(),
         truncated: true,
-        spill_ref: None,
+        spill_ref,
     }
+}
+
+fn bounded_spill(data: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("helios/tool-output");
+    fs::create_dir_all(&base).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&base, fs::Permissions::from_mode(0o700));
+    }
+    let sequence = OUTPUT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = base.join(format!("spill-{}-{sequence}", std::process::id()));
+    fs::write(&path, data).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Some(path)
 }
 
 fn search_recursive(
@@ -758,6 +784,37 @@ mod tests {
             )
             .expect_err("conflict");
         assert!(matches!(error, ToolError::PatchConflict));
+    }
+
+    #[test]
+    fn large_read_output_spills_to_bounded_secure_reference() {
+        let root = root("read-spill");
+        fs::write(root.join("large.txt"), "x".repeat(32 * 1024)).expect("write");
+        let registry = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("registry");
+        let outcome = registry
+            .execute(
+                "read_file",
+                json!({"path":"large.txt"}),
+                &CancellationToken::default(),
+            )
+            .expect("read");
+        let spill = outcome.spill_ref.expect("spill reference");
+        assert!(outcome.truncated);
+        assert!(spill.starts_with(
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+                .unwrap_or_else(std::env::temp_dir)
+                .join("helios/tool-output")
+        ));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(spill).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]
