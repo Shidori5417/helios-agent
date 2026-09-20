@@ -10,7 +10,7 @@ use agent_mcp::{
 use agent_memory::{MemoryEntry, MemoryStore, SqliteMemoryStore};
 use agent_plugins::{
     fetch_registry_manifest, install_from_registry, load_signed_registry, load_trust_store,
-    uninstall_exact, verify_registry_entry,
+    uninstall_exact, verify_registry_entry, verify_signed_registry, TrustStore,
 };
 use agent_plugins::{HookEvent, PluginRegistry};
 use agent_protocol::{Message, Role};
@@ -86,6 +86,14 @@ async fn main() -> ExitCode {
             Err(error) => fail(error),
         },
         Ok(Command::SelfCommand(command)) => match self_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Trust(command)) => match trust_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Registry(command)) => match registry_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -443,6 +451,8 @@ enum Command {
     Eval(EvalCommand),
     Perf(PerfCommand),
     SelfCommand(SelfCommand),
+    Trust(TrustCommand),
+    Registry(RegistryCommand),
     Search {
         db_path: PathBuf,
         query: String,
@@ -569,6 +579,54 @@ enum SelfCommand {
     Update {
         source: Option<PathBuf>,
         sha256: Option<String>,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum TrustCommand {
+    List {
+        path: PathBuf,
+    },
+    Show {
+        path: PathBuf,
+        id: String,
+    },
+    Add {
+        path: PathBuf,
+        id: String,
+        key_file: PathBuf,
+    },
+    Disable {
+        path: PathBuf,
+        id: String,
+    },
+    Enable {
+        path: PathBuf,
+        id: String,
+    },
+    Revoke {
+        path: PathBuf,
+        id: String,
+    },
+    Remove {
+        path: PathBuf,
+        id: String,
+        confirm: String,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RegistryCommand {
+    Status {
+        path: PathBuf,
+        id: Option<String>,
+    },
+    Reset {
+        path: PathBuf,
+        id: String,
+        confirm: String,
+    },
+    Verify {
+        source: String,
+        trust: PathBuf,
     },
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -727,6 +785,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "eval" => parse_eval_command(&args[1..]),
         "perf" => parse_perf_command(&args[1..]),
         "self" => parse_self_command(&args[1..]),
+        "trust" => parse_trust_command(&args[1..]),
+        "registry" => parse_registry_command(&args[1..]),
         "search" => {
             let db_path = path_option(&args[1..], "--db-path")?;
             let query = value_after(&args[1..], "--query")?.ok_or("search requires --query")?;
@@ -1063,6 +1123,80 @@ fn parse_self_command(args: &[String]) -> Result<Command, String> {
     }
 }
 
+fn default_trust_path() -> Result<PathBuf, String> {
+    Ok(workspace_root()?.join(".agent/trust-store.json"))
+}
+
+fn trust_path(args: &[String]) -> Result<PathBuf, String> {
+    Ok(value_after(args, "--trust-store")?
+        .map(PathBuf::from)
+        .unwrap_or(default_trust_path()?))
+}
+
+fn parse_trust_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let path = trust_path(&args[1..])?;
+    let id = || {
+        value_after(&args[1..], "--id")?.ok_or_else(|| "trust command requires --id".to_string())
+    };
+    let command = match action {
+        "list" => TrustCommand::List { path },
+        "show" => TrustCommand::Show { path, id: id()? },
+        "add" => TrustCommand::Add {
+            path,
+            id: id()?,
+            key_file: value_after(&args[1..], "--public-key-file")?
+                .map(PathBuf::from)
+                .ok_or("trust add requires --public-key-file PATH")?,
+        },
+        "disable" => TrustCommand::Disable { path, id: id()? },
+        "enable" => TrustCommand::Enable { path, id: id()? },
+        "revoke" => TrustCommand::Revoke { path, id: id()? },
+        "remove" => {
+            let id = id()?;
+            let confirm = value_after(&args[1..], "--confirm")?
+                .ok_or("trust remove requires --confirm ID")?;
+            if id != confirm {
+                return Err("trust remove confirmation must match ID".into());
+            }
+            TrustCommand::Remove { path, id, confirm }
+        }
+        other => return Err(format!("unknown trust command: {other}")),
+    };
+    Ok(Command::Trust(command))
+}
+
+fn parse_registry_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("status");
+    let state = workspace_root()?.join(".agent/registry-state.json");
+    match action {
+        "status" => Ok(Command::Registry(RegistryCommand::Status {
+            path: state,
+            id: value_after(&args[1..], "--registry-id")?,
+        })),
+        "reset" => {
+            let id = value_after(&args[1..], "--registry-id")?
+                .ok_or("registry reset requires --registry-id ID")?;
+            let confirm = value_after(&args[1..], "--confirm")?
+                .ok_or("registry reset requires --confirm ID")?;
+            if id != confirm {
+                return Err("registry reset confirmation must match ID".into());
+            }
+            Ok(Command::Registry(RegistryCommand::Reset {
+                path: state,
+                id,
+                confirm,
+            }))
+        }
+        "verify" => Ok(Command::Registry(RegistryCommand::Verify {
+            source: value_after(&args[1..], "--source")?
+                .ok_or("registry verify requires --source PATH|URL")?,
+            trust: trust_path(&args[1..])?,
+        })),
+        other => Err(format!("unknown registry command: {other}")),
+    }
+}
+
 fn parse_completion_command(args: &[String]) -> Result<Command, String> {
     let action = args.first().map(String::as_str).unwrap_or("generate");
     let shell = args.get(1).cloned().ok_or("completion requires shell")?;
@@ -1161,9 +1295,9 @@ fn parse_plugins(args: &[String]) -> Result<Command, String> {
     }
     let registry =
         value_after(&args[1..], "--registry")?.ok_or("plugin command requires --registry")?;
-    let trust_store = PathBuf::from(
-        value_after(&args[1..], "--trust-store")?.ok_or("plugin command requires --trust-store")?,
-    );
+    let trust_store = value_after(&args[1..], "--trust-store")?
+        .map(PathBuf::from)
+        .unwrap_or(default_trust_path()?);
     let command = match action {
         "verify" => PluginCommand::Verify {
             registry,
@@ -2731,6 +2865,193 @@ fn remote_self_update() -> Result<(), String> {
     result.map(|digest| println!("updated {} ({})", target.display(), digest))
 }
 
+fn read_trust_store_or_empty(path: &Path) -> Result<TrustStore, String> {
+    if !path.exists() {
+        return Ok(TrustStore {
+            keys: Default::default(),
+            revoked: Default::default(),
+            disabled: Default::default(),
+        });
+    }
+    load_trust_store(path).map_err(|error| error.to_string())
+}
+
+fn valid_key_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_ .".contains(&byte))
+}
+
+fn read_public_key_file(path: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let value = raw.trim();
+    if value.contains("BEGIN")
+        || value.contains("PRIVATE")
+        || value.len() != 64
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("public key file must contain exactly 32-byte Ed25519 public key hex; private/PEM material is rejected".into());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn write_trust_store(path: &Path, store: &TrustStore) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(store).map_err(|error| error.to_string())?;
+    atomic_write(path, &bytes)
+}
+
+fn trust_command(command: TrustCommand) -> Result<(), String> {
+    match command {
+        TrustCommand::List { path } => {
+            let store = read_trust_store_or_empty(&path)?;
+            for id in store.keys.keys() {
+                let state = if store.revoked.contains(id) {
+                    "revoked"
+                } else if store.disabled.contains(id) {
+                    "disabled"
+                } else {
+                    "enabled"
+                };
+                println!("{id}\t{state}");
+            }
+            Ok(())
+        }
+        TrustCommand::Show { path, id } => {
+            let store = read_trust_store_or_empty(&path)?;
+            let key = store.keys.get(&id).ok_or("trust key not found")?;
+            let state = if store.revoked.contains(&id) {
+                "revoked"
+            } else if store.disabled.contains(&id) {
+                "disabled"
+            } else {
+                "enabled"
+            };
+            println!("id={id} state={state} public_key={key}");
+            Ok(())
+        }
+        TrustCommand::Add { path, id, key_file } => {
+            if !valid_key_id(&id) {
+                return Err("invalid trust key id".into());
+            }
+            let key = read_public_key_file(&key_file)?;
+            let mut store = read_trust_store_or_empty(&path)?;
+            if store.keys.contains_key(&id) || store.revoked.contains(&id) {
+                return Err("trust key id already exists or is revoked".into());
+            }
+            store.keys.insert(id, key);
+            write_trust_store(&path, &store)
+        }
+        TrustCommand::Disable { path, id } => {
+            let mut store = read_trust_store_or_empty(&path)?;
+            if !store.keys.contains_key(&id) {
+                return Err("trust key not found".into());
+            }
+            store.disabled.insert(id);
+            write_trust_store(&path, &store)
+        }
+        TrustCommand::Enable { path, id } => {
+            let mut store = read_trust_store_or_empty(&path)?;
+            if store.revoked.contains(&id) {
+                return Err("revoked trust keys cannot be re-enabled".into());
+            }
+            if !store.keys.contains_key(&id) {
+                return Err("trust key not found".into());
+            }
+            store.disabled.remove(&id);
+            write_trust_store(&path, &store)
+        }
+        TrustCommand::Revoke { path, id } => {
+            let mut store = read_trust_store_or_empty(&path)?;
+            if !store.keys.contains_key(&id) {
+                return Err("trust key not found".into());
+            }
+            store.disabled.remove(&id);
+            store.revoked.insert(id);
+            write_trust_store(&path, &store)
+        }
+        TrustCommand::Remove {
+            path,
+            id,
+            confirm: _,
+        } => {
+            let mut store = read_trust_store_or_empty(&path)?;
+            if !store.keys.contains_key(&id) {
+                return Err("trust key not found".into());
+            }
+            store.keys.remove(&id);
+            store.disabled.remove(&id);
+            store.revoked.remove(&id);
+            write_trust_store(&path, &store)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+struct RegistryStateFile {
+    #[serde(default)]
+    registries: std::collections::BTreeMap<String, RegistryStateValue>,
+}
+#[derive(Debug, Deserialize, Serialize)]
+struct RegistryStateValue {
+    sequence: u64,
+    digest: String,
+}
+
+fn registry_command(command: RegistryCommand) -> Result<(), String> {
+    match command {
+        RegistryCommand::Status { path, id } => {
+            let state: RegistryStateFile = if path.exists() {
+                serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?
+            } else {
+                RegistryStateFile::default()
+            };
+            for (name, value) in state.registries {
+                if id.as_deref().is_none_or(|wanted| wanted == name) {
+                    println!(
+                        "{name}\tsequence={}\tdigest={}",
+                        value.sequence, value.digest
+                    );
+                }
+            }
+            Ok(())
+        }
+        RegistryCommand::Reset {
+            path,
+            id,
+            confirm: _,
+        } => {
+            let mut state: RegistryStateFile =
+                serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            if state.registries.remove(&id).is_none() {
+                return Err("registry id not found".into());
+            }
+            let home = env::var_os("HOME").ok_or("HOME is not set")?;
+            let trash = PathBuf::from(home).join(".local/share/helios/trash");
+            fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+            fs::rename(&path, trash.join(format!("registry-state-{}", job_id())))
+                .map_err(|error| error.to_string())?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec_pretty(&state).map_err(|error| error.to_string())?,
+            )
+        }
+        RegistryCommand::Verify { source, trust } => {
+            let store = load_trust_store(&trust).map_err(|error| error.to_string())?;
+            let verified =
+                verify_signed_registry(source, &store).map_err(|error| error.to_string())?;
+            println!(
+                "verified registry={} signer={} sequence={} expires_at={}",
+                verified.registry_id, verified.key_id, verified.sequence, verified.expires_at
+            );
+            Ok(())
+        }
+    }
+}
+
 fn resolve_observability_session(
     database: &Database,
     workspace: &str,
@@ -3104,7 +3425,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare; self version|install|update|uninstall");
+    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare; self version|install|update|uninstall; trust list|show|add|disable|enable|revoke|remove; registry status|reset|verify");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
@@ -4095,6 +4416,41 @@ mod tests {
             "binary".into()
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn trust_store_lifecycle_rejects_private_material_and_preserves_revoke() {
+        let root = std::env::temp_dir().join(format!("helios-trust-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("trust-store.json");
+        let key = root.join("public.hex");
+        fs::write(&key, "11".repeat(32)).expect("key");
+        trust_command(TrustCommand::Add {
+            path: path.clone(),
+            id: "release".into(),
+            key_file: key,
+        })
+        .expect("add");
+        trust_command(TrustCommand::Revoke {
+            path: path.clone(),
+            id: "release".into(),
+        })
+        .expect("revoke");
+        assert!(trust_command(TrustCommand::Enable {
+            path: path.clone(),
+            id: "release".into()
+        })
+        .is_err());
+        let private = root.join("private.pem");
+        fs::write(&private, "-----BEGIN PRIVATE KEY-----").expect("private");
+        assert!(trust_command(TrustCommand::Add {
+            path: path.clone(),
+            id: "bad".into(),
+            key_file: private
+        })
+        .is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

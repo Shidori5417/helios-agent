@@ -209,6 +209,21 @@ pub fn load_signed_registry(
     Ok(verified)
 }
 
+/// Verifies a signed envelope without accepting it into rollback state.
+pub fn verify_signed_registry(
+    source: impl AsRef<str>,
+    trust: &TrustStore,
+) -> Result<VerifiedRegistry, RegistryError> {
+    let bytes = read_registry_source(source.as_ref())?;
+    let envelope: RegistryEnvelope =
+        serde_json::from_slice(&bytes).map_err(|error| RegistryError::Schema(error.to_string()))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RegistryError::Schema(error.to_string()))?
+        .as_secs();
+    verify_registry_envelope(&envelope, trust, now)
+}
+
 fn accept_registry_state(
     registry: &VerifiedRegistry,
     state_path: impl AsRef<Path>,

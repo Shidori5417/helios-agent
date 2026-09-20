@@ -14,4 +14,6 @@ Offline evaluation and startup performance checks are available from the same bi
 
 Self-management is explicit and user-scoped: `self version`, `self install --prefix ~/.local --name helios`, `self update --from PATH --sha256 HEX`, and `self uninstall --confirm NAME`. Install/update use atomic replacement and `0755`; uninstall verifies the install marker and moves the exact binary to the user trash directory. Remote updates are fail-closed when no verified release is available; no `sudo`, shell, or plaintext token path is used.
 
+Plugin trust is controlled with `trust list|show|add|disable|enable|revoke|remove`; only 32-byte Ed25519 public-key hex is accepted, and the default store is `.agent/trust-store.json` with atomic `0600` writes. `registry status|reset|verify` exposes rollback state, requires exact reset confirmation, and verifies signed envelopes without mutating state. Private-key material is rejected.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.
