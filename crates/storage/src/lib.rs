@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 9;
+pub const STORAGE_FORMAT_VERSION: u32 = 10;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -86,6 +86,14 @@ pub struct PendingMemoryRecord {
     pub content: String,
     pub confidence: f64,
     pub importance: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct QueueItem {
+    pub id: i64,
+    pub session_id: i64,
+    pub prompt: String,
+    pub position: i64,
 }
 
 pub struct Database {
@@ -224,6 +232,13 @@ impl Database {
                 "ALTER TABLE sessions ADD COLUMN tools_enabled TEXT NOT NULL DEFAULT '[]';
                  ALTER TABLE sessions ADD COLUMN tools_disabled TEXT NOT NULL DEFAULT '[]';
                  PRAGMA user_version = 9;",
+            )?;
+        }
+        if version < 10 {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS foreground_queue (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id), prompt TEXT NOT NULL, position INTEGER NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS foreground_queue_session_position ON foreground_queue(session_id, position);
+                 PRAGMA user_version = 10;",
             )?;
         }
         Ok(())
@@ -528,6 +543,72 @@ impl Database {
     pub fn append_turn(&self, session_id: i64, turn_index: i64) -> SqlResult<i64> {
         self.connection.execute("INSERT INTO turns(session_id, turn_index, created_at) VALUES (?1, ?2, strftime('%s','now'))", params![session_id, turn_index])?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn enqueue_foreground(&self, session_id: i64, prompt: &str) -> SqlResult<i64> {
+        if prompt.trim().is_empty() || prompt.len() > 32 * 1024 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "queue prompt bounds".into(),
+            ));
+        }
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM foreground_queue WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if count >= 32 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "queue capacity".into(),
+            ));
+        }
+        let position: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM foreground_queue WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO foreground_queue(session_id,prompt,position,created_at) VALUES (?1,?2,?3,strftime('%s','now'))",
+            params![session_id, prompt, position])?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn foreground_queue(&self, session_id: i64) -> SqlResult<Vec<QueueItem>> {
+        let mut statement = self.connection.prepare("SELECT id,session_id,prompt,position FROM foreground_queue WHERE session_id=?1 ORDER BY position,id")?;
+        let rows = statement
+            .query_map(params![session_id], |row| {
+                Ok(QueueItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    prompt: row.get(2)?,
+                    position: row.get(3)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn remove_foreground(&self, session_id: i64, id: i64) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "DELETE FROM foreground_queue WHERE session_id=?1 AND id=?2",
+            params![session_id, id],
+        )? > 0)
+    }
+
+    pub fn clear_foreground(&self, session_id: i64) -> SqlResult<usize> {
+        self.connection.execute(
+            "DELETE FROM foreground_queue WHERE session_id=?1",
+            params![session_id],
+        )
+    }
+
+    pub fn pop_foreground(&self, session_id: i64) -> SqlResult<Option<String>> {
+        let item = self.foreground_queue(session_id)?.into_iter().next();
+        if let Some(item) = item {
+            self.remove_foreground(session_id, item.id)?;
+            Ok(Some(item.prompt))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn update_turn_status(
@@ -1190,5 +1271,32 @@ mod tests {
             .expect("empty")
             .is_empty());
         assert_eq!(db.memory_count().expect("memory"), 1);
+    }
+
+    #[test]
+    fn foreground_queue_is_bounded_ordered_and_persistent() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("run", "/workspace")
+            .expect("session");
+        let first = db.enqueue_foreground(session, "first").expect("queue");
+        let second = db.enqueue_foreground(session, "second").expect("queue");
+        assert_eq!(
+            db.foreground_queue(session)
+                .expect("list")
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(
+            db.pop_foreground(session).expect("pop").as_deref(),
+            Some("first")
+        );
+        assert!(db.remove_foreground(session, second).expect("remove"));
+        assert!(db.foreground_queue(session).expect("empty").is_empty());
+        assert!(db
+            .enqueue_foreground(session, &"x".repeat(32 * 1024 + 1))
+            .is_err());
     }
 }

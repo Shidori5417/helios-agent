@@ -2304,9 +2304,11 @@ fn interactive_command() -> Result<(), String> {
     let session_provider = Arc::new(Mutex::new(None::<String>));
     let session_effort = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
+    let steering = Arc::new(Mutex::new(None::<String>));
     let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
     let workspace_path = paths.workspace.clone();
+    let steering_for_ui = steering.clone();
     agent_tui::run_interactive_with_context_and_approval(
         receiver,
         sender.clone(),
@@ -2318,6 +2320,68 @@ fn interactive_command() -> Result<(), String> {
             let mut prompt_for_run = prompt.clone();
             if command == "/exit" || command == "/quit" {
                 return agent_tui::SubmitAction::Exit;
+            }
+            if command == "/stop" {
+                turn_cancellation.cancel();
+                let _ = events.send(agent_protocol::Event::Error("active turn cancellation requested".into()));
+                return agent_tui::SubmitAction::Continue;
+            }
+            if let Some(instruction) = prompt.strip_prefix("/steer ") {
+                let instruction = instruction.trim();
+                if instruction.is_empty() {
+                    let _ = events.send(agent_protocol::Event::Error("/steer requires an instruction".into()));
+                } else if let Ok(mut slot) = steering_for_ui.lock() {
+                    *slot = Some(instruction.chars().take(4096).collect());
+                    let _ = events.send(agent_protocol::Event::ModelDelta("steer queued for the next safe iteration boundary".into()));
+                }
+                return agent_tui::SubmitAction::Continue;
+            }
+            if let Some(queue_command) = prompt.strip_prefix("/queue") {
+                let action = queue_command.trim();
+                let result = Database::open(&db_path).and_then(|db| {
+                    let session = active_session.lock().ok().and_then(|value| *value)
+                        .or_else(|| db.latest_session(&workspace_path.display().to_string()).ok().flatten().map(|s| s.id));
+                    let Some(session) = session else { return Ok("queue unavailable until the first session turn".into()); };
+                    if action.is_empty() || action == "list" {
+                        let items = db.foreground_queue(session)?;
+                        return Ok(if items.is_empty() { "queue empty".into() } else { items.into_iter().map(|item| format!("{}: {}", item.id, redact_output(&item.prompt))).collect::<Vec<_>>().join("\n") });
+                    }
+                    if action == "clear" { db.clear_foreground(session)?; return Ok("queue cleared".into()); }
+                    if let Some(text) = action.strip_prefix("remove ") { let id = text.trim().parse::<i64>().map_err(|_| rusqlite::Error::InvalidParameterName("queue id".into()))?; return Ok(if db.remove_foreground(session,id)? { "queue item removed".into() } else { "queue item not found".into() }); }
+                    db.enqueue_foreground(session, action).map(|id| format!("queued {id}"))
+                });
+                let output = result.map_err(|error| error.to_string()).unwrap_or_else(|error| error);
+                let _ = events.send(agent_protocol::Event::ModelDelta(output));
+                return agent_tui::SubmitAction::Continue;
+            }
+            if let Some(side_prompt) = prompt.strip_prefix("/btw ") {
+                let side_prompt = side_prompt.trim();
+                if side_prompt.is_empty() {
+                    let _ = events.send(agent_protocol::Event::Error("usage: /btw QUESTION".into()));
+                    return agent_tui::SubmitAction::Continue;
+                }
+                let side_events = events.clone();
+                let side_db = db_path.clone();
+                let side_config = project_config_path.clone();
+                let side_prompt = side_prompt.to_owned();
+                std::thread::spawn(move || {
+                    let (side_sender, side_receiver) = std::sync::mpsc::sync_channel(256);
+                    let mut options = default_run_options(side_prompt, side_db, None, Some(side_sender));
+                    options.config = Some(side_config);
+                    options.exec = true;
+                    let result = run_command_with_cancellation(options, CancellationToken::default());
+                    let mut response = String::new();
+                    for event in side_receiver.try_iter() {
+                        if let agent_protocol::Event::ModelDelta(text) = event { response.push_str(&text); }
+                    }
+                    let summary = match result {
+                        Ok(()) if !response.is_empty() => format!("BTW (isolated): {response}"),
+                        Ok(()) => "BTW (isolated): completed without text".into(),
+                        Err(error) => format!("BTW (isolated) error: {}", redact_output(&error)),
+                    };
+                    let _ = side_events.send(agent_protocol::Event::ModelDelta(summary));
+                });
+                return agent_tui::SubmitAction::Continue;
             }
             if command.starts_with('!') {
                 let input = prompt.trim().to_owned();
@@ -2916,17 +2980,25 @@ fn interactive_command() -> Result<(), String> {
             let worker_db_path = db_path.clone();
             let worker_workspace = workspace_path.clone();
             let worker_active_session = active_session.clone();
+            let worker_approval = approval.clone();
             std::thread::spawn(move || {
-                let result = run_command_with_cancellation(options, turn_cancellation);
+                let run_cancel = turn_cancellation.clone();
+                let result = run_command_with_cancellation(options, run_cancel);
+                let cancelled = turn_cancellation.is_cancelled();
                 if let Err(error) = result {
                     let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
-                } else if let Ok(db) = Database::open(&worker_db_path) {
-                    if let Ok(Some(record)) =
-                        db.latest_session(&worker_workspace.display().to_string())
-                    {
-                        if let Ok(mut active) = worker_active_session.lock() {
-                            *active = Some(record.id);
-                        }
+                }
+                let Ok(db) = Database::open(&worker_db_path) else { return; };
+                let Ok(Some(record)) = db.latest_session(&worker_workspace.display().to_string()) else { return; };
+                if let Ok(mut active) = worker_active_session.lock() { *active = Some(record.id); }
+                if cancelled { return; }
+                while let Ok(Some(next_prompt)) = db.pop_foreground(record.id) {
+                    let mut next = default_run_options(next_prompt, worker_db_path.clone(), Some(record.id.to_string()), Some(events.clone()));
+                    next.approval = Some(worker_approval.clone());
+                    let Ok((next, _, _)) = resolve_runtime_options(next) else { break; };
+                    let next_cancel = CancellationToken::default();
+                    if let Err(error) = run_command_with_cancellation(next, next_cancel) {
+                        let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
                     }
                 }
             });
@@ -2973,6 +3045,10 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         ("retry", "retry the last user turn"),
         ("undo", "hide the last exchange from active context"),
         ("compact", "compact active context with the local compactor"),
+        ("queue", "queue prompts for the active foreground turn"),
+        ("steer", "steer the active turn at a safe boundary"),
+        ("stop", "cancel the active turn and remain in the session"),
+        ("btw", "run an isolated read-only side question"),
         ("exit", "close the interactive session"),
         ("quit", "close the interactive session"),
     ]
@@ -3511,6 +3587,15 @@ fn slash_command_output(command: &str) -> Option<String> {
                 pending.len()
             ))
         }),
+        "/queue" | "/queue list" => app_paths().ok().and_then(|paths| {
+            let db = Database::open(&paths.db_path).ok()?;
+            let session = db
+                .latest_session(&paths.workspace.display().to_string())
+                .ok()??;
+            let items = db.foreground_queue(session.id).ok()?;
+            Some(format!("queue={}", items.len()))
+        }),
+        "/stop" => Some("stop requested for active turn; session remains open".into()),
         "/status" => app_paths().ok().map(|paths| {
             format!(
                 "workspace={}\nconfig={}\ndb_present={}",
