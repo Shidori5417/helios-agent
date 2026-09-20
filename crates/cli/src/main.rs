@@ -23,8 +23,8 @@ use agent_sandbox::PermissionMode;
 use agent_skills::SkillCatalog;
 use agent_storage::{ContextRecord, Database, UsageRecord};
 use agent_subagents::{
-    Budgets as SubagentBudgets, CancellationToken as SubagentCancellation, FakeExecutor, Scheduler,
-    TaskSpec,
+    Budgets as SubagentBudgets, CancellationToken as SubagentCancellation, Scheduler, StopReason,
+    TaskResult, TaskSpec, WorktreeManager,
 };
 use agent_terminal::CancellationToken;
 use agent_tools::{ToolRegistry, ToolStatus};
@@ -4474,17 +4474,209 @@ fn subagents_command(args: &[String], path: &Path, workspace: &Path) -> Result<(
         }
         "run" | "test" => {
             let objective = if action == "test" { "complete offline subagent smoke".to_owned() } else { value_after(args, "--objective")?.ok_or("subagents run requires --objective TEXT")? };
-            if args.iter().any(|arg| arg == "--worktree") { return Err("subagents --worktree requires explicit manager integration and is not enabled by this offline command".into()); }
+            let provider = value_after(args, "--provider")?.unwrap_or_else(|| "fake".into());
+            if provider != "fake" && !valid_provider(&provider) { return Err(format!("unknown provider: {provider}")); }
+            let model = value_after(args, "--model")?.unwrap_or_else(|| "offline-subagent".into());
+            let base_url = value_after(args, "--base-url")?;
             let scope = value_after(args, "--scope")?.map(|value| workspace.join(value)).unwrap_or_else(|| workspace.to_path_buf());
-            let permission = PermissionEngine::new(workspace, PermissionMode::ReadOnly).map_err(|e| e.to_string())?;
-            let task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_permission(PermissionMode::ReadOnly).with_budgets(subagent_budgets(path)?);
-            let results = Scheduler::new(subagent_concurrency(path)?).run(&permission, PermissionMode::ReadOnly, vec![task], &FakeExecutor, SubagentCancellation::default()).map_err(|e| e.to_string())?;
+            let policy = load_runtime_policy(path)?;
+            let mut task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_permission(policy.mode).with_budgets(subagent_budgets(path)?);
+            let cancellation = SubagentCancellation::default();
+            let keep_worktree = args.iter().any(|arg| arg == "--keep-worktree");
+            let mut manager = None;
+            let worktree = if args.iter().any(|arg| arg == "--worktree") {
+                let temp_root = std::env::temp_dir().join("helios-agent-worktrees");
+                let mut owned = WorktreeManager::new(workspace, &temp_root).map_err(|e| e.to_string())?;
+                let handle = owned.create(value_after(args, "--ref")?.as_deref()).map_err(|e| e.to_string())?;
+                task = owned.reroot_task(&task, &handle).map_err(|e| e.to_string())?;
+                manager = Some((owned, handle.clone()));
+                Some(handle.path)
+            } else { None };
+            let permission = PermissionEngine::new(worktree.as_deref().unwrap_or(workspace), policy.mode).map_err(|e| e.to_string())?;
+            let executor = RealSubagentExecutor { provider, model, base_url };
+            let results = Scheduler::new(subagent_concurrency(path)?).run(&permission, policy.mode, vec![task], &executor, cancellation).map_err(|e| e.to_string())?;
             let result = results.first().ok_or("subagent returned no result")?;
             println!("id={} reason={:?} iterations={} tokens={} tool_calls={} summary={}", result.id, result.stop_reason, result.iterations, result.tokens, result.tool_calls, result.summary);
+            if let Some((mut manager, handle)) = manager {
+                if keep_worktree { println!("worktree={}", handle.path.display()); } else { manager.cleanup(handle).map_err(|e| e.to_string())?; }
+            }
         }
         _ => return Err(format!("unsupported subagents action: {action}")),
     }
     Ok(())
+}
+
+struct RealSubagentExecutor {
+    provider: String,
+    model: String,
+    base_url: Option<String>,
+}
+
+impl agent_subagents::Executor for RealSubagentExecutor {
+    fn execute(
+        &self,
+        task: &TaskSpec,
+        cancellation: &SubagentCancellation,
+        _active: &std::sync::atomic::AtomicUsize,
+    ) -> TaskResult {
+        let context = task
+            .context
+            .iter()
+            .map(|segment| segment.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = if context.is_empty() {
+            task.objective.clone()
+        } else {
+            format!("Context:\n{}\n\nObjective:\n{}", context, task.objective)
+        };
+        match self.provider.as_str() {
+            "fake" => execute_subagent_provider(FakeProvider, task, &prompt, cancellation),
+            "openai" => match credential_for("openai") {
+                Ok(key) => execute_subagent_provider(
+                    OpenAiProvider::with_credentials(
+                        self.model.clone(),
+                        key,
+                        self.base_url
+                            .clone()
+                            .or_else(|| env::var("OPENAI_BASE_URL").ok())
+                            .unwrap_or_else(|| "https://api.openai.com/v1/responses".into()),
+                    ),
+                    task,
+                    &prompt,
+                    cancellation,
+                ),
+                Err(error) => failed_subagent(task, error),
+            },
+            "anthropic" => match credential_for("anthropic") {
+                Ok(key) => execute_subagent_provider(
+                    AnthropicProvider::with_credentials(
+                        self.model.clone(),
+                        key,
+                        self.base_url
+                            .clone()
+                            .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
+                            .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
+                    ),
+                    task,
+                    &prompt,
+                    cancellation,
+                ),
+                Err(error) => failed_subagent(task, error),
+            },
+            "gemini" => match credential_for("gemini") {
+                Ok(key) => execute_subagent_provider(
+                    GeminiProvider::with_credentials(
+                        self.model.clone(),
+                        key,
+                        self.base_url
+                            .clone()
+                            .or_else(|| env::var("GEMINI_BASE_URL").ok())
+                            .unwrap_or_else(|| {
+                                "https://generativelanguage.googleapis.com/v1beta/models".into()
+                            }),
+                    ),
+                    task,
+                    &prompt,
+                    cancellation,
+                ),
+                Err(error) => failed_subagent(task, error),
+            },
+            _ => match credential_for("generic") {
+                Ok(key) => execute_subagent_provider(
+                    OpenAiCompatibleProvider::with_credentials(
+                        self.model.clone(),
+                        key,
+                        self.base_url
+                            .clone()
+                            .or_else(|| env::var("GENERIC_BASE_URL").ok())
+                            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into()),
+                    ),
+                    task,
+                    &prompt,
+                    cancellation,
+                ),
+                Err(error) => failed_subagent(task, error),
+            },
+        }
+    }
+}
+
+struct SubagentSink<'a> {
+    events: Vec<agent_protocol::Event>,
+    cancellation: &'a SubagentCancellation,
+}
+impl agent_core::EventSink for SubagentSink<'_> {
+    fn emit(&mut self, event: agent_protocol::Event) {
+        self.events.push(event);
+    }
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+    }
+}
+
+fn execute_subagent_provider<P: ModelProvider>(
+    provider: P,
+    task: &TaskSpec,
+    prompt: &str,
+    cancellation: &SubagentCancellation,
+) -> TaskResult {
+    let started = std::time::Instant::now();
+    if cancellation.is_cancelled() {
+        return failed_result(task, 0, 0, 0, StopReason::Cancelled);
+    }
+    let mut agent = AgentLoop::new(provider).with_context_budget(task.budgets.max_tokens);
+    let mut sink = SubagentSink {
+        events: Vec::new(),
+        cancellation,
+    };
+    let result = agent.run_once_streaming(prompt.to_owned(), &mut sink);
+    let tokens = result
+        .as_ref()
+        .map(|text| text.len() as u64 / 4)
+        .unwrap_or(0);
+    let reason = if cancellation.is_cancelled() {
+        StopReason::Cancelled
+    } else if started.elapsed() > task.budgets.wall_clock {
+        StopReason::WallClock
+    } else if tokens > task.budgets.max_tokens {
+        StopReason::TokenBudget
+    } else if result.is_ok() {
+        StopReason::Completed
+    } else {
+        StopReason::PermissionDenied
+    };
+    failed_result(task, 1, tokens.min(task.budgets.max_tokens), 0, reason)
+        .with_summary(result.unwrap_or_else(|error| error.to_string()))
+}
+
+fn failed_subagent(task: &TaskSpec, error: String) -> TaskResult {
+    failed_result(task, 0, 0, 0, StopReason::PermissionDenied).with_summary(error)
+}
+fn failed_result(
+    task: &TaskSpec,
+    iterations: u32,
+    tokens: u64,
+    calls: u32,
+    reason: StopReason,
+) -> TaskResult {
+    TaskResult {
+        id: task.id.clone(),
+        summary: String::new(),
+        iterations,
+        tokens,
+        tool_calls: calls,
+        stop_reason: reason,
+    }
+}
+trait TaskResultSummary {
+    fn with_summary(self, summary: String) -> TaskResult;
+}
+impl TaskResultSummary for TaskResult {
+    fn with_summary(mut self, summary: String) -> TaskResult {
+        self.summary = summary.chars().take(4096).collect();
+        self
+    }
 }
 
 fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result<(), String> {
