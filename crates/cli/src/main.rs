@@ -2158,7 +2158,7 @@ fn interactive_command() -> Result<(), String> {
                     let registry = match ToolRegistry::new(&worker_workspace, policy.mode) {
                         Ok(registry) => registry
                             .with_disabled_tools(
-                                disabled_tool_names(&worker_config).unwrap_or_default(),
+                                effective_disabled_tool_names(&worker_config).unwrap_or_default(),
                             )
                             .with_cancellation(worker_cancellation.clone())
                             .with_approval_broker(worker_approval),
@@ -2580,6 +2580,31 @@ fn interactive_command() -> Result<(), String> {
                 } else {
                     Some("theme must be dark, light, system, or monochrome".into())
                 }
+            } else if let Some(action) = command.strip_prefix("/tools ") {
+                let mut parts = action.split_whitespace();
+                match parts.next() {
+                    Some("enable") | Some("disable") => {
+                        let mode = action.split_whitespace().next().unwrap_or_default();
+                        let name = parts.next().ok_or_else(|| "tool name required".to_string());
+                        Some(name.and_then(|name| runtime_command(RuntimeCommand::Tools(vec![mode.into(), "--id".into(), name.into()])).map(|_| format!("tool={name} enabled={}", mode == "enable"))).unwrap_or_else(|error| error))
+                    }
+                    Some("info") => {
+                        let name = parts.next().unwrap_or_default();
+                        let policy = load_runtime_policy(&project_config_path).unwrap_or_default();
+                        ToolRegistry::new(&workspace_path, policy.mode).ok().and_then(|registry| registry.metadata(name)).map(|metadata| format!("{} permission={:?} schema_cost=estimated:{} budget={} timeout_ms={}", metadata.id, metadata.permission_class, metadata.context_cost_hint, metadata.output_budget, metadata.timeout.as_millis())).or_else(|| Some("unknown tool".into()))
+                    }
+                    _ => Some("tools action requires enable, disable, or info".into()),
+                }
+            } else if let Some(action) = command.strip_prefix("/memory ") {
+                let mut parts = action.split_whitespace();
+                match parts.next() {
+                    Some("show") => {
+                        let id = parts.next().and_then(|value| value.parse::<i64>().ok());
+                        id.and_then(|id| SqliteMemoryStore::open(&db_path, 128, 16 * 1024).ok().and_then(|store| store.list(&workspace_path.display().to_string(), 128).ok()).and_then(|entries| entries.into_iter().find(|entry| entry.id == id))).map(|entry| format!("memory #{} [{}] {} confidence={} importance={}", entry.id, entry.entry.kind, redact_output(&entry.entry.content), entry.entry.confidence, entry.entry.importance)).or_else(|| Some("memory entry not found".into()))
+                    }
+                    Some("pending") => slash_command_output("/memory"),
+                    _ => Some("memory action requires show or pending".into()),
+                }
             } else if prompt.trim_start().starts_with('@') {
                 Some(path_target_output(prompt.trim()))
             } else {
@@ -2777,6 +2802,108 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let disabled = effective_disabled_tool_names(config_path).unwrap_or_default();
+    let tools = ToolRegistry::new(
+        &paths.workspace,
+        policy
+            .as_ref()
+            .map(|value| value.mode)
+            .unwrap_or(PermissionMode::ReadOnly),
+    )
+    .ok()
+    .map(|registry| {
+        registry
+            .definitions()
+            .into_iter()
+            .filter_map(|definition| {
+                registry
+                    .metadata(&definition.name)
+                    .map(|metadata| agent_tui::ToolOption {
+                        name: definition.name,
+                        description: definition.description,
+                        enabled: !disabled.iter().any(|name| name == &metadata.id),
+                        scope: if disabled.iter().any(|name| name == &metadata.id) {
+                            "project".into()
+                        } else {
+                            "default".into()
+                        },
+                        permission: format!("{:?}", metadata.permission_class),
+                        cost_hint: format!("estimated schema_cost={}", metadata.context_cost_hint),
+                    })
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+    let (memory, usage_summary, context_summary) = Database::open(&paths.db_path)
+        .ok()
+        .map(|db| {
+            let scope = paths.workspace.display().to_string();
+            let memory = SqliteMemoryStore::open(&paths.db_path, 128, 16 * 1024)
+                .ok()
+                .map(|store| {
+                    let active =
+                        store
+                            .list(&scope, 20)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|entry| agent_tui::MemoryOption {
+                                id: entry.id,
+                                key: entry.entry.key,
+                                kind: entry.entry.kind,
+                                summary: redact_output(&entry.entry.content),
+                                status: "active".into(),
+                                confidence: format!("{:.2}", entry.entry.confidence),
+                                importance: entry.entry.importance,
+                            });
+                    let pending = store
+                        .pending(&scope, 20)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|entry| agent_tui::MemoryOption {
+                            id: entry.id,
+                            key: entry.entry.key,
+                            kind: entry.entry.kind,
+                            summary: redact_output(&entry.entry.content),
+                            status: "pending".into(),
+                            confidence: format!("{:.2}", entry.entry.confidence),
+                            importance: entry.entry.importance,
+                        });
+                    active.chain(pending).collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let session = db.latest_session(&scope).ok().flatten();
+            let usage = session
+                .and_then(|session| db.usage_for_session(session.id).ok())
+                .map(|usage| {
+                    format!(
+                        "input={} output={} cache_read={} cache_write={} reasoning={} total={}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cache_read_tokens,
+                        usage.cache_write_tokens,
+                        usage.reasoning_tokens,
+                        usage.total_tokens
+                    )
+                });
+            let context = db
+                .latest_session(&scope)
+                .ok()
+                .flatten()
+                .and_then(|session| db.context_for_session(session.id).ok())
+                .and_then(|plans| plans.last().cloned())
+                .map(|plan| {
+                    format!(
+                        "estimated={} budget={} selected={} dropped={} truncated={} (estimate)",
+                        plan.estimated_tokens,
+                        plan.budget,
+                        plan.selected_count,
+                        plan.dropped_count,
+                        plan.truncated_count
+                    )
+                });
+            (memory, usage, context)
+        })
+        .unwrap_or_default();
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -2794,6 +2921,11 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         sessions,
         diff,
         diff_variants,
+        tools,
+        memory,
+        usage_summary,
+        cost_summary: Some("cost unavailable (no explicit pricing configured)".into()),
+        context_summary,
         ..agent_tui::TuiContext::default()
     }
 }
@@ -2951,7 +3083,14 @@ fn slash_command_output(command: &str) -> Option<String> {
             let entries = store
                 .list(&paths.workspace.display().to_string(), 20)
                 .ok()?;
-            Some(format!("memory={}", entries.len()))
+            let pending = store
+                .pending(&paths.workspace.display().to_string(), 20)
+                .ok()?;
+            Some(format!(
+                "memory={} pending={}",
+                entries.len(),
+                pending.len()
+            ))
         }),
         "/status" => app_paths().ok().map(|paths| {
             format!(
@@ -3176,7 +3315,7 @@ fn run_command_with_cancellation(
             });
         }
     }
-    let disabled_tools = disabled_tool_names(&runtime_config_path)?;
+    let disabled_tools = effective_disabled_tool_names(&runtime_config_path)?;
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_disabled_tools(disabled_tools)
@@ -5581,6 +5720,42 @@ fn disabled_tool_names(path: &Path) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
+fn effective_disabled_tool_names(project: &Path) -> Result<Vec<String>, String> {
+    let paths = app_paths()?;
+    let mut disabled = disabled_tool_names(&paths.global_config)?;
+    let project_disabled = disabled_tool_names(project)?;
+    let project_enabled = tool_name_list(project, "enabled")?;
+    disabled.retain(|name| !project_enabled.iter().any(|enabled| enabled == name));
+    for name in project_disabled {
+        if !disabled.iter().any(|current| current == &name) {
+            disabled.push(name);
+        }
+    }
+    disabled.sort();
+    Ok(disabled)
+}
+
+fn tool_name_list(path: &Path, key: &str) -> Result<Vec<String>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?;
+    Ok(document
+        .get("tools")
+        .and_then(|value| value.get(key))
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 fn config_command(command: ConfigCommand) -> Result<(), String> {
     let path = config_path()?;
     match command {
@@ -6155,7 +6330,7 @@ fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
         toml::Value::Table(Default::default())
     };
     if action == "list" || action == "info" {
-        let disabled = disabled_tool_names(path)?;
+        let disabled = effective_disabled_tool_names(path)?;
         let requested = args.get(1).cloned();
         for definition in registry
             .definitions()
@@ -6196,10 +6371,27 @@ fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
                 .iter()
                 .any(|value| value.as_str() == Some(id.as_str()))
             {
-                disabled.push(toml::Value::String(id));
+                disabled.push(toml::Value::String(id.clone()));
             }
         }
         _ => return Err(format!("unsupported tools action: {action}")),
+    }
+    let enabled = table
+        .entry("enabled")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("tools.enabled must be an array")?;
+    match action {
+        "enable" => {
+            if !enabled
+                .iter()
+                .any(|value| value.as_str() == Some(id.as_str()))
+            {
+                enabled.push(toml::Value::String(id));
+            }
+        }
+        "disable" => enabled.retain(|value| value.as_str() != Some(id.as_str())),
+        _ => unreachable!(),
     }
     atomic_write(
         path,

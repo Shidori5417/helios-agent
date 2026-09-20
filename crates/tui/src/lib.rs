@@ -52,6 +52,11 @@ pub struct TuiModel {
     pub diff_variants: Vec<(String, String)>,
     pub permission_request: Option<PermissionPrompt>,
     pub tool_cards: Vec<ToolCard>,
+    pub tools: Vec<ToolOption>,
+    pub memory: Vec<MemoryOption>,
+    pub usage_summary: Option<String>,
+    pub cost_summary: Option<String>,
+    pub context_summary: Option<String>,
 }
 
 impl Default for TuiModel {
@@ -88,6 +93,11 @@ impl Default for TuiModel {
             diff_variants: Vec::new(),
             permission_request: None,
             tool_cards: Vec::new(),
+            tools: Vec::new(),
+            memory: Vec::new(),
+            usage_summary: None,
+            cost_summary: None,
+            context_summary: None,
         }
     }
 }
@@ -125,6 +135,27 @@ pub struct SessionOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOption {
+    pub name: String,
+    pub description: String,
+    pub enabled: bool,
+    pub scope: String,
+    pub permission: String,
+    pub cost_hint: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryOption {
+    pub id: i64,
+    pub key: String,
+    pub kind: String,
+    pub summary: String,
+    pub status: String,
+    pub confidence: String,
+    pub importance: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlayKind {
     Palette,
     Help,
@@ -136,6 +167,10 @@ pub enum OverlayKind {
     Diff,
     Theme,
     Keybindings,
+    Tools,
+    Memory,
+    Usage,
+    Cost,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -514,6 +549,52 @@ impl TuiModel {
                     local: true,
                 })
                 .collect()
+        } else if kind == OverlayKind::Tools {
+            self.tools
+                .iter()
+                .map(|tool| PaletteCommand {
+                    name: tool.name.clone(),
+                    description: format!(
+                        "{} · {} · {} · {}",
+                        if tool.enabled { "enabled" } else { "disabled" },
+                        tool.scope,
+                        tool.permission,
+                        tool.cost_hint
+                    ),
+                    category: "Tools".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else if kind == OverlayKind::Memory {
+            self.memory
+                .iter()
+                .map(|memory| PaletteCommand {
+                    name: memory.id.to_string(),
+                    description: format!(
+                        "{} · {} · {} · confidence={} importance={}",
+                        memory.key,
+                        memory.kind,
+                        memory.status,
+                        memory.confidence,
+                        memory.importance
+                    ),
+                    category: "Memory".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else if matches!(
+            kind,
+            OverlayKind::Usage | OverlayKind::Cost | OverlayKind::Context
+        ) {
+            vec![PaletteCommand {
+                name: "summary".into(),
+                description: self.summary_for_overlay(&kind),
+                category: "Diagnostics".into(),
+                arguments: String::new(),
+                local: true,
+            }]
         } else {
             self.palette.clone()
         };
@@ -556,6 +637,10 @@ impl TuiModel {
             OverlayKind::Diff => "Diff (read-only)",
             OverlayKind::Theme => "Theme",
             OverlayKind::Keybindings => "Keybindings",
+            OverlayKind::Tools => "Tools",
+            OverlayKind::Memory => "Memory",
+            OverlayKind::Usage => "Usage",
+            OverlayKind::Cost => "Cost",
         };
         if overlay.kind == OverlayKind::Permission {
             if let Some(request) = &self.permission_request {
@@ -576,6 +661,15 @@ impl TuiModel {
         }
         if overlay.kind == OverlayKind::Keybindings {
             return "Keybindings\nEnter submit · Alt+Enter newline · Ctrl-C cancel\nEsc close · PageUp/PageDown scroll · Ctrl-L redraw".into();
+        }
+        if matches!(
+            overlay.kind,
+            OverlayKind::Usage | OverlayKind::Cost | OverlayKind::Context
+        ) {
+            return format!(
+                "{title}\n{}\n\nEsc closes",
+                self.summary_for_overlay(&overlay.kind)
+            );
         }
         let mut lines = vec![format!("{title}  /{}  (Esc close)", overlay.query)];
         let commands = self.filtered_palette();
@@ -694,12 +788,18 @@ impl TuiModel {
                     }
                     let model_overlay = overlay.kind == OverlayKind::Model;
                     let session_overlay = overlay.kind == OverlayKind::Sessions;
+                    let tools_overlay = overlay.kind == OverlayKind::Tools;
+                    let memory_overlay = overlay.kind == OverlayKind::Memory;
                     self.overlay = None;
                     return if command.local {
                         if model_overlay {
                             OverlayAction::Execute(format!("/model {}", command.name))
                         } else if session_overlay {
                             OverlayAction::Execute(format!("/session-resume {}", command.name))
+                        } else if tools_overlay {
+                            OverlayAction::Execute(format!("/tools info {}", command.name))
+                        } else if memory_overlay {
+                            OverlayAction::Execute(format!("/memory show {}", command.name))
                         } else {
                             OverlayAction::Execute(format!("/{}", command.name))
                         }
@@ -728,8 +828,31 @@ impl TuiModel {
         self.sessions = context.sessions;
         self.diff = context.diff.clone();
         self.diff_variants = context.diff_variants;
+        self.tools = context.tools;
+        self.memory = context.memory;
+        self.usage_summary = context.usage_summary;
+        self.cost_summary = context.cost_summary;
+        self.context_summary = context.context_summary;
         if let Some(diff) = context.diff {
             self.set_diff(diff);
+        }
+    }
+
+    fn summary_for_overlay(&self, kind: &OverlayKind) -> String {
+        match kind {
+            OverlayKind::Usage => self
+                .usage_summary
+                .clone()
+                .unwrap_or_else(|| "usage unavailable".into()),
+            OverlayKind::Cost => self
+                .cost_summary
+                .clone()
+                .unwrap_or_else(|| "cost unavailable".into()),
+            OverlayKind::Context => self
+                .context_summary
+                .clone()
+                .unwrap_or_else(|| "context unavailable (estimate)".into()),
+            _ => String::new(),
         }
     }
 
@@ -985,6 +1108,11 @@ pub struct TuiContext {
     pub sessions: Vec<SessionOption>,
     pub diff: Option<String>,
     pub diff_variants: Vec<(String, String)>,
+    pub tools: Vec<ToolOption>,
+    pub memory: Vec<MemoryOption>,
+    pub usage_summary: Option<String>,
+    pub cost_summary: Option<String>,
+    pub context_summary: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1364,6 +1492,19 @@ where
                                 }
                                 if command == "/keybindings" {
                                     model.open_overlay(OverlayKind::Keybindings);
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                let local_overlay = match command.as_str() {
+                                    "/tools" => Some(OverlayKind::Tools),
+                                    "/memory" => Some(OverlayKind::Memory),
+                                    "/usage" => Some(OverlayKind::Usage),
+                                    "/cost" => Some(OverlayKind::Cost),
+                                    "/context" => Some(OverlayKind::Context),
+                                    _ => None,
+                                };
+                                if let Some(kind) = local_overlay {
+                                    model.open_overlay(kind);
                                     needs_draw = true;
                                     continue;
                                 }
@@ -1781,5 +1922,50 @@ mod tests {
         assert_eq!(model.tool_cards[0].status, "ok");
         assert_eq!(model.tool_cards[0].output, "bounded output");
         assert_eq!(markdown_plain("# title\n- `code`"), "TITLE\n• code");
+    }
+
+    #[test]
+    fn local_c2_overlays_are_searchable_and_provider_free() {
+        let model_tools = vec![ToolOption {
+            name: "shell".into(),
+            description: "direct process".into(),
+            enabled: false,
+            scope: "project".into(),
+            permission: "Process".into(),
+            cost_hint: "estimated schema_cost=1".into(),
+        }];
+        let model_memory = vec![MemoryOption {
+            id: 3,
+            key: "fact".into(),
+            kind: "project_fact".into(),
+            summary: "safe".into(),
+            status: "pending".into(),
+            confidence: "1.00".into(),
+            importance: 2,
+        }];
+        let mut model = TuiModel {
+            tools: model_tools,
+            memory: model_memory,
+            usage_summary: Some("input=1 output=2".into()),
+            cost_summary: Some("cost unavailable".into()),
+            context_summary: Some("estimated=10 budget=20".into()),
+            ..TuiModel::default()
+        };
+        model.open_overlay(OverlayKind::Tools);
+        assert!(model.overlay_text().contains("disabled"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/tools info shell".into())
+        );
+        model.open_overlay(OverlayKind::Memory);
+        assert!(model.overlay_text().contains("pending"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/memory show 3".into())
+        );
+        model.open_overlay(OverlayKind::Usage);
+        assert!(model.overlay_text().contains("input=1"));
+        model.open_overlay(OverlayKind::Cost);
+        assert!(model.overlay_text().contains("unavailable"));
     }
 }

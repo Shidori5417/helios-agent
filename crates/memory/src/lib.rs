@@ -3,6 +3,14 @@ use rusqlite::{params, OptionalExtension, Result as SqlResult};
 use std::path::Path;
 
 pub const STARTUP_MEMORY_TOKEN_TARGET: usize = 1_000;
+pub const MEMORY_KINDS: &[&str] = &[
+    "user_preference",
+    "project_fact",
+    "architecture_decision",
+    "workflow_knowledge",
+    "temporary",
+    "fact",
+];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MemoryEntry {
@@ -31,6 +39,8 @@ pub enum MemoryError {
     EntryLimit { limit: usize },
     #[error("secret-like memory content is not allowed")]
     SecretLike,
+    #[error("unsupported memory category: {0}")]
+    InvalidKind(String),
 }
 
 pub trait MemoryStore {
@@ -117,6 +127,9 @@ impl SqliteMemoryStore {
 
 impl MemoryStore for SqliteMemoryStore {
     fn put(&mut self, entry: MemoryEntry) -> Result<i64, MemoryError> {
+        if !MEMORY_KINDS.contains(&entry.kind.as_str()) {
+            return Err(MemoryError::InvalidKind(entry.kind));
+        }
         if entry.content.len() > self.max_content_bytes {
             return Err(MemoryError::ContentTooLarge {
                 limit: self.max_content_bytes,
@@ -145,6 +158,9 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn propose(&mut self, entry: MemoryEntry) -> Result<i64, MemoryError> {
+        if !MEMORY_KINDS.contains(&entry.kind.as_str()) {
+            return Err(MemoryError::InvalidKind(entry.kind));
+        }
         if entry.content.len() > self.max_content_bytes {
             return Err(MemoryError::ContentTooLarge {
                 limit: self.max_content_bytes,
@@ -364,5 +380,17 @@ mod tests {
         assert_eq!(store.pending("project", 10).expect("pending").len(), 1);
         assert!(store.approve_pending("project", id).expect("approve"));
         assert_eq!(store.list("project", 10).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn memory_categories_are_typed() {
+        let mut store = SqliteMemoryStore::in_memory(4, 1024).expect("store");
+        assert!(store.put(entry("x", "safe")).is_ok());
+        let mut invalid = entry("x2", "safe");
+        invalid.kind = "arbitrary".into();
+        assert!(matches!(
+            store.put(invalid),
+            Err(MemoryError::InvalidKind(_))
+        ));
     }
 }
