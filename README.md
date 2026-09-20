@@ -95,7 +95,7 @@ Session prompts and model/tool messages are intentionally persisted in the selec
 
 The CLI remains non-interactive by default; `--tui` enters the ratatui/crossterm UI only on an interactive TTY and restores the terminal on exit. The producer and renderer communicate through a bounded event channel; q/Esc/Ctrl-C cancellation propagates to provider, native process and MCP execution. Resize and bounded scroll state are reducer-tested. Provider adapters implement bounded chunked SSE/JSON streaming with assembled tool calls and usage events; malformed, oversized, timed-out, or cancelled streams fail with typed errors. The offline fake provider retains the complete-response fallback path.
 
-The CLI control plane includes `init`, typed atomic `config`, fail-closed `auth`, `doctor`, and shell `completion` commands. Secret status exposes presence only; login never accepts secret arguments or falls back to plaintext when Secret Service/keyring storage is unavailable. See `docs/CLI_CONTROL_PLANE.md`.
+The CLI control plane includes `init`, typed atomic `config`, OS-keyring-backed `auth`, `doctor`, and shell `completion` commands. Secret status exposes source only; login never accepts secret arguments or falls back to plaintext when Secret Service/keyring storage is unavailable. See `docs/CLI_CONTROL_PLANE.md`.
 
 Runtime extensions are also controlled through typed `providers`, `permissions`, `mcp`, `lsp`, `hooks`, `skills`, `subagents`, and `status` commands. Mutations are canonical-id, atomic TOML operations; MCP/LSP test commands remain offline-only.
 

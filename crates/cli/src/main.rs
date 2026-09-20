@@ -35,6 +35,7 @@ use std::{
         Arc,
     },
 };
+use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -1074,8 +1075,15 @@ fn run_selected_provider(
             cancellation.clone(),
         ),
         "openai" => run_provider(
-            OpenAiProvider::from_env_with_base_url(options.model.clone(), options.base_url.clone())
-                .map_err(|error| error.to_string())?,
+            OpenAiProvider::with_credentials(
+                options.model.clone(),
+                credential_for("openai")?,
+                options
+                    .base_url
+                    .clone()
+                    .or_else(|| env::var("OPENAI_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.openai.com/v1/responses".into()),
+            ),
             tools,
             database,
             session_id,
@@ -1089,11 +1097,15 @@ fn run_selected_provider(
             cancellation.clone(),
         ),
         "anthropic" => run_provider(
-            AnthropicProvider::from_env_with_base_url(
+            AnthropicProvider::with_credentials(
                 options.model.clone(),
-                options.base_url.clone(),
-            )
-            .map_err(|error| error.to_string())?,
+                credential_for("anthropic")?,
+                options
+                    .base_url
+                    .clone()
+                    .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
+            ),
             tools,
             database,
             session_id,
@@ -1107,8 +1119,17 @@ fn run_selected_provider(
             cancellation.clone(),
         ),
         "gemini" => run_provider(
-            GeminiProvider::from_env_with_base_url(options.model.clone(), options.base_url.clone())
-                .map_err(|error| error.to_string())?,
+            GeminiProvider::with_credentials(
+                options.model.clone(),
+                credential_for("gemini")?,
+                options
+                    .base_url
+                    .clone()
+                    .or_else(|| env::var("GEMINI_BASE_URL").ok())
+                    .unwrap_or_else(|| {
+                        "https://generativelanguage.googleapis.com/v1beta/models".into()
+                    }),
+            ),
             tools,
             database,
             session_id,
@@ -1122,11 +1143,15 @@ fn run_selected_provider(
             cancellation.clone(),
         ),
         "generic" | "openai-compatible" => run_provider(
-            OpenAiCompatibleProvider::from_env_with_base_url(
+            OpenAiCompatibleProvider::with_credentials(
                 options.model.clone(),
-                options.base_url.clone(),
-            )
-            .map_err(|error| error.to_string())?,
+                credential_for("generic")?,
+                options
+                    .base_url
+                    .clone()
+                    .or_else(|| env::var("GENERIC_BASE_URL").ok())
+                    .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into()),
+            ),
             tools,
             database,
             session_id,
@@ -1901,12 +1926,20 @@ fn valid_provider(provider: &str) -> bool {
     matches!(provider, "openai" | "anthropic" | "gemini" | "generic")
 }
 
+const KEYRING_SERVICE: &str = "dev.helios-agent";
+
 trait SecretStore {
+    fn get(&self, provider: &str) -> Result<Option<String>, String>;
     fn set(&self, provider: &str, token: &str) -> Result<(), String>;
     fn delete(&self, provider: &str) -> Result<(), String>;
 }
+#[cfg(test)]
 struct UnavailableSecretStore;
+#[cfg(test)]
 impl SecretStore for UnavailableSecretStore {
+    fn get(&self, _provider: &str) -> Result<Option<String>, String> {
+        Err("Secret Service/keyring is unavailable".into())
+    }
     fn set(&self, _provider: &str, _token: &str) -> Result<(), String> {
         Err("Secret Service/keyring is unavailable; refusing plaintext fallback".into())
     }
@@ -1915,35 +1948,100 @@ impl SecretStore for UnavailableSecretStore {
     }
 }
 
+struct KeyringSecretStore;
+impl KeyringSecretStore {
+    fn entry(provider: &str) -> Result<keyring::Entry, String> {
+        keyring::Entry::new(KEYRING_SERVICE, provider)
+            .map_err(|_| "keyring backend is unavailable".to_owned())
+    }
+}
+impl SecretStore for KeyringSecretStore {
+    fn get(&self, provider: &str) -> Result<Option<String>, String> {
+        match Self::entry(provider)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(keyring::Error::NoStorageAccess(_)) => {
+                Err("keyring access denied or unavailable".into())
+            }
+            Err(_) => Err("keyring read failed".into()),
+        }
+    }
+    fn set(&self, provider: &str, token: &str) -> Result<(), String> {
+        Self::entry(provider)?
+            .set_password(token)
+            .map_err(|_| "keyring write failed".into())
+    }
+    fn delete(&self, provider: &str) -> Result<(), String> {
+        match Self::entry(provider)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(keyring::Error::NoStorageAccess(_)) => {
+                Err("keyring access denied or unavailable".into())
+            }
+            Err(_) => Err("keyring delete failed".into()),
+        }
+    }
+}
+
+fn credential_for(provider: &str) -> Result<String, String> {
+    let store = KeyringSecretStore;
+    credential_from_store(&store, provider)
+}
+
+fn credential_from_store(store: &dyn SecretStore, provider: &str) -> Result<String, String> {
+    match store.get(provider) {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) | Err(_) => env::var(provider_env(provider)).map_err(|_| {
+            format!("no credential available for {provider} (keyring or environment)")
+        }),
+    }
+}
+
 fn auth_command(command: AuthCommand) -> Result<(), String> {
-    let store = UnavailableSecretStore;
+    let store = KeyringSecretStore;
     match command {
         AuthCommand::Status { provider } => {
             let env_name = provider_env(&provider);
-            println!(
-                "provider={provider} credential_source=keyring-or-env env_present={}",
-                env::var_os(env_name).is_some()
-            );
+            let source = match store.get(&provider) {
+                Ok(Some(_)) => "keyring",
+                Ok(None) if env::var_os(env_name).is_some() => "env",
+                Ok(None) => "absent",
+                Err(_) if env::var_os(env_name).is_some() => "env",
+                Err(_) => "keyring-unavailable",
+            };
+            println!("provider={provider} credential_source={source}");
             Ok(())
         }
         AuthCommand::Login {
             provider,
             token_stdin,
         } => {
-            if !token_stdin || io::stdin().is_terminal() {
-                return Err(
-                    "login requires non-TTY --token-stdin; token arguments are forbidden".into(),
-                );
-            }
-            let mut token = String::new();
-            io::stdin()
-                .read_to_string(&mut token)
-                .map_err(|e| e.to_string())?;
-            let token = token.trim();
-            if token.is_empty() {
+            let token = if token_stdin {
+                if io::stdin().is_terminal() {
+                    return Err("--token-stdin requires non-TTY stdin".into());
+                }
+                let mut input = String::new();
+                io::stdin()
+                    .read_to_string(&mut input)
+                    .map_err(|e| e.to_string())?;
+                if input.lines().count() != 1 {
+                    return Err("--token-stdin expects exactly one line".into());
+                }
+                Zeroizing::new(input.trim_end_matches(['\r', '\n']).to_owned())
+            } else {
+                if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                    return Err(
+                        "interactive login requires a TTY; use --token-stdin for automation".into(),
+                    );
+                }
+                Zeroizing::new(
+                    rpassword::prompt_password("Token: ")
+                        .map_err(|_| "could not read token".to_owned())?,
+                )
+            };
+            if token.trim().is_empty() {
                 return Err("empty token".into());
             }
-            store.set(&provider, token)
+            store.set(&provider, token.trim())
         }
         AuthCommand::Logout { provider } => store.delete(&provider),
     }
@@ -1955,6 +2053,10 @@ fn doctor_command() -> Result<(), String> {
     println!("workspace={}", workspace.display());
     println!("config={}", config_path()?.display());
     println!("config_valid={}", load_user_config(&config_path()?).is_ok());
+    println!(
+        "keyring_available={}",
+        !KeyringSecretStore.get("openai").is_err()
+    );
     println!("db_present={}", workspace.join(".agent/state.db").is_file());
     for command in ["git", "rg"] {
         println!("{command}_available={}", command_available(command));
@@ -2536,6 +2638,27 @@ mod tests {
         let store = UnavailableSecretStore;
         assert!(store.set("openai", "not-persisted").is_err());
         assert!(store.delete("openai").is_err());
+    }
+
+    #[test]
+    fn credential_resolution_prefers_mock_keyring_and_falls_back_to_env() {
+        struct MockStore(Option<String>);
+        impl SecretStore for MockStore {
+            fn get(&self, _provider: &str) -> Result<Option<String>, String> {
+                Ok(self.0.clone())
+            }
+            fn set(&self, _provider: &str, _token: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn delete(&self, _provider: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        assert_eq!(
+            credential_from_store(&MockStore(Some("keyring-value".into())), "generic")
+                .expect("keyring"),
+            "keyring-value"
+        );
     }
 
     #[test]

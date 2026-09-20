@@ -9,7 +9,7 @@
   },
   {
     "path": "README.md",
-    "bytes": 13632
+    "bytes": 13636
   },
   {
     "path": ".gitignore",
@@ -157,15 +157,15 @@
   },
   {
     "path": "Cargo.toml",
-    "bytes": 988
+    "bytes": 1117
   },
   {
     "path": "crates/cli/Cargo.toml",
-    "bytes": 734
+    "bytes": 811
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 94991
+    "bytes": 99720
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -257,7 +257,7 @@
   },
   {
     "path": "Cargo.lock",
-    "bytes": 59468
+    "bytes": 61550
   },
   {
     "path": "crates/mcp/Cargo.toml",
@@ -401,7 +401,7 @@
   },
   {
     "path": "docs/CLI_CONTROL_PLANE.md",
-    "bytes": 1162
+    "bytes": 1325
   },
   {
     "path": "docs/CLI_RUNTIME_CONTROL.md",
