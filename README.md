@@ -123,6 +123,8 @@ C3 adds local `/plan`, `/review [security|performance|tests]`, `/config`, `/sett
 
 Runtime extensions are also controlled through typed `providers`, `permissions`, `mcp`, `lsp`, `hooks`, `skills`, `subagents`, and `status` commands. Hooks, skills, and subagents use their real runtime boundaries; MCP/LSP test commands perform bounded configured handshakes and require explicit network policy for HTTP.
 
+Skills use project-over-global metadata precedence and progressive disclosure: `skills list` reads frontmatter only, `skills show NAME` loads a bounded body, and `skills enable|disable NAME` persists typed project state. Enabled auto-invoke or explicitly relevant skills are added to the next provider context with a bounded `skill:<name>` source. Signed plugins expose `plugins list|info|enable|disable|reload`; enabling only affects declared hook/process capabilities and remains subject to the shared permission boundary.
+
 Terminal cancellation and timeouts kill the Unix process group, so descendants do not remain running. Background jobs have deterministic IDs, bounded concurrency, cancellation, wait/reap, and bounded output spill. PTY mode is intentionally opt-in and remains a small non-interactive boundary; full interactive terminal UX is postponed.
 
 MCP supports both lazy stdio and streamable HTTP JSON-RPC transports. HTTP is denied by default and requires an explicit policy host approval; authentication accepts only an environment-variable name. Plugin hooks execute explicit argv through the same permission, timeout, cancellation, bounded-output, and workspace-canonicalization boundary. Fail-closed hooks block on failure; fail-open hooks record a bounded failure and continue. In-process arbitrary plugin code is not supported.

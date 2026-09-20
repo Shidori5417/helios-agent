@@ -1335,6 +1335,16 @@ enum MemoryCommand {
 #[derive(Debug, PartialEq, Eq)]
 enum PluginCommand {
     List,
+    Info {
+        id: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Reload,
     Verify {
         registry: String,
         trust_store: PathBuf,
@@ -2033,7 +2043,19 @@ fn parse_plugins(args: &[String]) -> Result<Command, String> {
     if action == "list" {
         return Ok(Command::Plugins(PluginCommand::List));
     }
+    if action == "reload" {
+        return Ok(Command::Plugins(PluginCommand::Reload));
+    }
     let id = value_after(&args[1..], "--id")?.ok_or("plugin command requires --id")?;
+    if action == "info" {
+        return Ok(Command::Plugins(PluginCommand::Info { id }));
+    }
+    if action == "enable" {
+        return Ok(Command::Plugins(PluginCommand::Enable { id }));
+    }
+    if action == "disable" {
+        return Ok(Command::Plugins(PluginCommand::Disable { id }));
+    }
     if action == "uninstall" {
         return Ok(Command::Plugins(PluginCommand::Uninstall { id }));
     }
@@ -2743,6 +2765,8 @@ fn interactive_command() -> Result<(), String> {
                     Some("pending") => slash_command_output("/memory"),
                     _ => Some("memory action requires show or pending".into()),
                 }
+            } else if let Some(name) = command.strip_prefix("/skill ") {
+                Some(skill_body(&workspace_path, name.trim()).unwrap_or_else(|error| error))
             } else if command == "/mcp" || command.starts_with("/mcp ") {
                 Some(mcp_interactive_command(&command, &workspace_path, &project_config_path))
             } else if let Some(custom_prompt) = custom_prompt_command(&command, &project_config_path) {
@@ -3822,7 +3846,12 @@ fn run_command_with_cancellation(
         &runtime_policy.env_allow,
         &runtime_policy.env_deny,
     )?;
-    let startup_memory = load_startup_memory(&options.db_path, &workspace_id, &options.prompt)?;
+    let mut startup_memory = load_startup_memory(&options.db_path, &workspace_id, &options.prompt)?;
+    startup_memory.extend(load_startup_skills(
+        &workspace,
+        config_path.as_deref(),
+        &options.prompt,
+    )?);
     if options.tui {
         let tui_settings = config_path
             .as_deref()
@@ -5760,16 +5789,67 @@ fn plugins_command(command: PluginCommand) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let requested_enable = matches!(&command, PluginCommand::Enable { .. });
     match command {
         PluginCommand::List => {
-            let registry = PluginRegistry::discover(plugin_root(&workspace))
+            let mut registry = PluginRegistry::discover(plugin_root(&workspace))
                 .map_err(|error| error.to_string())?;
+            for id in enabled_plugin_names(&config_path()?)? {
+                let _ = registry.enable(&id);
+            }
             for plugin in registry.plugins() {
                 println!(
                     "{}\t{}\t{}",
                     plugin.manifest.name, plugin.manifest.version, plugin.enabled
                 );
             }
+        }
+        PluginCommand::Info { id } => {
+            let mut registry = PluginRegistry::discover(plugin_root(&workspace))
+                .map_err(|error| error.to_string())?;
+            for enabled in enabled_plugin_names(&config_path()?)? {
+                let _ = registry.enable(&enabled);
+            }
+            let plugin = registry
+                .plugins()
+                .iter()
+                .find(|plugin| plugin.manifest.name == id)
+                .ok_or("plugin not found")?;
+            println!(
+                "{} version={} enabled={} capabilities={} hooks={}",
+                plugin.manifest.name,
+                plugin.manifest.version,
+                plugin.enabled,
+                plugin.manifest.capabilities.join(","),
+                plugin.manifest.hooks.len()
+            );
+        }
+        PluginCommand::Enable { id } | PluginCommand::Disable { id } => {
+            let registry = PluginRegistry::discover(plugin_root(&workspace))
+                .map_err(|error| error.to_string())?;
+            if !registry
+                .plugins()
+                .iter()
+                .any(|plugin| plugin.manifest.name == id)
+            {
+                return Err("plugin not found".into());
+            }
+            let path = config_path()?;
+            set_enabled_plugin(&path, &id, requested_enable)?;
+            println!(
+                "plugin {} {}",
+                id,
+                if requested_enable {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
+        PluginCommand::Reload => {
+            let registry = PluginRegistry::discover(plugin_root(&workspace))
+                .map_err(|error| error.to_string())?;
+            println!("reloaded {} plugin(s)", registry.plugins().len());
         }
         PluginCommand::Verify {
             registry,
@@ -5834,6 +5914,64 @@ fn load_startup_memory(
             content: memory.entry.content,
         })
         .collect())
+}
+
+fn load_startup_skills(
+    workspace: &Path,
+    config_path: Option<&Path>,
+    prompt: &str,
+) -> Result<Vec<RetrievedMemory>, String> {
+    let mut roots = vec![
+        workspace.join("skills"),
+        workspace.join(".helios/skills"),
+        workspace.join(".agent/skills"),
+    ];
+    if let Ok(paths) = AppPaths::discover(workspace) {
+        roots.push(
+            paths
+                .global_config
+                .parent()
+                .unwrap_or(workspace)
+                .join("skills"),
+        );
+    }
+    let mut loaded = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let root_permissions = PermissionEngine::new(&root, PermissionMode::ReadOnly)
+            .map_err(|error| error.to_string())?;
+        let catalog =
+            SkillCatalog::discover(&root, root_permissions).map_err(|error| error.to_string())?;
+        for metadata in catalog.metadata() {
+            if !names.insert(metadata.name.clone())
+                || !skill_enabled(config_path.unwrap_or(Path::new("")), &metadata.name)?
+                || !(metadata.auto_invoke || prompt.contains(&metadata.name))
+            {
+                continue;
+            }
+            let body = catalog
+                .load_body(&metadata.name)
+                .map_err(|error| error.to_string())?;
+            let body = body.chars().take(32 * 1024).collect::<String>();
+            loaded.push(RetrievedMemory {
+                id: format!("skill:{}", metadata.name),
+                key: format!("skill:{}", metadata.name),
+                content: format!(
+                    "[skill source={} risk={}]\n{}",
+                    root.display(),
+                    metadata.risk,
+                    body
+                ),
+            });
+            if loaded.len() >= 8 {
+                return Ok(loaded);
+            }
+        }
+    }
+    Ok(loaded)
 }
 
 fn load_runtime_hooks(
@@ -7187,6 +7325,87 @@ fn parse_hook_event(name: &str) -> Result<HookEvent, String> {
     }
 }
 
+fn skill_enabled(path: &Path, name: &str) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(true);
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?;
+    let skills = document.get("skills");
+    if skills
+        .and_then(|value| value.get("disabled"))
+        .and_then(toml::Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(name)))
+    {
+        return Ok(false);
+    }
+    if let Some(enabled) = skills
+        .and_then(|value| value.get("enabled"))
+        .and_then(toml::Value::as_array)
+    {
+        return Ok(enabled.iter().any(|value| value.as_str() == Some(name)));
+    }
+    Ok(true)
+}
+
+fn set_skill_enabled(path: &Path, name: &str, enabled: bool) -> Result<(), String> {
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let skills = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?
+        .entry("skills")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("skills config must be a table")?;
+    for (key, present) in [("enabled", enabled), ("disabled", !enabled)] {
+        let values = skills
+            .entry(key)
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or("skills state must be an array")?;
+        values.retain(|value| value.as_str() != Some(name));
+        if present {
+            values.push(toml::Value::String(name.to_owned()));
+        }
+    }
+    atomic_write(
+        path,
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+}
+
+fn skill_body(workspace: &Path, name: &str) -> Result<String, String> {
+    let permissions = PermissionEngine::new(workspace, PermissionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    for root in [
+        workspace.join("skills"),
+        workspace.join(".helios/skills"),
+        workspace.join(".agent/skills"),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        let catalog =
+            SkillCatalog::discover(root, permissions.clone()).map_err(|error| error.to_string())?;
+        if catalog.metadata().iter().any(|skill| skill.name == name) {
+            let body = catalog.load_body(name).map_err(|error| error.to_string())?;
+            if body.len() > 128 * 1024 {
+                return Err("skill body exceeds 128 KiB".into());
+            }
+            return Ok(body);
+        }
+    }
+    Err("skill not found".into())
+}
+
 fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Result<(), String> {
     let action = args.first().map(String::as_str).unwrap_or("list");
     let workspace = workspace_root()?;
@@ -7268,15 +7487,27 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
                     );
                     Ok(())
                 }
+                "reload" => {
+                    println!("reloaded {} hook plugin(s)", registry.plugins().len());
+                    Ok(())
+                }
                 _ => Err(format!("unsupported hooks action: {action}")),
             }
         }
         "skills" => {
-            let permissions = PermissionEngine::new(&workspace, PermissionMode::ReadOnly)
-                .map_err(|e| e.to_string())?;
-            let mut roots = vec![workspace.join("skills"), workspace.join(".helios/skills")];
-            if !workspace.join(".helios/skills").is_dir() {
-                roots.push(workspace.join(".agent/skills"));
+            let mut roots = vec![
+                workspace.join("skills"),
+                workspace.join(".helios/skills"),
+                workspace.join(".agent/skills"),
+            ];
+            if let Ok(paths) = AppPaths::discover(&workspace) {
+                roots.push(
+                    paths
+                        .global_config
+                        .parent()
+                        .unwrap_or(&workspace)
+                        .join("skills"),
+                );
             }
             if let Some(root) = value_after(args, "--root")? {
                 roots = vec![workspace.join(root)];
@@ -7285,6 +7516,8 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
             let mut found = Vec::new();
             for root in roots {
                 if root.exists() {
+                    let permissions = PermissionEngine::new(&root, PermissionMode::ReadOnly)
+                        .map_err(|e| e.to_string())?;
                     found.push(
                         SkillCatalog::discover(root, permissions.clone())
                             .map_err(|e| e.to_string())?,
@@ -7293,17 +7526,25 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
             }
             match action {
                 "list" => {
+                    let mut seen = std::collections::HashSet::new();
                     for catalog in &found {
                         for skill in catalog.metadata() {
+                            if !seen.insert(skill.name.clone()) {
+                                continue;
+                            }
                             println!(
-                                "{}\t{}\tauto_invoke={}\trisk={}",
-                                skill.name, skill.description, skill.auto_invoke, skill.risk
+                                "{}\t{}\tenabled={}\tauto_invoke={}\trisk={}",
+                                skill.name,
+                                skill.description,
+                                skill_enabled(path, &skill.name)?,
+                                skill.auto_invoke,
+                                skill.risk
                             );
                         }
                     }
                     Ok(())
                 }
-                "show" => {
+                "show" | "info" => {
                     let name = name.ok_or("skills show requires NAME")?;
                     for catalog in &found {
                         if let Ok(body) = catalog.load_body(&name) {
@@ -7315,6 +7556,20 @@ fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Re
                         }
                     }
                     Err("skill not found".into())
+                }
+                "enable" | "disable" => {
+                    let name = name.ok_or("skills enable/disable requires NAME")?;
+                    if !found
+                        .iter()
+                        .any(|catalog| catalog.metadata().iter().any(|skill| skill.name == name))
+                    {
+                        return Err("skill not found".into());
+                    }
+                    set_skill_enabled(path, &name, action == "enable")
+                }
+                "reload" => {
+                    println!("reloaded {} skill catalog(s)", found.len());
+                    Ok(())
                 }
                 "validate" => {
                     let target = name;
@@ -8291,6 +8546,20 @@ mod tests {
             "demo".into()
         ])
         .is_err());
+    }
+
+    #[test]
+    fn skill_enable_state_is_typed_and_persistent() {
+        let root = std::env::temp_dir().join(format!("helios-skill-state-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("config.toml");
+        assert!(skill_enabled(&path, "review").expect("default"));
+        set_skill_enabled(&path, "review", false).expect("disable");
+        assert!(!skill_enabled(&path, "review").expect("disabled"));
+        set_skill_enabled(&path, "review", true).expect("enable");
+        assert!(skill_enabled(&path, "review").expect("enabled"));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
