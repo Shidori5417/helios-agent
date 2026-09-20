@@ -24,6 +24,7 @@ use agent_storage::{ContextRecord, Database, UsageRecord};
 use agent_terminal::CancellationToken;
 use agent_tools::{ToolRegistry, ToolStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     io::{self, IsTerminal, Read},
@@ -81,6 +82,10 @@ async fn main() -> ExitCode {
             Err(error) => fail(error),
         },
         Ok(Command::Perf(command)) => match perf_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::SelfCommand(command)) => match self_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -437,6 +442,7 @@ enum Command {
     Jobs(JobCommand),
     Eval(EvalCommand),
     Perf(PerfCommand),
+    SelfCommand(SelfCommand),
     Search {
         db_path: PathBuf,
         query: String,
@@ -546,6 +552,23 @@ enum PerfCommand {
     Compare {
         current: PathBuf,
         baseline: PathBuf,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum SelfCommand {
+    Version,
+    Install {
+        prefix: PathBuf,
+        name: String,
+        compat: bool,
+    },
+    Uninstall {
+        name: String,
+        confirm: String,
+    },
+    Update {
+        source: Option<PathBuf>,
+        sha256: Option<String>,
     },
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -703,6 +726,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "jobs" => parse_jobs_command(&args[1..]),
         "eval" => parse_eval_command(&args[1..]),
         "perf" => parse_perf_command(&args[1..]),
+        "self" => parse_self_command(&args[1..]),
         "search" => {
             let db_path = path_option(&args[1..], "--db-path")?;
             let query = value_after(&args[1..], "--query")?.ok_or("search requires --query")?;
@@ -1005,6 +1029,37 @@ fn parse_perf_command(args: &[String]) -> Result<Command, String> {
                 .ok_or("perf compare requires baseline report")?,
         })),
         other => Err(format!("unknown perf command: {other}")),
+    }
+}
+
+fn parse_self_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("version");
+    match action {
+        "version" => Ok(Command::SelfCommand(SelfCommand::Version)),
+        "install" => Ok(Command::SelfCommand(SelfCommand::Install {
+            prefix: value_after(&args[1..], "--prefix")?
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("~/.local")),
+            name: value_after(&args[1..], "--name")?.unwrap_or_else(|| "helios".into()),
+            compat: args.iter().any(|arg| arg == "--compat-agent-cli"),
+        })),
+        "uninstall" => {
+            let name = value_after(&args[1..], "--name")?.unwrap_or_else(|| "helios".into());
+            let confirm = value_after(&args[1..], "--confirm")?
+                .ok_or("self uninstall requires --confirm NAME")?;
+            if confirm != name {
+                return Err("self uninstall confirmation must exactly match NAME".into());
+            }
+            Ok(Command::SelfCommand(SelfCommand::Uninstall {
+                name,
+                confirm,
+            }))
+        }
+        "update" => Ok(Command::SelfCommand(SelfCommand::Update {
+            source: value_after(&args[1..], "--from")?.map(PathBuf::from),
+            sha256: value_after(&args[1..], "--sha256")?,
+        })),
+        other => Err(format!("unknown self command: {other}")),
     }
 }
 
@@ -2425,6 +2480,257 @@ fn perf_command(command: PerfCommand) -> Result<(), String> {
     }
 }
 
+fn expand_user_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path == Path::new("~") || path.starts_with("~/") {
+        let home = env::var_os("HOME").ok_or("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(path.strip_prefix("~").unwrap_or(Path::new(""))));
+    }
+    Ok(path)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn safe_install_prefix(prefix: &Path) -> Result<PathBuf, String> {
+    let prefix = expand_user_path(prefix.to_path_buf())?
+        .canonicalize()
+        .unwrap_or_else(|_| prefix.to_path_buf());
+    if prefix.parent().is_none() || prefix == Path::new("/") {
+        return Err("refusing unsafe install prefix".into());
+    }
+    let text = prefix.to_string_lossy();
+    if ["/usr", "/bin", "/sbin", "/etc", "/var"]
+        .iter()
+        .any(|item| text == *item)
+    {
+        return Err("refusing system install prefix; use a user-owned prefix".into());
+    }
+    Ok(prefix)
+}
+
+fn install_one(source: &Path, target: &Path) -> Result<String, String> {
+    let digest = sha256_file(source)?;
+    let parent = target.parent().ok_or("invalid install target")?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    fs::copy(source, &temp).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o755))
+            .map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temp, target).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        error.to_string()
+    })?;
+    atomic_write(&target.with_extension("install.sha256"), digest.as_bytes())?;
+    Ok(digest)
+}
+
+fn self_command(command: SelfCommand) -> Result<(), String> {
+    match command {
+        SelfCommand::Version => {
+            println!("helios {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        SelfCommand::Install {
+            prefix,
+            name,
+            compat,
+        } => {
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+            {
+                return Err("invalid installation name".into());
+            }
+            let prefix = safe_install_prefix(&prefix)?;
+            let source = env::current_exe()
+                .map_err(|error| error.to_string())?
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            let target = prefix.join("bin").join(&name);
+            let digest = install_one(&source, &target)?;
+            if compat && name != "agent-cli" {
+                install_one(&source, &prefix.join("bin/agent-cli"))?;
+            }
+            println!("installed {} ({})", target.display(), digest);
+            if !env::var_os("PATH").is_some_and(|path| {
+                env::split_paths(&path).any(|entry| entry == prefix.join("bin"))
+            }) {
+                println!("add {} to PATH", prefix.join("bin").display());
+            }
+            Ok(())
+        }
+        SelfCommand::Uninstall { name, confirm: _ } => {
+            let home = env::var_os("HOME").ok_or("HOME is not set")?;
+            let mut candidates = env::var_os("PATH")
+                .map(|path| {
+                    env::split_paths(&path)
+                        .map(|dir| dir.join(&name))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            candidates.push(PathBuf::from(home.clone()).join(".local/bin").join(&name));
+            let target = candidates
+                .into_iter()
+                .find(|path| path.is_file())
+                .ok_or("installed binary not found")?;
+            let marker = target.with_extension("install.sha256");
+            let expected =
+                fs::read_to_string(&marker).map_err(|_| "refusing to remove untracked binary")?;
+            if sha256_file(&target)? != expected.trim() {
+                return Err("installed binary identity does not match its marker".into());
+            }
+            let trash = PathBuf::from(home).join(".local/share/helios/trash");
+            fs::create_dir_all(&trash).map_err(|error| error.to_string())?;
+            let stamp = job_id();
+            fs::rename(&target, trash.join(format!("{name}-{stamp}")))
+                .map_err(|error| error.to_string())?;
+            let _ = fs::rename(
+                &marker,
+                trash.join(format!("{name}-{stamp}.install.sha256")),
+            );
+            println!("moved {} to {}", target.display(), trash.display());
+            Ok(())
+        }
+        SelfCommand::Update {
+            source: Some(source),
+            sha256: Some(expected),
+        } => {
+            if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err("--sha256 must be a 64-character hexadecimal digest".into());
+            }
+            let source = source.canonicalize().map_err(|error| error.to_string())?;
+            let actual = sha256_file(&source)?;
+            if !actual.eq_ignore_ascii_case(&expected) {
+                return Err("local update checksum mismatch; no mutation performed".into());
+            }
+            let target = env::current_exe().map_err(|error| error.to_string())?;
+            let digest = install_one(&source, &target)?;
+            println!("updated {} ({})", target.display(), digest);
+            Ok(())
+        }
+        SelfCommand::Update {
+            source: None,
+            sha256: None,
+        } => remote_self_update(),
+        SelfCommand::Update { .. } => {
+            Err("self update requires both --from PATH and --sha256 HEX".into())
+        }
+    }
+}
+
+fn remote_self_update() -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct Release {
+        assets: Vec<ReleaseAsset>,
+    }
+    #[derive(Deserialize)]
+    struct ReleaseAsset {
+        name: String,
+        browser_download_url: String,
+    }
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("helios-agent-self-update")
+        .build()
+        .map_err(|error| error.to_string())?;
+    let mut request =
+        client.get("https://api.github.com/repos/Shidori5417/helios-agent/releases/latest");
+    if let Some(token) = env::var_os("GITHUB_TOKEN") {
+        request = request.bearer_auth(token.to_string_lossy());
+    }
+    let response = request.send().map_err(|error| error.to_string())?;
+    if response.status().as_u16() == 404 {
+        return Err("no release available".into());
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "release lookup failed with HTTP {}",
+            response.status()
+        ));
+    }
+    let release: Release = response.json().map_err(|error| error.to_string())?;
+    let artifact = release
+        .assets
+        .iter()
+        .find(|asset| {
+            asset.name.contains("x86_64")
+                && asset.name.contains("linux")
+                && !asset.name.ends_with(".bundle")
+        })
+        .ok_or("release has no x86_64 Linux artifact")?;
+    let checksums = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "SHA256SUMS")
+        .ok_or("release has no SHA256SUMS")?;
+    let bundle = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.ends_with(".bundle"))
+        .ok_or("release has no cosign bundle")?;
+    let download = |url: &str| -> Result<Vec<u8>, String> {
+        let mut request = client.get(url);
+        if let Some(token) = env::var_os("GITHUB_TOKEN") {
+            request = request.bearer_auth(token.to_string_lossy());
+        }
+        let response = request.send().map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "asset download failed with HTTP {}",
+                response.status()
+            ));
+        }
+        let bytes = response.bytes().map_err(|error| error.to_string())?;
+        if bytes.len() > 100 * 1024 * 1024 {
+            return Err("release asset exceeds 100 MiB bound".into());
+        }
+        Ok(bytes.to_vec())
+    };
+    let artifact_bytes = download(&artifact.browser_download_url)?;
+    let checksum_text = String::from_utf8(download(&checksums.browser_download_url)?)
+        .map_err(|_| "invalid checksum file".to_string())?;
+    let expected = checksum_text
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let digest = fields.next()?;
+            let name = fields.next()?.trim_start_matches('*');
+            (name == artifact.name).then(|| digest.to_string())
+        })
+        .ok_or("artifact is absent from SHA256SUMS")?;
+    if !format!("{:x}", Sha256::digest(&artifact_bytes)).eq_ignore_ascii_case(&expected) {
+        return Err("release checksum mismatch; no mutation performed".into());
+    }
+    let root = env::temp_dir().join(format!("helios-update-{}", job_id()));
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let artifact_path = root.join(&artifact.name);
+    let bundle_path = root.join(&bundle.name);
+    fs::write(&artifact_path, &artifact_bytes).map_err(|error| error.to_string())?;
+    fs::write(&bundle_path, download(&bundle.browser_download_url)?)
+        .map_err(|error| error.to_string())?;
+    let verified = OsCommand::new("cosign").args(["verify-blob", "--bundle"]).arg(&bundle_path).args(["--certificate-identity", "https://github.com/Shidori5417/helios-agent/.github/workflows/release.yml@refs/heads/main", "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com"]).arg(&artifact_path).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    if !verified.is_ok_and(|status| status.success()) {
+        let _ = fs::remove_dir_all(&root);
+        return Err(
+            "cosign verification failed or cosign is unavailable; no mutation performed".into(),
+        );
+    }
+    let target = env::current_exe().map_err(|error| error.to_string())?;
+    let result = install_one(&artifact_path, &target);
+    let _ = fs::remove_dir_all(&root);
+    result.map(|digest| println!("updated {} ({})", target.display(), digest))
+}
+
 fn resolve_observability_session(
     database: &Database,
     workspace: &str,
@@ -2798,7 +3104,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare");
+    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare; self version|install|update|uninstall");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
@@ -3767,6 +4073,45 @@ mod tests {
             parse_args(vec!["perf".into(), "compare".into(), "--current".into(), "a.json".into(), "--baseline".into(), "b.json".into()]).expect("perf"),
             Command::Perf(PerfCommand::Compare { current, baseline }) if current == Path::new("a.json") && baseline == Path::new("b.json")
         ));
+    }
+
+    #[test]
+    fn self_commands_require_exact_update_inputs_and_confirmation() {
+        assert_eq!(
+            parse_args(vec!["self".into(), "version".into()]).expect("version"),
+            Command::SelfCommand(SelfCommand::Version)
+        );
+        assert!(parse_args(vec![
+            "self".into(),
+            "uninstall".into(),
+            "--confirm".into(),
+            "other".into()
+        ])
+        .is_err());
+        assert!(parse_args(vec![
+            "self".into(),
+            "update".into(),
+            "--from".into(),
+            "binary".into()
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn local_install_is_hashed_and_atomic() {
+        let root = std::env::temp_dir().join(format!("helios-self-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let source = root.join("source");
+        let target = root.join("bin/helios");
+        fs::create_dir_all(source.parent().expect("parent")).expect("dir");
+        fs::write(&source, b"helios-test").expect("source");
+        let digest = install_one(&source, &target).expect("install");
+        assert_eq!(sha256_file(&target).expect("hash"), digest);
+        assert_eq!(
+            fs::read_to_string(target.with_extension("install.sha256")).expect("marker"),
+            digest
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

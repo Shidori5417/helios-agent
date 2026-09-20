@@ -12,4 +12,6 @@ Persistent background jobs are managed with `jobs start -- COMMAND ARGS...`, `li
 
 Offline evaluation and startup performance checks are available from the same binary: `eval run --suite smoke|benchmark-100`, `eval show`, and `eval baseline create`, plus `perf run`, `perf show`, and `perf compare`. The built-in suites are embedded in the executable so an installed binary does not depend on the source checkout. Reports default to `.agent/reports/`, are written atomically with best-effort `0600` permissions, and existing files are never overwritten; baseline regressions return a non-zero status.
 
+Self-management is explicit and user-scoped: `self version`, `self install --prefix ~/.local --name helios`, `self update --from PATH --sha256 HEX`, and `self uninstall --confirm NAME`. Install/update use atomic replacement and `0755`; uninstall verifies the install marker and moves the exact binary to the user trash directory. Remote updates are fail-closed when no verified release is available; no `sudo`, shell, or plaintext token path is used.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.
