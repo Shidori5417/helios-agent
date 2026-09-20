@@ -44,6 +44,8 @@ pub struct TuiModel {
     pub changes_delta: Option<i64>,
     pub background_jobs: Option<usize>,
     pub palette: Vec<PaletteCommand>,
+    pub models: Vec<ModelOption>,
+    pub sessions: Vec<SessionOption>,
     pub overlay: Option<OverlayState>,
 }
 
@@ -73,6 +75,8 @@ impl Default for TuiModel {
             changes_delta: None,
             background_jobs: None,
             palette: Vec::new(),
+            models: Vec::new(),
+            sessions: Vec::new(),
             overlay: None,
         }
     }
@@ -89,6 +93,25 @@ pub struct PaletteCommand {
     pub category: String,
     pub arguments: String,
     pub local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelOption {
+    pub provider: String,
+    pub model: String,
+    pub configured: bool,
+    pub current: bool,
+    pub capabilities: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionOption {
+    pub id: i64,
+    pub title: String,
+    pub turn_count: i64,
+    pub last_activity: Option<i64>,
+    pub model: Option<String>,
+    pub git_branch: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,6 +136,7 @@ pub struct OverlayState {
 pub enum OverlayAction {
     None,
     Close,
+    Open(OverlayKind),
     Execute(String),
     Fill(String),
 }
@@ -280,11 +304,56 @@ impl TuiModel {
     }
 
     pub fn open_overlay(&mut self, kind: OverlayKind) {
+        let commands = if kind == OverlayKind::Model {
+            self.models
+                .iter()
+                .map(|model| PaletteCommand {
+                    name: format!("{}/{}", model.provider, model.model),
+                    description: format!(
+                        "{}{} · {}",
+                        if model.current {
+                            "current · "
+                        } else if model.configured {
+                            "configured · "
+                        } else {
+                            ""
+                        },
+                        model.provider,
+                        model.capabilities
+                    ),
+                    category: "Model".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else if kind == OverlayKind::Sessions {
+            self.sessions
+                .iter()
+                .map(|session| PaletteCommand {
+                    name: session.id.to_string(),
+                    description: format!(
+                        "{} · turns={}{}",
+                        session.title,
+                        session.turn_count,
+                        session
+                            .model
+                            .as_ref()
+                            .map(|model| format!(" · model={model}"))
+                            .unwrap_or_default()
+                    ),
+                    category: "Session".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else {
+            self.palette.clone()
+        };
         self.overlay = Some(OverlayState {
             kind,
             query: String::new(),
             selected: 0,
-            commands: self.palette.clone(),
+            commands,
         });
     }
 
@@ -379,9 +448,29 @@ impl TuiModel {
                     .nth(overlay.selected)
                     .cloned();
                 if let Some(command) = selected {
+                    if overlay.kind == OverlayKind::Palette
+                        && matches!(command.name.as_str(), "model" | "sessions")
+                    {
+                        let target = if command.name == "model" {
+                            OverlayKind::Model
+                        } else {
+                            OverlayKind::Sessions
+                        };
+                        self.overlay = None;
+                        self.open_overlay(target.clone());
+                        return OverlayAction::Open(target);
+                    }
+                    let model_overlay = overlay.kind == OverlayKind::Model;
+                    let session_overlay = overlay.kind == OverlayKind::Sessions;
                     self.overlay = None;
                     return if command.local {
-                        OverlayAction::Execute(format!("/{}", command.name))
+                        if model_overlay {
+                            OverlayAction::Execute(format!("/model {}", command.name))
+                        } else if session_overlay {
+                            OverlayAction::Execute(format!("/session-resume {}", command.name))
+                        } else {
+                            OverlayAction::Execute(format!("/{}", command.name))
+                        }
                     } else {
                         OverlayAction::Fill(format!("/{} ", command.name))
                     };
@@ -401,6 +490,8 @@ impl TuiModel {
         self.permission_mode = context.permission_mode;
         self.background_jobs = context.background_jobs;
         self.palette = context.palette;
+        self.models = context.models;
+        self.sessions = context.sessions;
     }
 
     pub fn push_item(&mut self, item: TranscriptItem) {
@@ -606,6 +697,8 @@ pub struct TuiContext {
     pub permission_mode: Option<String>,
     pub background_jobs: Option<usize>,
     pub palette: Vec<PaletteCommand>,
+    pub models: Vec<ModelOption>,
+    pub sessions: Vec<SessionOption>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -935,7 +1028,16 @@ where
                 }
                 crossterm::event::Event::Key(key) => {
                     if model.overlay.is_some() {
-                        match model.handle_overlay_key(key) {
+                        let overlay_action = model.handle_overlay_key(key);
+                        if let OverlayAction::Execute(command) = &overlay_action {
+                            if let Some(selected) = command.strip_prefix("/model ") {
+                                model.model = selected
+                                    .rsplit_once('/')
+                                    .map(|(_, model)| model.to_owned())
+                                    .or_else(|| Some(selected.to_owned()));
+                            }
+                        }
+                        match overlay_action {
                             OverlayAction::Execute(command) => {
                                 let turn_cancellation =
                                     agent_terminal::CancellationToken::default();
@@ -949,7 +1051,8 @@ where
                                 model.composer.text = text;
                                 model.composer.cursor = model.composer.text.len();
                             }
-                            OverlayAction::Close | OverlayAction::None => {}
+                            OverlayAction::Open(_) | OverlayAction::Close | OverlayAction::None => {
+                            }
                         }
                         needs_draw = true;
                         continue;
@@ -1248,6 +1351,36 @@ mod tests {
         assert_eq!(
             model.handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             OverlayAction::Close
+        );
+    }
+
+    #[test]
+    fn model_and_session_overlays_select_typed_local_targets() {
+        let mut model = TuiModel::default();
+        model.models = vec![ModelOption {
+            provider: "fake".into(),
+            model: "gpt-5".into(),
+            configured: true,
+            current: true,
+            capabilities: "offline".into(),
+        }];
+        model.sessions = vec![SessionOption {
+            id: 7,
+            title: "inspect".into(),
+            turn_count: 2,
+            last_activity: None,
+            model: Some("gpt-5".into()),
+            git_branch: None,
+        }];
+        model.open_overlay(OverlayKind::Model);
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/model fake/gpt-5".into())
+        );
+        model.open_overlay(OverlayKind::Sessions);
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/session-resume 7".into())
         );
     }
 }

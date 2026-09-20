@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 5;
+pub const STORAGE_FORMAT_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -46,6 +46,27 @@ pub struct SessionRecord {
     pub workspace: String,
     pub archived: bool,
     pub deleted_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SessionSummary {
+    pub id: i64,
+    pub objective: String,
+    pub workspace: String,
+    pub created_at: i64,
+    pub last_activity: Option<i64>,
+    pub turn_count: i64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub git_branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SessionOverride {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub struct Database {
@@ -138,6 +159,15 @@ impl Database {
                  PRAGMA user_version = 5;",
             )?;
         }
+        if version < 6 {
+            self.connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN provider TEXT;
+                 ALTER TABLE sessions ADD COLUMN model TEXT;
+                 ALTER TABLE sessions ADD COLUMN effort TEXT;
+                 ALTER TABLE sessions ADD COLUMN git_branch TEXT;
+                 PRAGMA user_version = 6;",
+            )?;
+        }
         Ok(())
     }
 
@@ -225,6 +255,61 @@ impl Database {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn list_session_summaries(&self, workspace: &str) -> SqlResult<Vec<SessionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.objective, s.workspace, s.created_at, MAX(t.created_at), COUNT(t.id), s.provider, s.model, s.effort, s.git_branch
+             FROM sessions s LEFT JOIN turns t ON t.session_id = s.id
+             WHERE s.workspace = ?1 AND s.archived = 0 AND s.deleted_at IS NULL
+             GROUP BY s.id ORDER BY s.id DESC",
+        )?;
+        let rows = statement.query_map(params![workspace], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                objective: row.get(1)?,
+                workspace: row.get(2)?,
+                created_at: row.get(3)?,
+                last_activity: row.get(4)?,
+                turn_count: row.get(5)?,
+                provider: row.get(6)?,
+                model: row.get(7)?,
+                effort: row.get(8)?,
+                git_branch: row.get(9)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn set_session_override(
+        &self,
+        id: i64,
+        workspace: &str,
+        provider: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+        git_branch: Option<&str>,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET provider = COALESCE(?1, provider), model = COALESCE(?2, model), effort = COALESCE(?3, effort), git_branch = COALESCE(?4, git_branch) WHERE id = ?5 AND workspace = ?6 AND archived = 0 AND deleted_at IS NULL",
+            params![provider, model, effort, git_branch, id, workspace],
+        )? == 1)
+    }
+
+    pub fn session_override(&self, id: i64, workspace: &str) -> SqlResult<Option<SessionOverride>> {
+        self.connection
+            .query_row(
+                "SELECT provider, model, effort FROM sessions WHERE id = ?1 AND workspace = ?2 AND archived = 0 AND deleted_at IS NULL",
+                params![id, workspace],
+                |row| {
+                    Ok(SessionOverride {
+                        provider: row.get(0)?,
+                        model: row.get(1)?,
+                        effort: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
     }
 
     pub fn archive_session(&self, id: i64, workspace: &str, archived: bool) -> SqlResult<bool> {
@@ -534,6 +619,41 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn session_summary_and_override_are_workspace_scoped() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("inspect", "/workspace")
+            .expect("session");
+        db.append_turn(session, 0).expect("turn");
+        assert!(db
+            .set_session_override(
+                session,
+                "/workspace",
+                Some("fake"),
+                Some("gpt-5"),
+                None,
+                Some("main"),
+            )
+            .expect("override"));
+        assert_eq!(
+            db.session_override(session, "/workspace").expect("read"),
+            Some(SessionOverride {
+                provider: Some("fake".into()),
+                model: Some("gpt-5".into()),
+                effort: None,
+            })
+        );
+        assert!(db
+            .session_override(session, "/other")
+            .expect("wrong workspace")
+            .is_none());
+        let summaries = db.list_session_summaries("/workspace").expect("summaries");
+        assert_eq!(summaries[0].id, session);
+        assert_eq!(summaries[0].turn_count, 1);
+        assert_eq!(summaries[0].git_branch.as_deref(), Some("main"));
     }
 
     #[test]

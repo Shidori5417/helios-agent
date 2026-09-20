@@ -16,13 +16,13 @@ use agent_plugins::{
 use agent_plugins::{HookEvent, PluginRegistry};
 use agent_protocol::{Message, Role};
 use agent_providers::{
-    AnthropicProvider, FakeProvider, GeminiProvider, ModelProvider, OpenAiCompatibleProvider,
-    OpenAiProvider,
+    anthropic_profile, gemini_profile, generic_profile, openai_profile, AnthropicProvider,
+    FakeProvider, GeminiProvider, ModelProvider, OpenAiCompatibleProvider, OpenAiProvider,
 };
 use agent_sandbox::PermissionEngine;
 use agent_sandbox::PermissionMode;
 use agent_skills::SkillCatalog;
-use agent_storage::{ContextRecord, Database, UsageRecord};
+use agent_storage::{ContextRecord, Database, SessionSummary, UsageRecord};
 use agent_subagents::{
     Budgets as SubagentBudgets, CancellationToken as SubagentCancellation, Scheduler, StopReason,
     TaskResult, TaskSpec, WorktreeManager,
@@ -2064,7 +2064,10 @@ fn interactive_command() -> Result<(), String> {
     let ui_cancellation = CancellationToken::default();
     let first_turn = Arc::new(AtomicBool::new(true));
     let session_model = Arc::new(Mutex::new(None::<String>));
+    let session_provider = Arc::new(Mutex::new(None::<String>));
+    let active_session = Arc::new(Mutex::new(None::<i64>));
     let db_path = paths.db_path;
+    let workspace_path = paths.workspace.clone();
     agent_tui::run_interactive_with_context(
         receiver,
         sender.clone(),
@@ -2076,7 +2079,26 @@ fn interactive_command() -> Result<(), String> {
             if command == "/exit" || command == "/quit" {
                 return true;
             }
-            let local_output = if let Some(model) = command.strip_prefix("/model ") {
+            let local_output = if let Some(selector) = command.strip_prefix("/session-resume ") {
+                match selector.parse::<i64>() {
+                    Ok(id) => match Database::open(&db_path)
+                        .ok()
+                        .and_then(|db| db.session(id).ok().flatten())
+                    {
+                        Some(record)
+                            if record.workspace == workspace_path.display().to_string() =>
+                        {
+                            if let Ok(mut active) = active_session.lock() {
+                                *active = Some(id);
+                            }
+                            first_turn.store(false, Ordering::Release);
+                            Some(format!("resumed session #{}: {}", id, record.objective))
+                        }
+                        _ => Some("session not found in this workspace".into()),
+                    },
+                    Err(_) => Some("session resume requires an exact numeric id".into()),
+                }
+            } else if let Some(model) = command.strip_prefix("/model ") {
                 if model.is_empty()
                     || !model.chars().all(|character| {
                         character.is_ascii_alphanumeric() || "._:-/".contains(character)
@@ -2084,8 +2106,31 @@ fn interactive_command() -> Result<(), String> {
                 {
                     Some("model name must be a safe provider/model identifier".into())
                 } else {
+                    let (provider, model_name) = model
+                        .split_once('/')
+                        .map(|(provider, model)| (Some(provider), model))
+                        .unwrap_or((None, model));
                     if let Ok(mut selected) = session_model.lock() {
-                        *selected = Some(model.to_owned());
+                        *selected = Some(model_name.to_owned());
+                    }
+                    if let Some(provider) = provider {
+                        if let Ok(mut selected) = session_provider.lock() {
+                            *selected = Some(provider.to_owned());
+                        }
+                    }
+                    if let Ok(active) = active_session.lock() {
+                        if let Some(session_id) = *active {
+                            let _ = Database::open(&db_path).and_then(|db| {
+                                db.set_session_override(
+                                    session_id,
+                                    &workspace_path.display().to_string(),
+                                    provider,
+                                    Some(model_name),
+                                    None,
+                                    None,
+                                )
+                            });
+                        }
                     }
                     Some(format!("session model={model}"))
                 }
@@ -2110,6 +2155,12 @@ fn interactive_command() -> Result<(), String> {
             let options =
                 default_run_options(prompt, db_path.clone(), resume, Some(events.clone()));
             let mut options = options;
+            if let Ok(selected) = session_provider.lock() {
+                if let Some(provider) = selected.clone() {
+                    options.provider = provider;
+                    options.provider_explicit = true;
+                }
+            }
             if let Ok(selected) = session_model.lock() {
                 if let Some(model) = selected.clone() {
                     options.model = model;
@@ -2123,9 +2174,21 @@ fn interactive_command() -> Result<(), String> {
                     return false;
                 }
             };
+            let worker_db_path = db_path.clone();
+            let worker_workspace = workspace_path.clone();
+            let worker_active_session = active_session.clone();
             std::thread::spawn(move || {
-                if let Err(error) = run_command_with_cancellation(options, turn_cancellation) {
+                let result = run_command_with_cancellation(options, turn_cancellation);
+                if let Err(error) = result {
                     let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
+                } else if let Ok(db) = Database::open(&worker_db_path) {
+                    if let Ok(Some(record)) =
+                        db.latest_session(&worker_workspace.display().to_string())
+                    {
+                        if let Ok(mut active) = worker_active_session.lock() {
+                            *active = Some(record.id);
+                        }
+                    }
                 }
             });
             false
@@ -2169,11 +2232,49 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         palette.push(agent_tui::PaletteCommand {
             name: definition.name.to_owned(),
             description: definition.description.to_owned(),
-            category: definition.category.to_owned(),
+            category: help_category(definition.category).into(),
             arguments: definition.arguments.to_owned(),
             local: definition.local,
         });
     }
+    let mut models = Vec::new();
+    if let Some(config) = &config {
+        if let (Some(provider), Some(model)) = (&config.provider, &config.model) {
+            let capabilities = provider_capability_summary(provider);
+            models.push(agent_tui::ModelOption {
+                provider: provider.clone(),
+                model: model.clone(),
+                configured: true,
+                current: true,
+                capabilities,
+            });
+        }
+    }
+    if !models
+        .iter()
+        .any(|model: &agent_tui::ModelOption| model.provider == "fake" && model.model == "gpt-5")
+    {
+        models.push(agent_tui::ModelOption {
+            provider: "fake".into(),
+            model: "gpt-5".into(),
+            configured: config.as_ref().and_then(|value| value.provider.as_deref()) == Some("fake"),
+            current: config.as_ref().is_none_or(|value| {
+                value.provider.as_deref() == Some("fake")
+                    && value.model.as_deref().unwrap_or("gpt-5") == "gpt-5"
+            }),
+            capabilities: "tools,streaming,offline".into(),
+        });
+    }
+    let sessions = Database::open(&paths.db_path)
+        .ok()
+        .and_then(|db| {
+            db.list_session_summaries(&paths.workspace.display().to_string())
+                .ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(session_option)
+        .collect();
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -2187,8 +2288,56 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         model: config.as_ref().and_then(|value| value.model.clone()),
         permission_mode: policy.map(|value| format!("{:?}", value.mode)),
         palette,
+        models,
+        sessions,
         ..agent_tui::TuiContext::default()
     }
+}
+
+fn session_option(summary: SessionSummary) -> agent_tui::SessionOption {
+    agent_tui::SessionOption {
+        id: summary.id,
+        title: summary.objective,
+        turn_count: summary.turn_count,
+        last_activity: summary.last_activity,
+        model: summary.model,
+        git_branch: summary.git_branch,
+    }
+}
+
+fn help_category(category: &str) -> &'static str {
+    match category {
+        "workspace" | "control" | "configuration" => "Configuration",
+        "runtime" => "Tools",
+        "security" => "Permissions",
+        "diagnostics" | "ui" => "UI",
+        "data" | "sessions" => "Session",
+        "tasks" => "Tasks",
+        "git" => "Git",
+        "context" => "Context",
+        "model" => "Model",
+        "skills" => "Skills",
+        "mcp" => "MCP",
+        "coding" => "Coding",
+        _ => "Configuration",
+    }
+}
+
+fn provider_capability_summary(provider: &str) -> String {
+    let capabilities = match provider {
+        "openai" => openai_profile().capabilities,
+        "anthropic" => anthropic_profile().capabilities,
+        "gemini" => gemini_profile().capabilities,
+        "generic" | "openai-compatible" => generic_profile().capabilities,
+        _ => return "capabilities=unknown".into(),
+    };
+    format!(
+        "tools,caching={},compaction={},reasoning={},streaming={}",
+        capabilities.prompt_caching,
+        capabilities.native_compaction,
+        capabilities.reasoning_controls,
+        capabilities.streaming
+    )
 }
 
 fn git_state_snapshot(workspace: &Path) -> (Option<String>, Option<usize>) {
@@ -2266,8 +2415,9 @@ fn slash_command_output(command: &str) -> Option<String> {
             let mut lines = Vec::new();
             let mut category = "";
             for definition in definitions {
-                if definition.category != category {
-                    category = definition.category;
+                let mapped_category = help_category(definition.category);
+                if mapped_category != category {
+                    category = mapped_category;
                     lines.push(format!("[{category}]"));
                 }
                 lines.push(format!(
@@ -2386,7 +2536,7 @@ fn run_command_with_cancellation(
     if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Err("--tui requires an interactive TTY".into());
     }
-    let (options, runtime_policy, workspace) = resolve_runtime_options(options)?;
+    let (mut options, runtime_policy, workspace) = resolve_runtime_options(options)?;
     let permission_mode = runtime_policy.mode;
     let config_path = options
         .config
@@ -2400,7 +2550,7 @@ fn run_command_with_cancellation(
     let (session_id, objective, messages) = if let Some(selector) = options.resume.as_deref() {
         let record = if selector == "latest" {
             database
-                .latest_session_any()
+                .latest_session(&workspace_id)
                 .map_err(|error| error.to_string())?
         } else {
             database
@@ -2436,6 +2586,33 @@ fn run_command_with_cancellation(
             Vec::new(),
         )
     };
+    if options.resume.is_some() {
+        if let Some(override_config) = database
+            .session_override(session_id, &workspace_id)
+            .map_err(|error| error.to_string())?
+        {
+            if !options.provider_explicit {
+                if let Some(provider) = override_config.provider {
+                    options.provider = provider;
+                }
+            }
+            if !options.model_explicit {
+                if let Some(model) = override_config.model {
+                    options.model = model;
+                }
+            }
+        }
+    }
+    database
+        .set_session_override(
+            session_id,
+            &workspace_id,
+            Some(&options.provider),
+            Some(&options.model),
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
     let config_path = runtime_config_path.is_file().then_some(runtime_config_path);
     let mut servers = config_path
         .as_ref()
