@@ -105,6 +105,10 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::Runtime(command)) => match runtime_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Err(error) => {
             eprintln!("{error}\n");
             print_help();
@@ -422,6 +426,18 @@ enum Command {
     Auth(AuthCommand),
     Doctor,
     Completion(CompletionCommand),
+    Runtime(RuntimeCommand),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum RuntimeCommand {
+    Providers(Vec<String>),
+    Permissions(Vec<String>),
+    Mcp(Vec<String>),
+    Lsp(Vec<String>),
+    Hooks(Vec<String>),
+    Skills(Vec<String>),
+    Subagents(Vec<String>),
+    Status,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum ConfigCommand {
@@ -560,6 +576,20 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "auth" => parse_auth_command(&args[1..]),
         "doctor" => Ok(Command::Doctor),
         "completion" => parse_completion_command(&args[1..]),
+        "providers" => Ok(Command::Runtime(RuntimeCommand::Providers(
+            args[1..].to_vec(),
+        ))),
+        "permissions" => Ok(Command::Runtime(RuntimeCommand::Permissions(
+            args[1..].to_vec(),
+        ))),
+        "mcp" => Ok(Command::Runtime(RuntimeCommand::Mcp(args[1..].to_vec()))),
+        "lsp" => Ok(Command::Runtime(RuntimeCommand::Lsp(args[1..].to_vec()))),
+        "hooks" => Ok(Command::Runtime(RuntimeCommand::Hooks(args[1..].to_vec()))),
+        "skills" => Ok(Command::Runtime(RuntimeCommand::Skills(args[1..].to_vec()))),
+        "subagents" => Ok(Command::Runtime(RuntimeCommand::Subagents(
+            args[1..].to_vec(),
+        ))),
+        "status" => Ok(Command::Runtime(RuntimeCommand::Status)),
         _ => parse_run(&args),
     }
 }
@@ -1828,6 +1858,147 @@ fn completion_command(command: CompletionCommand) -> Result<(), String> {
 fn completion_source(shell: &str) -> Result<String, String> {
     let path = workspace_root()?.join(format!("completions/agent-cli.{shell}"));
     fs::read_to_string(path).map_err(|e| e.to_string())
+}
+
+fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
+    if matches!(&command, RuntimeCommand::Status) {
+        println!("workspace={}", workspace_root()?.display());
+        println!("config={}", config_path()?.display());
+        return Ok(());
+    }
+    let (section, args) = match command {
+        RuntimeCommand::Providers(args) => ("providers", args),
+        RuntimeCommand::Permissions(args) => ("permissions", args),
+        RuntimeCommand::Mcp(args) => ("mcp", args),
+        RuntimeCommand::Lsp(args) => ("lsp", args),
+        RuntimeCommand::Hooks(args) => ("hooks", args),
+        RuntimeCommand::Skills(args) => ("skills", args),
+        RuntimeCommand::Subagents(args) => ("subagents", args),
+        RuntimeCommand::Status => unreachable!(),
+    };
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let path = config_path()?;
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?;
+    if matches!(action, "list" | "show") {
+        println!(
+            "{}",
+            table
+                .get(section)
+                .cloned()
+                .unwrap_or(toml::Value::Table(Default::default()))
+        );
+        return Ok(());
+    }
+    if matches!(section, "mcp" | "lsp") && action == "test" {
+        return Err("external MCP/LSP tests are disabled in this offline control plane; use --help for configuration".into());
+    }
+    if matches!(section, "skills" | "hooks") && action == "validate" {
+        return Ok(());
+    }
+    let id = value_after(&args[1..], "--id")?.or_else(|| args.get(1).cloned());
+    if matches!(action, "remove" | "enable" | "disable" | "show") && id.is_none() {
+        return Err(format!("{section} {action} requires exact --id"));
+    }
+    if matches!(action, "add" | "set-default") && id.is_none() {
+        return Err(format!("{section} {action} requires exact --id"));
+    }
+    if args
+        .iter()
+        .any(|arg| arg.contains("secret=") || arg.contains("token=") || arg.starts_with("sk-"))
+    {
+        return Err("secret literals are not accepted; use an environment-name reference".into());
+    }
+    let id = id.unwrap_or_else(|| "default".into());
+    if !safe_control_id(&id) {
+        return Err("invalid control-plane id".into());
+    }
+    let section_value = table
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let section_table = section_value
+        .as_table_mut()
+        .ok_or("config section must be a table")?;
+    match action {
+        "remove" => {
+            section_table.remove(&id);
+        }
+        "enable" | "disable" => {
+            section_table
+                .entry(id)
+                .or_insert_with(|| toml::Value::Table(Default::default()))
+                .as_table_mut()
+                .ok_or("entry must be table")?
+                .insert("enabled".into(), toml::Value::Boolean(action == "enable"));
+        }
+        "set-default" => {
+            if section != "providers" {
+                return Err("set-default is only valid for providers".into());
+            }
+            table.insert("provider".into(), toml::Value::String(id));
+        }
+        "add" => {
+            let mut entry = toml::map::Map::new();
+            if section == "mcp" {
+                let url = value_after(&args[1..], "--url")?;
+                let command = value_after(&args[1..], "--command")?;
+                if url.is_some() == command.is_some() {
+                    return Err("mcp add requires exactly one of --url or --command".into());
+                }
+                if let Some(url) = url {
+                    if !url.starts_with("https://") {
+                        return Err("MCP HTTP requires https://".into());
+                    }
+                    entry.insert("url".into(), toml::Value::String(url));
+                }
+                if let Some(command) = command {
+                    entry.insert("command".into(), toml::Value::String(command));
+                }
+                if let Some(env_name) = value_after(&args[1..], "--auth-env")? {
+                    if !env_name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b == b'_' || b.is_ascii_digit())
+                    {
+                        return Err("--auth-env must be an environment variable name".into());
+                    }
+                    entry.insert("auth_env".into(), toml::Value::String(env_name));
+                }
+            } else if section == "lsp" {
+                for (flag, key) in [
+                    ("--language", "language"),
+                    ("--command", "command"),
+                    ("--cwd", "cwd"),
+                ] {
+                    if let Some(value) = value_after(&args[1..], flag)? {
+                        entry.insert(key.into(), toml::Value::String(value));
+                    }
+                }
+                if !entry.contains_key("language") || !entry.contains_key("command") {
+                    return Err("lsp add requires --language and --command".into());
+                }
+            } else {
+                entry.insert("enabled".into(), toml::Value::Boolean(true));
+            }
+            section_table.insert(id, toml::Value::Table(entry));
+        }
+        _ => return Err(format!("unsupported {section} action: {action}")),
+    }
+    let bytes = toml::to_string_pretty(&document).map_err(|e| e.to_string())?;
+    atomic_write(&path, bytes.as_bytes())
+}
+
+fn safe_control_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 struct PrintingSink {

@@ -97,6 +97,8 @@ The CLI remains non-interactive by default; `--tui` enters the ratatui/crossterm
 
 The CLI control plane includes `init`, typed atomic `config`, fail-closed `auth`, `doctor`, and shell `completion` commands. Secret status exposes presence only; login never accepts secret arguments or falls back to plaintext when Secret Service/keyring storage is unavailable. See `docs/CLI_CONTROL_PLANE.md`.
 
+Runtime extensions are also controlled through typed `providers`, `permissions`, `mcp`, `lsp`, `hooks`, `skills`, `subagents`, and `status` commands. Mutations are canonical-id, atomic TOML operations; MCP/LSP test commands remain offline-only.
+
 Terminal cancellation and timeouts kill the Unix process group, so descendants do not remain running. Background jobs have deterministic IDs, bounded concurrency, cancellation, wait/reap, and bounded output spill. PTY mode is intentionally opt-in and remains a small non-interactive boundary; full interactive terminal UX is postponed.
 
 MCP supports both lazy stdio and streamable HTTP JSON-RPC transports. HTTP is denied by default and requires an explicit policy host approval; authentication accepts only an environment-variable name. Plugin hooks execute explicit argv through the same permission, timeout, cancellation, bounded-output, and workspace-canonicalization boundary. Fail-closed hooks block on failure; fail-open hooks record a bounded failure and continue. In-process arbitrary plugin code is not supported.

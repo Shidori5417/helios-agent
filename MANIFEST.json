@@ -9,7 +9,7 @@
   },
   {
     "path": "README.md",
-    "bytes": 13386
+    "bytes": 13632
   },
   {
     "path": ".gitignore",
@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 72439
+    "bytes": 79563
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -402,5 +402,9 @@
   {
     "path": "docs/CLI_CONTROL_PLANE.md",
     "bytes": 1162
+  },
+  {
+    "path": "docs/CLI_RUNTIME_CONTROL.md",
+    "bytes": 745
   }
 ]
