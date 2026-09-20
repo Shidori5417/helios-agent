@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    io::{self, IsTerminal, Read},
+    io::{self, IsTerminal, Read, Write},
     path::{Path, PathBuf},
     process::{Command as OsCommand, ExitCode, Stdio},
     sync::{
@@ -182,7 +182,7 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
-        Ok(Command::Doctor) => match doctor_command() {
+        Ok(Command::Doctor { json }) => match doctor_command(json) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -566,7 +566,9 @@ enum Command {
     },
     Config(ConfigCommand),
     Auth(AuthCommand),
-    Doctor,
+    Doctor {
+        json: bool,
+    },
     Completion(CompletionCommand),
     Runtime(RuntimeCommand),
 }
@@ -1426,7 +1428,9 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         }),
         "config" => parse_config_command(&args[1..]),
         "auth" => parse_auth_command(&args[1..]),
-        "doctor" => Ok(Command::Doctor),
+        "doctor" => Ok(Command::Doctor {
+            json: args.iter().any(|arg| arg == "--json"),
+        }),
         "completion" => parse_completion_command(&args[1..]),
         "providers" => Ok(Command::Runtime(RuntimeCommand::Providers(
             args[1..].to_vec(),
@@ -2617,6 +2621,18 @@ fn interactive_command() -> Result<(), String> {
                         .map(|id| session_export(db_path.clone(), id, destination).map(|_| "session exported".into()).unwrap_or_else(|error| error))
                         .or_else(|| Some("no active session to export".into())),
                 }
+            } else if matches!(command.as_str(), "/editor" | "/compose" | "/prompt") {
+                Some(edit_external_prompt("", &workspace_path).unwrap_or_else(|error| error))
+            } else if let Some(copy_target) = command.strip_prefix("/copy ") {
+                Some(copy_last_text(copy_target, &workspace_path))
+            } else if let Some(custom_output) = custom_exec_command(
+                &command,
+                &workspace_path,
+                &project_config_path,
+                approval.clone(),
+                turn_cancellation.clone(),
+            ) {
+                Some(custom_output.unwrap_or_else(|error| error))
             } else if let Some(action) = command.strip_prefix("/tools ") {
                 let mut parts = action.split_whitespace();
                 match parts.next() {
@@ -3235,6 +3251,160 @@ fn custom_prompt_command(command: &str, config_path: &Path) -> Option<String> {
     }
     let prompt = entry.get("prompt")?.as_str()?.trim();
     (!prompt.is_empty()).then(|| prompt.to_owned())
+}
+
+fn custom_exec_command(
+    command: &str,
+    workspace: &Path,
+    project_config: &Path,
+    approval: ApprovalBroker,
+    cancellation: CancellationToken,
+) -> Option<Result<String, String>> {
+    let name = command.strip_prefix('/')?.split_whitespace().next()?;
+    if name.is_empty()
+        || command != format!("/{name}")
+        || command_registry().iter().any(|item| item.name == name)
+    {
+        return None;
+    }
+    let paths = AppPaths::discover(workspace).ok()?;
+    let source = [project_config.to_path_buf(), paths.global_config]
+        .into_iter()
+        .find_map(|path| {
+            let value: toml::Value = toml::from_str(&fs::read_to_string(path).ok()?).ok()?;
+            value.get("commands")?.get(name)?.as_table().cloned()
+        })?;
+    if source.get("type").and_then(toml::Value::as_str) != Some("exec") {
+        return None;
+    }
+    let argv = source
+        .get("argv")
+        .and_then(toml::Value::as_array)
+        .and_then(|values| {
+            values
+                .iter()
+                .map(toml::Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        })?;
+    let (program, args) = argv.split_first()?;
+    let policy = load_runtime_policy(project_config).unwrap_or_default();
+    let registry = match ToolRegistry::new(workspace, policy.mode) {
+        Ok(registry) => registry
+            .with_approval_broker(approval)
+            .with_cancellation(cancellation.clone()),
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let result = registry.execute(
+        "shell",
+        serde_json::json!({"program": program, "args": args, "cwd": workspace.display().to_string(), "requires_pty": false}),
+        &cancellation,
+    );
+    Some(
+        result
+            .map(|outcome| redact_output(&outcome.data))
+            .map_err(|error| error.to_string()),
+    )
+}
+
+fn edit_external_prompt(initial: &str, workspace: &Path) -> Result<String, String> {
+    let paths = AppPaths::discover(workspace).map_err(|error| error.to_string())?;
+    paths.ensure_dirs().map_err(|error| error.to_string())?;
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
+        .map_err(|_| "no VISUAL or EDITOR configured".to_owned())?;
+    let argv = parse_direct_argv(&editor)
+        .map_err(|_| "editor must be an explicit executable and argv".to_owned())?;
+    let program = argv.first().ok_or("editor command is empty")?.clone();
+    let path = paths
+        .state_dir
+        .join(format!("compose-{}.txt", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).map_err(|error| error.to_string())?;
+    file.write_all(initial.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let result = agent_terminal::run(
+        agent_terminal::CommandSpec {
+            program,
+            args: argv
+                .into_iter()
+                .skip(1)
+                .chain(std::iter::once(path.display().to_string()))
+                .collect(),
+            cwd: workspace.to_path_buf(),
+            timeout: Duration::from_secs(60),
+            output_limit: 8 * 1024,
+            spill_dir: paths.spill_dir,
+            requires_pty: false,
+            env_allowlist: vec![],
+        },
+        &CancellationToken::default(),
+    )
+    .map_err(|error| error.to_string());
+    let text = result.and_then(|result| match result.status {
+        agent_terminal::CommandStatus::Exited(0) => {
+            fs::read_to_string(&path).map_err(|error| error.to_string())
+        }
+        status => Err(format!("editor failed: {status:?}")),
+    });
+    let _ = fs::remove_file(&path);
+    text.map(|value| value.chars().take(64 * 1024).collect())
+}
+
+fn copy_last_text(target: &str, workspace: &Path) -> String {
+    let text = if target == "diff" {
+        ToolRegistry::new(workspace, PermissionMode::ReadOnly)
+            .ok()
+            .and_then(|registry| registry.git_diff_variant("worktree").ok())
+            .map(|result| result.data)
+            .unwrap_or_default()
+    } else {
+        "last response is available in the durable session export".into()
+    };
+    let program = ["wl-copy", "xclip", "xsel"]
+        .into_iter()
+        .find(|candidate| command_available(candidate));
+    if let Some(program) = program {
+        let args: Vec<String> = match program {
+            "xclip" => vec!["-selection".into(), "clipboard".into()],
+            "xsel" => vec!["--clipboard", "--input"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut child = match OsCommand::new(program)
+            .args(args)
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => {
+                return format!(
+                    "clipboard unavailable; selectable fallback:\n{}",
+                    text.chars().take(4096).collect::<String>()
+                )
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if child.wait().is_ok() {
+            return "copied to clipboard".into();
+        }
+    }
+    format!(
+        "clipboard unavailable; selectable fallback:\n{}",
+        text.chars().take(4096).collect::<String>()
+    )
 }
 
 fn run_command(options: RunOptions) -> Result<(), String> {
@@ -6113,28 +6283,63 @@ fn auth_command(command: AuthCommand) -> Result<(), String> {
     }
 }
 
-fn doctor_command() -> Result<(), String> {
+fn doctor_command(json: bool) -> Result<(), String> {
     let workspace = workspace_root()?;
-    println!("binary=helios version=0.1.0 compatibility=agent-cli");
-    println!("workspace={}", workspace.display());
-    println!("config={}", config_path()?.display());
-    println!("config_valid={}", load_user_config(&config_path()?).is_ok());
-    println!(
-        "keyring_available={}",
-        !KeyringSecretStore.get("openai").is_err()
-    );
-    println!("db_present={}", app_paths()?.db_path.is_file());
-    for command in ["git", "rg"] {
-        println!("{command}_available={}", command_available(command));
-    }
-    for provider in ["openai", "anthropic", "gemini", "generic"] {
-        println!(
-            "{provider}_credential_present={}",
-            env::var_os(provider_env(provider)).is_some()
-        );
+    let paths = app_paths()?;
+    let config = config_path()?;
+    let config_valid = load_user_config(&config).is_ok();
+    let db_present = paths.db_path.is_file();
+    let db_integrity = db_present
+        && Database::open(&paths.db_path)
+            .and_then(|db| {
+                db.connection()
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            })
+            .map(|value| value == "ok")
+            .unwrap_or(false);
+    let keyring_available = KeyringSecretStore.get("openai").is_ok();
+    let git_available = command_available("git");
+    let rg_available = command_available("rg");
+    let terminal = env::var("TERM").unwrap_or_else(|_| "unknown".into());
+    let provider_credentials = ["openai", "anthropic", "gemini", "generic"]
+        .iter()
+        .map(|provider| serde_json::json!({"provider": provider, "env_present": env::var_os(provider_env(provider)).is_some(), "keyring_present": KeyringSecretStore.get(provider).is_ok()}))
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "binary": "helios", "version": env!("CARGO_PKG_VERSION"), "workspace": workspace,
+        "config": config, "config_valid": config_valid, "db_present": db_present,
+        "db_integrity": db_integrity, "keyring_available": keyring_available,
+        "git_available": git_available, "rg_available": rg_available, "terminal": terminal,
+        "provider_credentials": provider_credentials,
+        "mcp_configured": config_value_count(&config, "mcp_server"), "lsp_configured": config_value_count(&config, "lsp_server"),
+        "plugins_dir_present": paths.plugins_dir.is_dir(), "skills_dir_present": workspace.join("skills").is_dir(),
+        "permission_mode": load_runtime_policy(&config).map(|policy| format!("{:?}", policy.mode)).unwrap_or_else(|_| "invalid".into()),
+    });
+    if json {
+        println!("{payload}");
+    } else {
+        println!("binary=helios version={}", env!("CARGO_PKG_VERSION"));
+        for (key, value) in payload
+            .as_object()
+            .into_iter()
+            .flat_map(|object| object.iter())
+        {
+            if !matches!(key.as_str(), "provider_credentials") {
+                println!("{key}={value}");
+            }
+        }
     }
     Ok(())
 }
+
+fn config_value_count(path: &Path, key: &str) -> usize {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+        .and_then(|value| value.get(key).and_then(toml::Value::as_array).map(Vec::len))
+        .unwrap_or(0)
+}
+
 fn command_available(name: &str) -> bool {
     env::var_os("PATH")
         .map(|path| env::split_paths(&path).any(|dir| dir.join(name).is_file()))
@@ -8210,6 +8415,25 @@ mod tests {
         let disabled = disabled_tool_names(&root.join(".helios/config.toml")).expect("read");
         assert_eq!(disabled, vec!["shell"]);
         WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn c3_local_controls_are_bounded_and_custom_prompt_is_provider_free() {
+        let root = std::env::temp_dir().join(format!("helios-c3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let config = root.join("config.toml");
+        atomic_write(
+            &config,
+            b"[commands.review]\ntype = 'prompt'\nprompt = 'inspect only'",
+        )
+        .expect("config");
+        assert_eq!(
+            custom_prompt_command("/review", &config).as_deref(),
+            Some("inspect only")
+        );
+        assert!(resolve_workspace_file(Path::new("../escape.json"), &root).is_err());
         let _ = fs::remove_dir_all(root);
     }
 }
