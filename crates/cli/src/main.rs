@@ -2343,6 +2343,43 @@ fn interactive_command() -> Result<(), String> {
                 }
                 return agent_tui::SubmitAction::Continue;
             }
+            if command == "/checkpoint" || command.starts_with("/checkpoint ") {
+                let label = prompt.strip_prefix("/checkpoint").unwrap_or("").trim();
+                let result = Database::open(&db_path).and_then(|db| {
+                    let session = active_session.lock().ok().and_then(|value| *value)
+                        .or_else(|| db.latest_session(&workspace_path.display().to_string()).ok().flatten().map(|s| s.id))
+                        .ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
+                    db.create_checkpoint(session, &workspace_path.display().to_string(), if label.is_empty() { "manual" } else { label }, "explicit user checkpoint")
+                });
+                let _ = events.send(agent_protocol::Event::ModelDelta(result.map(|id| format!("checkpoint={id}")).unwrap_or_else(|error| format!("checkpoint error: {error}"))));
+                return agent_tui::SubmitAction::Continue;
+            }
+            if command.starts_with("/branch") || command.starts_with("/fork") {
+                let kind = if command.starts_with("/fork") { "fork" } else { "branch" };
+                let title = prompt.split_once(' ').map(|(_, value)| value.trim()).filter(|value| !value.is_empty()).unwrap_or(kind);
+                let result = Database::open(&db_path).and_then(|db| {
+                    let parent = active_session.lock().ok().and_then(|value| *value)
+                        .or_else(|| db.latest_session(&workspace_path.display().to_string()).ok().flatten().map(|s| s.id))
+                        .ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
+                    let message_id: i64 = db.connection().query_row("SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?1", rusqlite::params![parent], |row| row.get(0))?;
+                    db.create_lineage_session(title, &workspace_path.display().to_string(), parent, kind, message_id)
+                });
+                if let Ok(id) = result {
+                    if let Ok(mut active) = active_session.lock() { *active = Some(id); }
+                    let _ = events.send(agent_protocol::Event::ModelDelta(format!("{kind} session={id}")));
+                } else { let _ = events.send(agent_protocol::Event::Error(format!("{kind} failed"))); }
+                return agent_tui::SubmitAction::Continue;
+            }
+            if command.starts_with("/rewind") {
+                let id = prompt.split_whitespace().nth(1).and_then(|value| value.parse::<i64>().ok());
+                let result = Database::open(&db_path).and_then(|db| {
+                    let session = active_session.lock().ok().and_then(|value| *value).ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
+                    let checkpoint = id.and_then(|checkpoint_id| db.checkpoint(checkpoint_id, session, &workspace_path.display().to_string()).ok().flatten()).ok_or_else(|| rusqlite::Error::InvalidParameterName("checkpoint not found".into()))?;
+                    db.create_context_boundary_at(session, checkpoint.message_id, "rewind conversation")
+                });
+                let _ = events.send(agent_protocol::Event::ModelDelta(result.map(|boundary| format!("conversation rewind boundary={boundary}")).unwrap_or_else(|error| format!("rewind error: {error}"))));
+                return agent_tui::SubmitAction::Continue;
+            }
             if let Some(queue_command) = prompt.strip_prefix("/queue") {
                 let action = queue_command.trim();
                 let result = Database::open(&db_path).and_then(|db| {
@@ -3081,6 +3118,10 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         ("steer", "steer the active turn at a safe boundary"),
         ("stop", "cancel the active turn and remain in the session"),
         ("btw", "run an isolated read-only side question"),
+        ("checkpoint", "create a durable conversation checkpoint"),
+        ("branch", "create a new session lineage branch"),
+        ("fork", "fork a new session from the current lineage"),
+        ("rewind", "restore conversation context to a checkpoint"),
         ("exit", "close the interactive session"),
         ("quit", "close the interactive session"),
     ]

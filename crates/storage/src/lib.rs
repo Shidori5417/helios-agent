@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 10;
+pub const STORAGE_FORMAT_VERSION: u32 = 11;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -94,6 +94,18 @@ pub struct QueueItem {
     pub session_id: i64,
     pub prompt: String,
     pub position: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CheckpointRecord {
+    pub id: i64,
+    pub session_id: i64,
+    pub message_id: i64,
+    pub workspace: String,
+    pub label: String,
+    pub reason: String,
+    pub created_at: i64,
+    pub pinned: bool,
 }
 
 pub struct Database {
@@ -241,6 +253,15 @@ impl Database {
                  PRAGMA user_version = 10;",
             )?;
         }
+        if version < 11 {
+            self.connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN parent_session_id INTEGER REFERENCES sessions(id);
+                 ALTER TABLE sessions ADD COLUMN lineage_kind TEXT NOT NULL DEFAULT 'root';
+                 CREATE TABLE IF NOT EXISTS checkpoints (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id), message_id INTEGER NOT NULL, workspace TEXT NOT NULL, label TEXT NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0);
+                 CREATE INDEX IF NOT EXISTS checkpoints_session ON checkpoints(session_id, id);
+                 PRAGMA user_version = 11;",
+            )?;
+        }
         Ok(())
     }
 
@@ -258,6 +279,110 @@ impl Database {
             params![objective, workspace],
         )?;
         Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn create_lineage_session(
+        &self,
+        objective: &str,
+        workspace: &str,
+        parent: i64,
+        kind: &str,
+        message_id: i64,
+    ) -> SqlResult<i64> {
+        let parent_workspace: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id=?1",
+                params![parent],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if parent_workspace.as_deref() != Some(workspace) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "lineage workspace mismatch".into(),
+            ));
+        }
+        self.connection.execute("INSERT INTO sessions(objective,workspace,created_at,parent_session_id,lineage_kind) VALUES (?1,?2,strftime('%s','now'),?3,?4)", params![objective, workspace, parent, kind])?;
+        let id = self.connection.last_insert_rowid();
+        let mut statement = self.connection.prepare(
+            "SELECT role,content FROM messages WHERE session_id=?1 AND id<=?2 ORDER BY id",
+        )?;
+        let messages = statement
+            .query_map(params![parent, message_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<SqlResult<Vec<_>>>()?;
+        for (role, content) in messages.into_iter().take(256) {
+            self.connection.execute("INSERT INTO messages(session_id,role,content,created_at) VALUES (?1,?2,?3,strftime('%s','now'))", params![id,role,content])?;
+        }
+        Ok(id)
+    }
+
+    pub fn create_checkpoint(
+        &self,
+        session_id: i64,
+        workspace: &str,
+        label: &str,
+        reason: &str,
+    ) -> SqlResult<i64> {
+        let session_workspace: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT workspace FROM sessions WHERE id=?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if session_workspace.as_deref() != Some(workspace) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "checkpoint workspace mismatch".into(),
+            ));
+        }
+        let message_id: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(id),0) FROM messages WHERE session_id=?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if label.len() > 256 || reason.len() > 1024 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "checkpoint metadata bounds".into(),
+            ));
+        }
+        self.connection.execute("INSERT INTO checkpoints(session_id,message_id,workspace,label,reason,created_at) VALUES (?1,?2,?3,?4,?5,strftime('%s','now'))", params![session_id,message_id,workspace,label,reason])?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn checkpoints(
+        &self,
+        session_id: i64,
+        workspace: &str,
+    ) -> SqlResult<Vec<CheckpointRecord>> {
+        let mut statement = self.connection.prepare("SELECT id,session_id,message_id,workspace,label,reason,created_at,pinned FROM checkpoints WHERE session_id=?1 AND workspace=?2 ORDER BY id DESC LIMIT 128")?;
+        let rows = statement
+            .query_map(params![session_id, workspace], |row| {
+                Ok(CheckpointRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    workspace: row.get(3)?,
+                    label: row.get(4)?,
+                    reason: row.get(5)?,
+                    created_at: row.get(6)?,
+                    pinned: row.get::<_, i64>(7)? != 0,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn checkpoint(
+        &self,
+        id: i64,
+        session_id: i64,
+        workspace: &str,
+    ) -> SqlResult<Option<CheckpointRecord>> {
+        self.checkpoints(session_id, workspace)
+            .map(|items| items.into_iter().find(|item| item.id == id))
     }
 
     pub fn session(&self, id: i64) -> SqlResult<Option<SessionRecord>> {
@@ -419,6 +544,16 @@ impl Database {
             "INSERT INTO context_boundaries(session_id, message_id, reason, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
             params![session_id, message_id, reason],
         )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn create_context_boundary_at(
+        &self,
+        session_id: i64,
+        message_id: i64,
+        reason: &str,
+    ) -> SqlResult<i64> {
+        self.connection.execute("INSERT INTO context_boundaries(session_id,message_id,reason,created_at) VALUES (?1,?2,?3,strftime('%s','now'))", params![session_id,message_id,reason])?;
         Ok(self.connection.last_insert_rowid())
     }
 
@@ -1323,5 +1458,31 @@ mod tests {
         assert!(db
             .enqueue_foreground(session, &"x".repeat(32 * 1024 + 1))
             .is_err());
+    }
+
+    #[test]
+    fn checkpoints_and_lineage_are_workspace_scoped() {
+        let db = Database::in_memory().expect("db");
+        let parent = db
+            .create_session_for_workspace("root", "/workspace")
+            .expect("session");
+        let turn = db.append_turn(parent, 0).expect("turn");
+        db.append_message(parent, turn, "user", "inspect")
+            .expect("message");
+        let checkpoint = db
+            .create_checkpoint(parent, "/workspace", "before-edit", "test")
+            .expect("checkpoint");
+        let child = db
+            .create_lineage_session("branch", "/workspace", parent, "branch", i64::MAX)
+            .expect("lineage");
+        assert_ne!(parent, child);
+        assert_eq!(
+            db.checkpoints(parent, "/workspace").expect("list")[0].id,
+            checkpoint
+        );
+        assert!(db
+            .checkpoint(checkpoint, parent, "/other")
+            .expect("scope")
+            .is_none());
     }
 }
