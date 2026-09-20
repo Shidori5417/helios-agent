@@ -62,6 +62,7 @@ pub struct TuiModel {
     pub plugins: Vec<ExtensionOption>,
     pub skills: Vec<ExtensionOption>,
     pub hooks: Vec<ExtensionOption>,
+    pub tasks: Vec<TaskOption>,
 }
 
 impl Default for TuiModel {
@@ -108,6 +109,7 @@ impl Default for TuiModel {
             plugins: Vec::new(),
             skills: Vec::new(),
             hooks: Vec::new(),
+            tasks: Vec::new(),
         }
     }
 }
@@ -201,6 +203,14 @@ pub struct ExtensionOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskOption {
+    pub id: String,
+    pub state: String,
+    pub objective: String,
+    pub result: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlayKind {
     Palette,
     Help,
@@ -222,6 +232,8 @@ pub enum OverlayKind {
     Plugins,
     Skills,
     Hooks,
+    Tasks,
+    Agents,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -719,6 +731,17 @@ impl TuiModel {
                 arguments: String::new(),
                 local: true,
             }]
+        } else if matches!(kind, OverlayKind::Tasks | OverlayKind::Agents) {
+            self.tasks
+                .iter()
+                .map(|task| PaletteCommand {
+                    name: task.id.clone(),
+                    description: format!("{} · {}", task.state, task.objective),
+                    category: "Tasks".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
         } else {
             self.palette.clone()
         };
@@ -782,6 +805,8 @@ impl TuiModel {
             OverlayKind::Plugins => "Plugins",
             OverlayKind::Skills => "Skills",
             OverlayKind::Hooks => "Hooks",
+            OverlayKind::Tasks => "Tasks",
+            OverlayKind::Agents => "Agents",
         };
         if overlay.kind == OverlayKind::Permission {
             if let Some(request) = &self.permission_request {
@@ -1048,6 +1073,7 @@ impl TuiModel {
         self.plugins = context.plugins;
         self.skills = context.skills;
         self.hooks = context.hooks;
+        self.tasks = context.tasks;
         self.usage_summary = context.usage_summary;
         self.cost_summary = context.cost_summary;
         self.context_summary = context.context_summary;
@@ -1335,6 +1361,7 @@ pub struct TuiContext {
     pub plugins: Vec<ExtensionOption>,
     pub skills: Vec<ExtensionOption>,
     pub hooks: Vec<ExtensionOption>,
+    pub tasks: Vec<TaskOption>,
     pub context_summary: Option<String>,
 }
 
@@ -1725,6 +1752,8 @@ where
                                     "/usage" => Some(OverlayKind::Usage),
                                     "/cost" => Some(OverlayKind::Cost),
                                     "/context" => Some(OverlayKind::Context),
+                                    "/tasks" => Some(OverlayKind::Tasks),
+                                    "/agents" => Some(OverlayKind::Agents),
                                     _ => None,
                                 };
                                 if let Some(kind) = local_overlay {

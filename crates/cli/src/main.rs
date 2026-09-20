@@ -120,6 +120,12 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::Tasks(command)) | Ok(Command::Agents(command)) => {
+            match tasks_command(command) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(error),
+            }
+        }
         Ok(Command::Eval(command)) => match eval_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
@@ -697,6 +703,8 @@ enum Command {
     Database(DatabaseCommand),
     Audit(AuditCommand),
     Jobs(JobCommand),
+    Tasks(TaskCommand),
+    Agents(TaskCommand),
     Eval(EvalCommand),
     Perf(PerfCommand),
     SelfCommand(SelfCommand),
@@ -991,6 +999,18 @@ fn command_registry() -> Vec<CommandDefinition> {
             source: "builtin",
         },
         CommandDefinition {
+            name: "tasks",
+            aliases: &["agents"],
+            description: "manage durable background agent tasks",
+            category: "runtime",
+            arguments: "bg|list|show|status|cancel|adopt",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "tasks",
+            source: "builtin",
+        },
+        CommandDefinition {
             name: "eval",
             aliases: &[],
             description: "run offline evaluations",
@@ -1202,6 +1222,15 @@ enum JobCommand {
     Reap {
         id: Option<String>,
     },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum TaskCommand {
+    Background(String),
+    List,
+    Show(String),
+    Status(String),
+    Cancel(String),
+    Adopt(String),
 }
 #[derive(Debug, PartialEq, Eq)]
 enum EvalCommand {
@@ -1570,6 +1599,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "database" => parse_database_command(&args[1..]),
         "audit" => parse_audit_command(&args[1..]),
         "jobs" => parse_jobs_command(&args[1..]),
+        "tasks" => parse_tasks_command(&args[1..]),
+        "agents" => parse_agents_command(&args[1..]),
         "eval" => parse_eval_command(&args[1..]),
         "perf" => parse_perf_command(&args[1..]),
         "self" => parse_self_command(&args[1..]),
@@ -1841,6 +1872,36 @@ fn parse_jobs_command(args: &[String]) -> Result<Command, String> {
         other => return Err(format!("unknown jobs command: {other}")),
     };
     Ok(Command::Jobs(command))
+}
+
+fn parse_tasks_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let command = match action {
+        "bg" | "background" => {
+            let prompt = args[1..].join(" ").trim().to_owned();
+            if prompt.is_empty() {
+                return Err("tasks bg requires a prompt".into());
+            }
+            TaskCommand::Background(prompt)
+        }
+        "list" => TaskCommand::List,
+        "show" => TaskCommand::Show(args.get(1).cloned().ok_or("tasks show requires ID")?),
+        "status" => TaskCommand::Status(args.get(1).cloned().ok_or("tasks status requires ID")?),
+        "cancel" => TaskCommand::Cancel(args.get(1).cloned().ok_or("tasks cancel requires ID")?),
+        "adopt" => TaskCommand::Adopt(args.get(1).cloned().ok_or("tasks adopt requires ID")?),
+        other => return Err(format!("unknown tasks command: {other}")),
+    };
+    Ok(Command::Tasks(command))
+}
+
+fn parse_agents_command(args: &[String]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::Agents(TaskCommand::List));
+    }
+    parse_tasks_command(args).map(|command| match command {
+        Command::Tasks(task) => Command::Agents(task),
+        _ => unreachable!(),
+    })
 }
 
 fn parse_eval_command(args: &[String]) -> Result<Command, String> {
@@ -2328,6 +2389,24 @@ fn interactive_command() -> Result<(), String> {
             let mut prompt_for_run = prompt.clone();
             if command == "/exit" || command == "/quit" {
                 return agent_tui::SubmitAction::Exit;
+            }
+            if let Some(objective) = prompt.strip_prefix("/bg ").map(str::trim).filter(|v| !v.is_empty()) {
+                match start_background_task(&workspace_path, objective.to_owned()) {
+                    Ok(task) => { let _ = events.send(agent_protocol::Event::ModelDelta(format!("background task started: {}", task.id))); }
+                    Err(error) => { let _ = events.send(agent_protocol::Event::Error(redact_output(&error))); }
+                }
+                return agent_tui::SubmitAction::Continue;
+            }
+            if command == "/tasks" || command == "/agents" {
+                return agent_tui::SubmitAction::OpenOverlay(if command == "/tasks" { agent_tui::OverlayKind::Tasks } else { agent_tui::OverlayKind::Agents });
+            }
+            if command.starts_with("/tasks ") || command.starts_with("/agents ") {
+                let args = prompt.split_whitespace().skip(1).map(str::to_owned).collect::<Vec<_>>();
+                let parsed = parse_tasks_command(&args);
+                match parsed.and_then(|command| match command { Command::Tasks(task) | Command::Agents(task) => tasks_command(task), _ => unreachable!() }) {
+                    Ok(()) => {}, Err(error) => { let _ = events.send(agent_protocol::Event::Error(redact_output(&error))); }
+                }
+                return agent_tui::SubmitAction::Continue;
             }
             if command == "/checkpoint" || command == "/rollback" || command == "/rewind" {
                 return agent_tui::SubmitAction::OpenOverlay(agent_tui::OverlayKind::Checkpoints);
@@ -3255,6 +3334,28 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
     let config = load_user_config(config_path).ok();
     let policy = load_runtime_policy(config_path).ok();
     let (branch, dirty_files) = git_state_snapshot(&paths.workspace);
+    let mut tasks = Vec::new();
+    if let Ok(entries) = fs::read_dir(&paths.jobs_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(id) = name.strip_suffix(".task.json") {
+                if let Ok(mut task) = read_task(&paths.workspace, id) {
+                    if task.workspace != paths.workspace.display().to_string() {
+                        continue;
+                    }
+                    if let Ok(job) = read_job(&paths.workspace, &task.job_id) {
+                        task.state = task_state_from_job(&job).into();
+                    }
+                    tasks.push(agent_tui::TaskOption {
+                        id: task.id,
+                        state: task.state,
+                        objective: task.objective,
+                        result: task.result,
+                    });
+                }
+            }
+        }
+    }
     let mut palette = [
         ("help", "show categorized local help"),
         ("commands", "open the local command palette"),
@@ -3645,6 +3746,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         plugins,
         skills,
         hooks,
+        tasks,
         usage_summary,
         cost_summary: Some("cost unavailable (no explicit pricing configured)".into()),
         context_summary,
@@ -5242,6 +5344,22 @@ struct JobMeta {
     stderr: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TaskMeta {
+    id: String,
+    job_id: String,
+    workspace: String,
+    objective: String,
+    state: String,
+    provider: String,
+    permission: String,
+    max_iterations: u32,
+    max_tokens: u64,
+    max_tool_calls: u32,
+    wall_clock_seconds: u64,
+    result: Option<String>,
+}
+
 fn jobs_dir(workspace: &Path) -> PathBuf {
     AppPaths::discover(workspace)
         .map(|paths| paths.jobs_dir)
@@ -5249,6 +5367,24 @@ fn jobs_dir(workspace: &Path) -> PathBuf {
 }
 fn job_path(workspace: &Path, id: &str) -> PathBuf {
     jobs_dir(workspace).join(format!("{id}.json"))
+}
+fn task_path(workspace: &Path, id: &str) -> PathBuf {
+    jobs_dir(workspace).join(format!("{id}.task.json"))
+}
+fn read_task(workspace: &Path, id: &str) -> Result<TaskMeta, String> {
+    if !safe_job_id(id) {
+        return Err("invalid task id".into());
+    }
+    serde_json::from_slice(
+        &fs::read(task_path(workspace, id)).map_err(|_| "task not found".to_owned())?,
+    )
+    .map_err(|error| format!("invalid task metadata: {error}"))
+}
+fn write_task(workspace: &Path, task: &TaskMeta) -> Result<(), String> {
+    atomic_write(
+        &task_path(workspace, &task.id),
+        &serde_json::to_vec_pretty(task).map_err(|e| e.to_string())?,
+    )
 }
 fn safe_job_id(id: &str) -> bool {
     !id.is_empty()
@@ -5423,6 +5559,176 @@ fn jobs_command(command: JobCommand) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+fn start_background_task(workspace: &Path, objective: String) -> Result<TaskMeta, String> {
+    let workspace = workspace.canonicalize().map_err(|e| e.to_string())?;
+    let directory = jobs_dir(&workspace);
+    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+    let active = fs::read_dir(&directory)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+        .count();
+    if active >= 32 {
+        return Err("background task limit reached (32)".into());
+    }
+    let id = job_id();
+    let executable = env::current_exe().map_err(|e| e.to_string())?;
+    let job = JobMeta {
+        id: id.clone(),
+        workspace: workspace.display().to_string(),
+        executable: "subagents".into(),
+        argv_hash: argv_digest(&["subagents".into(), objective.clone()]),
+        pid: None,
+        pgid: None,
+        start_ticks: None,
+        status: "starting".into(),
+        exit_code: None,
+        stdout: format!("{id}.stdout"),
+        stderr: format!("{id}.stderr"),
+    };
+    write_job(&workspace, &job)?;
+    let task = TaskMeta {
+        id: id.clone(),
+        job_id: id.clone(),
+        workspace: workspace.display().to_string(),
+        objective: redact_output(&objective).chars().take(4096).collect(),
+        state: "pending".into(),
+        provider: "fake".into(),
+        permission: "read-only".into(),
+        max_iterations: 8,
+        max_tokens: 16_000,
+        max_tool_calls: 32,
+        wall_clock_seconds: 120,
+        result: None,
+    };
+    write_task(&workspace, &task)?;
+    let mut supervisor = OsCommand::new(executable);
+    supervisor.args([
+        "__job-supervisor",
+        "--workspace",
+        &workspace.display().to_string(),
+        "--job-id",
+        &id,
+        "--",
+    ]);
+    let child_executable = env::current_exe().map_err(|e| e.to_string())?;
+    supervisor.args([
+        &child_executable.display().to_string(),
+        "subagents",
+        "run",
+        "--objective",
+        &objective,
+        "--provider",
+        "fake",
+    ]);
+    supervisor
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = supervisor.spawn() {
+        let _ = fs::remove_file(task_path(&workspace, &id));
+        let _ = fs::remove_file(job_path(&workspace, &id));
+        return Err(error.to_string());
+    }
+    Ok(task)
+}
+
+fn task_state_from_job(job: &JobMeta) -> &'static str {
+    match job.status.as_str() {
+        "completed" => "completed",
+        "failed" => "failed",
+        "cancelled" | "cancelling" => "cancelled",
+        _ => "running",
+    }
+}
+
+fn ensure_task_workspace(task: &TaskMeta, workspace: &Path) -> Result<(), String> {
+    if task.workspace == workspace.display().to_string() {
+        Ok(())
+    } else {
+        Err("task belongs to another workspace".into())
+    }
+}
+
+fn tasks_command(command: TaskCommand) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    fs::create_dir_all(jobs_dir(&workspace)).map_err(|e| e.to_string())?;
+    match command {
+        TaskCommand::Background(objective) => {
+            let task = start_background_task(&workspace, objective)?;
+            println!("{}", task.id);
+        }
+        TaskCommand::List => {
+            let mut tasks = Vec::new();
+            for entry in fs::read_dir(jobs_dir(&workspace))
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+            {
+                if entry.path().extension().is_some_and(|ext| ext == "json")
+                    && entry
+                        .path()
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().ends_with(".task.json"))
+                {
+                    if let Some(id) = entry
+                        .path()
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| n.strip_suffix(".task.json"))
+                    {
+                        tasks.push(id.to_owned());
+                    }
+                }
+            }
+            tasks.sort();
+            for id in tasks {
+                let mut task = read_task(&workspace, &id)?;
+                if task.workspace != workspace.display().to_string() {
+                    continue;
+                }
+                if let Ok(job) = read_job(&workspace, &task.job_id) {
+                    task.state = task_state_from_job(&job).into();
+                }
+                println!("{}\t{}\t{}", task.id, task.state, task.objective);
+            }
+        }
+        TaskCommand::Show(id) | TaskCommand::Status(id) => {
+            let mut task = read_task(&workspace, &id)?;
+            ensure_task_workspace(&task, &workspace)?;
+            if let Ok(job) = read_job(&workspace, &task.job_id) {
+                task.state = task_state_from_job(&job).into();
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&task).map_err(|e| e.to_string())?
+            );
+        }
+        TaskCommand::Cancel(id) => {
+            let mut task = read_task(&workspace, &id)?;
+            ensure_task_workspace(&task, &workspace)?;
+            cancel_job(&workspace, &task.job_id)?;
+            task.state = "cancelling".into();
+            write_task(&workspace, &task)?;
+            println!("{id}");
+        }
+        TaskCommand::Adopt(id) => {
+            let mut task = read_task(&workspace, &id)?;
+            ensure_task_workspace(&task, &workspace)?;
+            let job = read_job(&workspace, &task.job_id)?;
+            if !matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
+                return Err("task is still running".into());
+            }
+            let output_path = jobs_dir(&workspace).join(&job.stdout);
+            let output = fs::read_to_string(output_path).unwrap_or_default();
+            task.state = task_state_from_job(&job).into();
+            task.result = Some(redact_output(&output).chars().take(16 * 1024).collect());
+            write_task(&workspace, &task)?;
+            println!("{}", task.result.as_deref().unwrap_or_default());
+        }
+    }
+    Ok(())
 }
 
 fn proc_start_ticks(pid: u32) -> Option<u64> {
@@ -6746,6 +7052,11 @@ fn print_command_help(path: &[String]) {
         "subagents run" => ("helios subagents run --objective TEXT [--provider fake|openai|anthropic|gemini|generic] [--scope PATH] [--session ID|latest] [--context-file PATH] [--memory-query TEXT] [--worktree --ref REF]".into(), "Selected context is bounded; worktree results are never auto-applied to the parent tree."),
         "jobs" => ("helios jobs start|list|status|logs|cancel|wait|reap".into(), "Jobs use explicit argv, bounded logs, process-group cleanup, and workspace ownership checks."),
         "jobs start" => ("helios jobs start -- COMMAND ARGS...".into(), "Shell interpolation is not used; secret-like arguments are rejected."),
+        "tasks" | "agents" => ("helios tasks bg|list|show|status|cancel|adopt [ID]".into(), "Background tasks are bounded, workspace-scoped, fake/offline by default, and never auto-applied."),
+        "tasks bg" | "agents bg" => ("helios tasks bg PROMPT".into(), "Starts a durable isolated task and returns immediately."),
+        "tasks show" | "tasks status" | "agents show" | "agents status" => ("helios tasks show|status ID".into(), "Shows bounded task state and budget metadata."),
+        "tasks cancel" | "agents cancel" => ("helios tasks cancel ID".into(), "Cancels only the exact owned process group."),
+        "tasks adopt" | "agents adopt" => ("helios tasks adopt ID".into(), "Explicitly reads a bounded completed result; it does not mutate the foreground session."),
         "tui" => ("helios tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
         "perf run" => ("helios perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
         "status" => ("helios status [--json]".into(), "Shows bounded aggregate state without secret values."),
@@ -9718,5 +10029,28 @@ mod tests {
         );
         assert!(resolve_workspace_file(Path::new("../escape.json"), &root).is_err());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn background_task_commands_parse_and_are_explicit() {
+        assert_eq!(
+            parse_args(vec!["tasks".into(), "list".into()]).expect("tasks"),
+            Command::Tasks(TaskCommand::List)
+        );
+        assert_eq!(
+            parse_args(vec![
+                "tasks".into(),
+                "bg".into(),
+                "inspect".into(),
+                "tree".into()
+            ])
+            .expect("bg"),
+            Command::Tasks(TaskCommand::Background("inspect tree".into()))
+        );
+        assert_eq!(
+            parse_args(vec!["agents".into(), "status".into(), "task-1".into()]).expect("agents"),
+            Command::Agents(TaskCommand::Status("task-1".into()))
+        );
+        assert!(parse_args(vec!["tasks".into(), "bg".into()]).is_err());
     }
 }
