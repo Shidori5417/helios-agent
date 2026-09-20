@@ -199,6 +199,13 @@ pub enum PermissionDecision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitAction {
+    Continue,
+    Exit,
+    ReplaceComposer(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionPrompt {
     pub id: u64,
     pub action: String,
@@ -1379,7 +1386,7 @@ pub fn run_interactive<F>(
     submit: F,
 ) -> io::Result<()>
 where
-    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> SubmitAction,
 {
     run_interactive_with_context(
         receiver,
@@ -1400,7 +1407,7 @@ pub fn run_interactive_with_context<F>(
     submit: F,
 ) -> io::Result<()>
 where
-    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> SubmitAction,
 {
     run_interactive_with_context_and_approval(
         receiver,
@@ -1423,7 +1430,7 @@ pub fn run_interactive_with_context_and_approval<F, D>(
     mut decide: D,
 ) -> io::Result<()>
 where
-    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> SubmitAction,
     D: FnMut(u64, PermissionDecision),
 {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -1512,8 +1519,15 @@ where
                                     agent_terminal::CancellationToken::default();
                                 active_cancellation = Some(turn_cancellation.clone());
                                 model.active_turn = true;
-                                if submit(command, sender.clone(), turn_cancellation) {
-                                    cancellation.cancel();
+                                match submit(command, sender.clone(), turn_cancellation) {
+                                    SubmitAction::Exit => cancellation.cancel(),
+                                    SubmitAction::ReplaceComposer(text) => {
+                                        model.history.pop();
+                                        model.composer.text = text;
+                                        model.composer.cursor = model.composer.text.len();
+                                        model.active_turn = false;
+                                    }
+                                    SubmitAction::Continue => {}
                                 }
                             }
                             OverlayAction::Fill(text) => {
@@ -1604,8 +1618,15 @@ where
                             model.active_turn = true;
                             let turn_cancellation = agent_terminal::CancellationToken::default();
                             active_cancellation = Some(turn_cancellation.clone());
-                            if submit(prompt, sender.clone(), turn_cancellation) {
-                                cancellation.cancel();
+                            match submit(prompt, sender.clone(), turn_cancellation) {
+                                SubmitAction::Exit => cancellation.cancel(),
+                                SubmitAction::ReplaceComposer(text) => {
+                                    model.history.pop();
+                                    model.composer.text = text;
+                                    model.composer.cursor = model.composer.text.len();
+                                    model.active_turn = false;
+                                }
+                                SubmitAction::Continue => {}
                             }
                         }
                         ComposerAction::Cancel => {

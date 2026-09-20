@@ -2136,7 +2136,7 @@ fn interactive_command() -> Result<(), String> {
             let command = prompt.trim().to_ascii_lowercase();
             let mut prompt_for_run = prompt.clone();
             if command == "/exit" || command == "/quit" {
-                return true;
+                return agent_tui::SubmitAction::Exit;
             }
             if command.starts_with('!') {
                 let input = prompt.trim().to_owned();
@@ -2198,7 +2198,7 @@ fn interactive_command() -> Result<(), String> {
                         }
                     }
                 });
-                return false;
+                            return agent_tui::SubmitAction::Continue;
             }
             let local_output = if command == "/new" || command.starts_with("/new ") {
                 let title = prompt.trim().strip_prefix("/new").unwrap_or("").trim();
@@ -2622,7 +2622,10 @@ fn interactive_command() -> Result<(), String> {
                         .or_else(|| Some("no active session to export".into())),
                 }
             } else if matches!(command.as_str(), "/editor" | "/compose" | "/prompt") {
-                Some(edit_external_prompt("", &workspace_path).unwrap_or_else(|error| error))
+                match edit_external_prompt("", &workspace_path) {
+                    Ok(text) => return agent_tui::SubmitAction::ReplaceComposer(text),
+                    Err(error) => Some(error),
+                }
             } else if let Some(copy_target) = command.strip_prefix("/copy ") {
                 Some(copy_last_text(copy_target, &workspace_path))
             } else if let Some(custom_output) = custom_exec_command(
@@ -2675,7 +2678,7 @@ fn interactive_command() -> Result<(), String> {
             };
             if let Some(output) = local_output {
                 if command == "/retry" && prompt_for_run.is_empty() {
-                    return false;
+                    return agent_tui::SubmitAction::Continue;
                 }
                 if command == "/retry" {
                     // Continue into the normal runtime with the restored user prompt.
@@ -2683,7 +2686,7 @@ fn interactive_command() -> Result<(), String> {
                     let _ = events.send(agent_protocol::Event::TurnStarted);
                     let _ = events.send(agent_protocol::Event::ModelDelta(output));
                     let _ = events.send(agent_protocol::Event::TurnCompleted);
-                    return false;
+                    return agent_tui::SubmitAction::Continue;
                 }
             }
             let resume = if let Some(id) = active_session.lock().ok().and_then(|value| *value) {
@@ -2722,7 +2725,7 @@ fn interactive_command() -> Result<(), String> {
                 Ok((options, _policy, _workspace)) => options,
                 Err(error) => {
                     let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
-                    return false;
+                    return agent_tui::SubmitAction::Continue;
                 }
             };
             let worker_db_path = db_path.clone();
@@ -2742,7 +2745,7 @@ fn interactive_command() -> Result<(), String> {
                     }
                 }
             });
-            false
+            agent_tui::SubmitAction::Continue
         },
         move |id, decision| {
             let mapped = match decision {
