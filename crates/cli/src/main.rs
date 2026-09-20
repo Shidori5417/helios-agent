@@ -76,6 +76,10 @@ async fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
+        Ok(Command::Interactive) => match interactive_command() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Ok(Command::ContextHelp(path)) => {
             print_command_help(&path);
             ExitCode::SUCCESS
@@ -520,6 +524,7 @@ impl HookRunner for RuntimeHooks {
 enum Command {
     Version,
     Help,
+    Interactive,
     ContextHelp(Vec<String>),
     Run(RunOptions),
     Sessions {
@@ -562,6 +567,409 @@ enum Command {
     Doctor,
     Completion(CompletionCommand),
     Runtime(RuntimeCommand),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandDefinition {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    description: &'static str,
+    category: &'static str,
+    arguments: &'static str,
+    destructive: bool,
+    requires_agent: bool,
+    local: bool,
+    handler_id: &'static str,
+    source: &'static str,
+}
+
+fn command_registry() -> Vec<CommandDefinition> {
+    vec![
+        CommandDefinition {
+            name: "init",
+            aliases: &[],
+            description: "initialize a workspace",
+            category: "workspace",
+            arguments: "[--force]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "init",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "config",
+            aliases: &[],
+            description: "inspect or mutate typed configuration",
+            category: "control",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "config",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "auth",
+            aliases: &[],
+            description: "manage provider credentials",
+            category: "control",
+            arguments: "ACTION PROVIDER",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "auth",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "doctor",
+            aliases: &[],
+            description: "inspect local runtime health",
+            category: "diagnostics",
+            arguments: "",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "doctor",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "completion",
+            aliases: &[],
+            description: "generate or install shell completion",
+            category: "control",
+            arguments: "ACTION SHELL",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "completion",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "providers",
+            aliases: &[],
+            description: "configure model providers",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "providers",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "permissions",
+            aliases: &[],
+            description: "configure execution permissions",
+            category: "security",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "permissions",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "mcp",
+            aliases: &[],
+            description: "configure MCP servers",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "mcp",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "lsp",
+            aliases: &[],
+            description: "configure language servers",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "lsp",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "hooks",
+            aliases: &[],
+            description: "inspect and test hooks",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "hooks",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "skills",
+            aliases: &[],
+            description: "discover and validate skills",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "skills",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "subagents",
+            aliases: &[],
+            description: "run isolated subagents",
+            category: "agent",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: true,
+            local: false,
+            handler_id: "subagents",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "tui",
+            aliases: &[],
+            description: "configure the terminal UI",
+            category: "control",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "tui",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "status",
+            aliases: &[],
+            description: "show consolidated runtime status",
+            category: "diagnostics",
+            arguments: "[--json]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "status",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "run",
+            aliases: &["r"],
+            description: "run one agent turn",
+            category: "agent",
+            arguments: "PROMPT",
+            destructive: true,
+            requires_agent: true,
+            local: false,
+            handler_id: "run",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "exec",
+            aliases: &["x"],
+            description: "run one headless agent turn",
+            category: "agent",
+            arguments: "PROMPT",
+            destructive: true,
+            requires_agent: true,
+            local: false,
+            handler_id: "exec",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "sessions",
+            aliases: &[],
+            description: "inspect persisted sessions",
+            category: "storage",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "sessions",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "database",
+            aliases: &[],
+            description: "backup or restore the database",
+            category: "storage",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "database",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "audit",
+            aliases: &[],
+            description: "inspect bounded audit events",
+            category: "storage",
+            arguments: "ACTION",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "audit",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "jobs",
+            aliases: &[],
+            description: "manage background jobs",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "jobs",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "eval",
+            aliases: &[],
+            description: "run offline evaluations",
+            category: "diagnostics",
+            arguments: "ACTION",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "eval",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "perf",
+            aliases: &[],
+            description: "measure offline performance",
+            category: "diagnostics",
+            arguments: "ACTION",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "perf",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "self",
+            aliases: &[],
+            description: "manage the installed binary",
+            category: "control",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "self",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "trust",
+            aliases: &[],
+            description: "manage public trust keys",
+            category: "security",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "trust",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "registry",
+            aliases: &[],
+            description: "inspect signed registries",
+            category: "security",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "registry",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "plugins",
+            aliases: &[],
+            description: "manage signed plugins",
+            category: "runtime",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "plugins",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "search",
+            aliases: &[],
+            description: "search persisted sessions",
+            category: "storage",
+            arguments: "--query TEXT",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "search",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "context",
+            aliases: &[],
+            description: "inspect selected context",
+            category: "diagnostics",
+            arguments: "[--session ID]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "context",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "usage",
+            aliases: &[],
+            description: "inspect normalized usage",
+            category: "diagnostics",
+            arguments: "[--session ID]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "usage",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "memory",
+            aliases: &[],
+            description: "manage bounded project memory",
+            category: "storage",
+            arguments: "ACTION",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "memory",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "verify",
+            aliases: &[],
+            description: "run explicit verification argv",
+            category: "agent",
+            arguments: "-- COMMAND ARGS...",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "verify",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "diff",
+            aliases: &[],
+            description: "show a bounded read-only git diff",
+            category: "diagnostics",
+            arguments: "",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "diff",
+            source: "builtin",
+        },
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -853,7 +1261,7 @@ enum PluginCommand {
         id: String,
     },
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 struct RunOptions {
     provider: String,
     model: String,
@@ -868,31 +1276,60 @@ struct RunOptions {
     base_url_explicit: bool,
     output_format: OutputFormat,
     exec: bool,
+    event_sender: Option<SyncSender<agent_protocol::Event>>,
 }
+
+impl PartialEq for RunOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.model == other.model
+            && self.base_url == other.base_url
+            && self.prompt == other.prompt
+            && self.db_path == other.db_path
+            && self.resume == other.resume
+            && self.tui == other.tui
+            && self.config == other.config
+            && self.provider_explicit == other.provider_explicit
+            && self.model_explicit == other.model_explicit
+            && self.base_url_explicit == other.base_url_explicit
+            && self.output_format == other.output_format
+            && self.exec == other.exec
+    }
+}
+
+impl Eq for RunOptions {}
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     let args = extract_workspace_flag(args)?;
     if args.len() == 1 && args[0] == "--version" {
         return Ok(Command::Version);
     }
-    if args.is_empty() || args[0] == "run" || args[0] == "exec" {
+    if args.is_empty() {
+        return Ok(Command::Interactive);
+    }
+    if matches!(args[0].as_str(), "run" | "exec" | "r" | "x") {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(if args.is_empty() {
                 Command::Help
             } else {
-                Command::ContextHelp(vec![args[0].clone()])
+                Command::ContextHelp(vec![match args[0].as_str() {
+                    "r" => "run",
+                    "x" => "exec",
+                    other => other,
+                }
+                .into()])
             });
         }
         return parse_run(
             if args
                 .first()
-                .is_some_and(|arg| arg == "run" || arg == "exec")
+                .is_some_and(|arg| matches!(arg.as_str(), "run" | "exec" | "r" | "x"))
             {
                 &args[1..]
             } else {
                 &args
             },
-            args.first().is_some_and(|arg| arg == "exec"),
+            args.first().is_some_and(|arg| arg == "exec" || arg == "x"),
         );
     }
     if args
@@ -1505,6 +1942,7 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
         base_url_explicit: false,
         output_format: OutputFormat::Text,
         exec,
+        event_sender: None,
     };
     let mut prompt = Vec::new();
     let mut index = 0;
@@ -1585,7 +2023,120 @@ fn default_db_path() -> Result<PathBuf, String> {
     Ok(app_paths()?.db_path)
 }
 
-fn run_command(mut options: RunOptions) -> Result<(), String> {
+fn interactive_command() -> Result<(), String> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Err(
+            "interactive mode requires a TTY; use `helios exec` for headless operation".into(),
+        );
+    }
+    let paths = app_paths()?;
+    let settings = if paths.effective_project_config().is_file() {
+        load_tui_settings(paths.effective_project_config())?
+    } else {
+        agent_tui::TuiSettings::default()
+    };
+    let (sender, receiver) = agent_tui::bounded_event_channel(settings.channel_capacity);
+    let ui_cancellation = CancellationToken::default();
+    let first_turn = Arc::new(AtomicBool::new(true));
+    let db_path = paths.db_path;
+    agent_tui::run_interactive(
+        receiver,
+        sender.clone(),
+        ui_cancellation,
+        settings,
+        move |prompt, events, turn_cancellation| {
+            let command = prompt.trim().to_ascii_lowercase();
+            if command == "/exit" || command == "/quit" {
+                return true;
+            }
+            if let Some(output) = slash_command_output(&command) {
+                let _ = events.send(agent_protocol::Event::TurnStarted);
+                let _ = events.send(agent_protocol::Event::ModelDelta(output));
+                let _ = events.send(agent_protocol::Event::TurnCompleted);
+                return false;
+            }
+            let resume = if first_turn.swap(false, Ordering::AcqRel) {
+                None
+            } else {
+                Some("latest".into())
+            };
+            let options = RunOptions {
+                provider: "fake".into(),
+                model: "gpt-5".into(),
+                base_url: None,
+                prompt,
+                db_path: db_path.clone(),
+                resume,
+                tui: false,
+                config: None,
+                provider_explicit: false,
+                model_explicit: false,
+                base_url_explicit: false,
+                output_format: OutputFormat::Text,
+                exec: false,
+                event_sender: Some(events.clone()),
+            };
+            std::thread::spawn(move || {
+                if let Err(error) = run_command_with_cancellation(options, turn_cancellation) {
+                    let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
+                }
+            });
+            false
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn slash_command_output(command: &str) -> Option<String> {
+    match command {
+        "/help" | "/commands" => Some(
+            command_registry()
+                .iter()
+                .map(|definition| format!("/{} — {}", definition.name, definition.description))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        "/version" => Some(format!("helios {}", env!("CARGO_PKG_VERSION"))),
+        "/status" => app_paths().ok().map(|paths| {
+            format!(
+                "workspace={}\nconfig={}\ndb_present={}",
+                paths.workspace.display(),
+                paths.effective_project_config().display(),
+                paths.db_path.is_file()
+            )
+        }),
+        "/permissions" => app_paths().ok().and_then(|paths| {
+            load_runtime_policy(paths.effective_project_config())
+                .ok()
+                .map(|policy| format!("permission_mode={:?}", policy.mode))
+        }),
+        "/sessions" => app_paths().ok().and_then(|paths| {
+            Database::open(&paths.db_path)
+                .ok()
+                .and_then(|db| {
+                    db.list_sessions(&paths.workspace.display().to_string())
+                        .ok()
+                })
+                .map(|sessions| format!("sessions={}", sessions.len()))
+        }),
+        "/context" => Some("context plan is shown for the active turn in the event stream".into()),
+        "/diff" => {
+            let workspace = workspace_root().ok()?;
+            let registry = ToolRegistry::new(workspace, PermissionMode::ReadOnly).ok()?;
+            registry.git_diff().ok().map(|result| result.data)
+        }
+        _ => None,
+    }
+}
+
+fn run_command(options: RunOptions) -> Result<(), String> {
+    run_command_with_cancellation(options, CancellationToken::default())
+}
+
+fn run_command_with_cancellation(
+    mut options: RunOptions,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
     if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Err("--tui requires an interactive TTY".into());
     }
@@ -1681,7 +2232,6 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
     for server in &mut lsp_servers {
         runtime_policy.filter_env(&mut server.env_allowlist);
     }
-    let cancellation = CancellationToken::default();
     if options.exec {
         let signal_cancellation = cancellation.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -1752,13 +2302,13 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         messages,
         startup_memory,
         hooks,
-        None,
+        options.event_sender.clone(),
         options.exec && options.output_format == OutputFormat::Text,
         cancellation,
     )?;
     if options.exec {
         emit_headless_output(&options, session_id, &outcome);
-    } else {
+    } else if options.event_sender.is_none() {
         for event in outcome.events {
             if !matches!(event, agent_protocol::Event::ModelDelta(_)) {
                 println!("{event:?}");
@@ -3772,41 +4322,12 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("helios [run|exec] [OPTIONS] [PROMPT]\n\nCommands:");
-    for line in [
-        "  init",
-        "  config (list|get|set|unset|sources|path|validate)",
-        "  auth",
-        "  doctor",
-        "  completion",
-        "  providers",
-        "  permissions",
-        "  mcp",
-        "  lsp",
-        "  hooks",
-        "  skills",
-        "  subagents",
-        "  tui",
-        "  status",
-        "  run",
-        "  sessions",
-        "  database",
-        "  audit",
-        "  jobs",
-        "  eval",
-        "  perf",
-        "  self",
-        "  trust",
-        "  registry",
-        "  plugins",
-        "  search",
-        "  context",
-        "  usage",
-        "  memory",
-        "  verify",
-        "  diff",
-    ] {
-        println!("{line}");
+    println!("helios [run|exec] [OPTIONS] [PROMPT]\n\nNo command opens the interactive TTY session; use exec for headless automation.\n\nCommands:");
+    for definition in command_registry() {
+        println!(
+            "  {:<12} {:<12} {}",
+            definition.name, definition.arguments, definition.description
+        );
     }
     println!("\nGlobal options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)\nUse `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
 }
@@ -4338,8 +4859,21 @@ fn completion_command(command: CompletionCommand) -> Result<(), String> {
     Ok(())
 }
 fn completion_source(shell: &str) -> Result<String, String> {
-    let path = workspace_root()?.join(format!("completions/agent-cli.{shell}"));
-    fs::read_to_string(path).map_err(|e| e.to_string())
+    let source = match shell {
+        "bash" => include_str!("../../../completions/agent-cli.bash"),
+        "zsh" => include_str!("../../../completions/agent-cli.zsh"),
+        "fish" => include_str!("../../../completions/agent-cli.fish"),
+        other => return Err(format!("unsupported completion shell: {other}")),
+    };
+    for definition in command_registry() {
+        if !source.contains(definition.name) {
+            return Err(format!(
+                "completion source is missing command {}",
+                definition.name
+            ));
+        }
+    }
+    Ok(source.into())
 }
 
 fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
@@ -5578,6 +6112,10 @@ mod tests {
     #[test]
     fn help_and_verify_parse() {
         assert_eq!(
+            parse_args(Vec::new()).expect("interactive"),
+            Command::Interactive
+        );
+        assert_eq!(
             parse_args(vec!["--help".into()]).expect("help"),
             Command::Help
         );
@@ -5635,6 +6173,23 @@ mod tests {
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["kind"], "error");
         assert_eq!(value["payload"]["error"], "[REDACTED]");
+    }
+
+    #[test]
+    fn command_registry_has_unique_names_and_aliases() {
+        let registry = command_registry();
+        let mut names = std::collections::BTreeSet::new();
+        let mut aliases = std::collections::BTreeSet::new();
+        for command in &registry {
+            assert!(!aliases.contains(command.name));
+            assert!(names.insert(command.name));
+            for alias in command.aliases {
+                assert!(aliases.insert(*alias));
+                assert!(!names.contains(alias));
+            }
+        }
+        assert!(registry.iter().any(|command| command.name == "exec"));
+        assert!(registry.iter().any(|command| command.name == "status"));
     }
     #[test]
     fn run_parses_resume_and_db() {

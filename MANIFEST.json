@@ -9,7 +9,7 @@
   },
   {
     "path": "README.md",
-    "bytes": 14680
+    "bytes": 15026
   },
   {
     "path": ".gitignore",
@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 227437
+    "bytes": 246175
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -253,7 +253,7 @@
   },
   {
     "path": "crates/tui/src/lib.rs",
-    "bytes": 11481
+    "bytes": 23801
   },
   {
     "path": "Cargo.lock",
