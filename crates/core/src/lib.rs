@@ -3,6 +3,51 @@ use agent_context::{
 };
 use agent_protocol::{Event, Message, ModelRequest, Role};
 use agent_providers::{ModelProvider, ProviderError, StreamEvent, StreamSink};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+
+#[derive(Clone, Debug)]
+pub struct SteeringChannel {
+    inner: Arc<Mutex<VecDeque<String>>>,
+    max_items: usize,
+    max_bytes: usize,
+}
+
+impl SteeringChannel {
+    pub fn bounded(max_items: usize, max_bytes: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+            max_items: max_items.max(1),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    pub fn push(&self, instruction: impl Into<String>) -> bool {
+        let instruction = instruction.into();
+        if instruction.trim().is_empty() || instruction.len() > self.max_bytes {
+            return false;
+        }
+        let Ok(mut queue) = self.inner.lock() else {
+            return false;
+        };
+        let bytes: usize = queue.iter().map(String::len).sum();
+        if queue.len() >= self.max_items || bytes.saturating_add(instruction.len()) > self.max_bytes
+        {
+            return false;
+        }
+        queue.push_back(instruction);
+        true
+    }
+
+    pub fn drain(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -169,6 +214,7 @@ pub struct AgentLoop<P> {
     memory_limit: usize,
     compactor: Option<Box<dyn Compactor>>,
     hooks: Option<Box<dyn HookRunner>>,
+    steering: Option<SteeringChannel>,
 }
 
 impl<P> AgentLoop<P>
@@ -185,6 +231,7 @@ where
             memory_limit: 8,
             compactor: None,
             hooks: None,
+            steering: None,
         }
     }
 
@@ -216,6 +263,23 @@ where
     pub fn with_hooks(mut self, hooks: Box<dyn HookRunner>) -> Self {
         self.hooks = Some(hooks);
         self
+    }
+
+    pub fn with_steering(mut self, steering: SteeringChannel) -> Self {
+        self.steering = Some(steering);
+        self
+    }
+
+    fn consume_steering(&mut self) {
+        let Some(steering) = self.steering.as_ref() else {
+            return;
+        };
+        for instruction in steering.drain() {
+            self.session.messages.push(Message {
+                role: Role::System,
+                content: format!("[steering source=user] {instruction}"),
+            });
+        }
     }
 
     fn run_hook(
@@ -288,6 +352,7 @@ where
         self.session.events.push(start);
         self.run_hook(LifecycleEvent::SessionStart, sink)?;
         self.run_hook(LifecycleEvent::BeforePrompt, sink)?;
+        self.consume_steering();
         let request = ModelRequest {
             messages: self.session.messages.clone(),
             tools: vec![],
@@ -345,6 +410,7 @@ where
             Vec::new()
         };
         for iteration in 0..limit {
+            self.consume_steering();
             let definitions = executor.definitions();
             let mut segments = self
                 .session
@@ -946,6 +1012,36 @@ mod tests {
             .run_coding_loop("patch", &mut executor, 1, &mut sink)
             .is_err());
         assert_eq!(executor.calls, 0);
+    }
+
+    #[test]
+    fn steering_is_consumed_only_at_next_request_boundary() {
+        let steering = SteeringChannel::bounded(4, 256);
+        let provider = ScriptedProvider {
+            responses: vec![
+                tool_response("read_file"),
+                ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: "done".into(),
+                    },
+                    tool_calls: vec![],
+                },
+            ],
+        };
+        let mut agent = AgentLoop::new(provider).with_steering(steering.clone());
+        let mut executor = RecordingExecutor { calls: 0 };
+        let mut sink = VecEventSink::default();
+        steering.push("focus on the failing test");
+        agent
+            .run_coding_loop("inspect", &mut executor, 2, &mut sink)
+            .expect("turn");
+        assert!(agent
+            .session
+            .messages
+            .iter()
+            .any(|message| message.content.contains("focus on the failing test")));
+        assert!(steering.drain().is_empty());
     }
 
     struct OneMemory;

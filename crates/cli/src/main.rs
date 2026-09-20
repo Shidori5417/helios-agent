@@ -3,7 +3,7 @@ use agent_context::{
 };
 use agent_core::{
     AgentLoop, EventSink, HookRunner, LifecycleEvent, MemoryRetriever, RetrievedMemory,
-    ToolExecution, ToolExecutor, ToolFailure,
+    SteeringChannel, ToolExecution, ToolExecutor, ToolFailure,
 };
 use agent_lsp::{load_config as load_lsp_config, LspClient, LspServerConfig, StdioTransport};
 use agent_mcp::{
@@ -1466,6 +1466,7 @@ struct RunOptions {
     exec: bool,
     event_sender: Option<SyncSender<agent_protocol::Event>>,
     approval: Option<ApprovalBroker>,
+    steering: Option<SteeringChannel>,
 }
 
 impl PartialEq for RunOptions {
@@ -1512,6 +1513,7 @@ fn default_run_options(
         exec: false,
         event_sender,
         approval: None,
+        steering: None,
     }
 }
 
@@ -2186,6 +2188,7 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
         exec,
         event_sender: None,
         approval: None,
+        steering: None,
     };
     let mut prompt = Vec::new();
     let mut index = 0;
@@ -2304,7 +2307,7 @@ fn interactive_command() -> Result<(), String> {
     let session_provider = Arc::new(Mutex::new(None::<String>));
     let session_effort = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
-    let steering = Arc::new(Mutex::new(None::<String>));
+    let steering = SteeringChannel::bounded(8, 8 * 1024);
     let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
     let workspace_path = paths.workspace.clone();
@@ -2330,9 +2333,10 @@ fn interactive_command() -> Result<(), String> {
                 let instruction = instruction.trim();
                 if instruction.is_empty() {
                     let _ = events.send(agent_protocol::Event::Error("/steer requires an instruction".into()));
-                } else if let Ok(mut slot) = steering_for_ui.lock() {
-                    *slot = Some(instruction.chars().take(4096).collect());
+                } else if steering_for_ui.push(instruction.chars().take(4096).collect::<String>()) {
                     let _ = events.send(agent_protocol::Event::ModelDelta("steer queued for the next safe iteration boundary".into()));
+                } else {
+                    let _ = events.send(agent_protocol::Event::Error("steer queue is full or instruction is too large".into()));
                 }
                 return agent_tui::SubmitAction::Continue;
             }
@@ -2965,6 +2969,7 @@ fn interactive_command() -> Result<(), String> {
             );
             let mut options = options;
             options.approval = Some(approval.clone());
+            options.steering = Some(steering_for_ui.clone());
             if let Ok(selected) = session_provider.lock() {
                 if let Some(provider) = selected.clone() {
                     options.provider = provider;
@@ -2993,6 +2998,7 @@ fn interactive_command() -> Result<(), String> {
             let worker_workspace = workspace_path.clone();
             let worker_active_session = active_session.clone();
             let worker_approval = approval.clone();
+            let worker_steering = steering_for_ui.clone();
             std::thread::spawn(move || {
                 let run_cancel = turn_cancellation.clone();
                 let result = run_command_with_cancellation(options, run_cancel);
@@ -3007,6 +3013,7 @@ fn interactive_command() -> Result<(), String> {
                 while let Ok(Some(next_prompt)) = db.pop_foreground(record.id) {
                     let mut next = default_run_options(next_prompt, worker_db_path.clone(), Some(record.id.to_string()), Some(events.clone()));
                     next.approval = Some(worker_approval.clone());
+                    next.steering = Some(worker_steering.clone());
                     let Ok((next, _, _)) = resolve_runtime_options(next) else { break; };
                     let next_cancel = CancellationToken::default();
                     if let Err(error) = run_command_with_cancellation(next, next_cancel) {
@@ -4347,6 +4354,7 @@ fn run_selected_provider(
             live_events,
             cancellation.clone(),
             context_budget,
+            options.steering.clone(),
         ),
         "openai" => run_provider(
             OpenAiProvider::with_credentials(
@@ -4370,6 +4378,7 @@ fn run_selected_provider(
             live_events,
             cancellation.clone(),
             context_budget,
+            options.steering.clone(),
         ),
         "anthropic" => run_provider(
             AnthropicProvider::with_credentials(
@@ -4393,6 +4402,7 @@ fn run_selected_provider(
             live_events,
             cancellation.clone(),
             context_budget,
+            options.steering.clone(),
         ),
         "gemini" => run_provider(
             GeminiProvider::with_credentials(
@@ -4418,6 +4428,7 @@ fn run_selected_provider(
             live_events,
             cancellation.clone(),
             context_budget,
+            options.steering.clone(),
         ),
         "generic" | "openai-compatible" => run_provider(
             OpenAiCompatibleProvider::with_credentials(
@@ -4441,6 +4452,7 @@ fn run_selected_provider(
             live_events,
             cancellation,
             context_budget,
+            options.steering.clone(),
         ),
         other => Err(format!("unknown provider: {other}")),
     }
@@ -4461,6 +4473,7 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
     live_events: Option<SyncSender<agent_protocol::Event>>,
     cancellation: CancellationToken,
     context_budget: u64,
+    steering: Option<SteeringChannel>,
 ) -> Result<RunOutcome, String> {
     let previous = messages.len();
     let memory_scope = workspace_root()?.display().to_string();
@@ -4469,6 +4482,9 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
         .with_memory_scope(memory_scope)
         .with_memory_retriever(Box::new(StaticMemory(startup_memory)))
         .with_compactor(Box::new(LocalCompactor));
+    if let Some(steering) = steering {
+        agent = agent.with_steering(steering);
+    }
     if let Some(hooks) = hooks {
         agent = agent.with_hooks(hooks);
     }
@@ -8832,6 +8848,7 @@ mod tests {
             exec: false,
             event_sender: None,
             approval: None,
+            steering: None,
         };
         let (resolved, _policy, workspace) = resolve_runtime_options(options).expect("resolve");
         assert_eq!(workspace, root.canonicalize().expect("canonical workspace"));
