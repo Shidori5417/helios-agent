@@ -76,6 +76,14 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::Eval(command)) => match eval_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Perf(command)) => match perf_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Ok(Command::Context {
             db_path,
             session,
@@ -427,6 +435,8 @@ enum Command {
     Database(DatabaseCommand),
     Audit(AuditCommand),
     Jobs(JobCommand),
+    Eval(EvalCommand),
+    Perf(PerfCommand),
     Search {
         db_path: PathBuf,
         query: String,
@@ -508,6 +518,34 @@ enum JobCommand {
     },
     Reap {
         id: Option<String>,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum EvalCommand {
+    Run {
+        suite: String,
+        report: Option<PathBuf>,
+        baseline: Option<PathBuf>,
+        max_regressions: usize,
+    },
+    Show(PathBuf),
+    Baseline {
+        input: PathBuf,
+        output: PathBuf,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum PerfCommand {
+    Run {
+        runs: usize,
+        output: Option<PathBuf>,
+        baseline: Option<PathBuf>,
+        max_regressions: usize,
+    },
+    Show(PathBuf),
+    Compare {
+        current: PathBuf,
+        baseline: PathBuf,
     },
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -663,6 +701,8 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "database" => parse_database_command(&args[1..]),
         "audit" => parse_audit_command(&args[1..]),
         "jobs" => parse_jobs_command(&args[1..]),
+        "eval" => parse_eval_command(&args[1..]),
+        "perf" => parse_perf_command(&args[1..]),
         "search" => {
             let db_path = path_option(&args[1..], "--db-path")?;
             let query = value_after(&args[1..], "--query")?.ok_or("search requires --query")?;
@@ -899,6 +939,73 @@ fn parse_jobs_command(args: &[String]) -> Result<Command, String> {
         other => return Err(format!("unknown jobs command: {other}")),
     };
     Ok(Command::Jobs(command))
+}
+
+fn parse_eval_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("run");
+    match action {
+        "run" => Ok(Command::Eval(EvalCommand::Run {
+            suite: value_after(&args[1..], "--suite")?.unwrap_or_else(|| "smoke".into()),
+            report: value_after(&args[1..], "--report")?.map(PathBuf::from),
+            baseline: value_after(&args[1..], "--baseline")?.map(PathBuf::from),
+            max_regressions: value_after(&args[1..], "--max-regressions")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        })),
+        "show" => Ok(Command::Eval(EvalCommand::Show(
+            value_after(&args[1..], "--report")?
+                .map(PathBuf::from)
+                .or_else(|| args.get(1).cloned().map(PathBuf::from))
+                .ok_or("eval show requires REPORT")?,
+        ))),
+        "baseline" => {
+            if args.get(1).map(String::as_str) != Some("create") {
+                return Err("eval baseline requires create".into());
+            }
+            Ok(Command::Eval(EvalCommand::Baseline {
+                input: value_after(&args[2..], "--from")?
+                    .map(PathBuf::from)
+                    .ok_or("baseline requires --from REPORT")?,
+                output: value_after(&args[2..], "--output")?
+                    .map(PathBuf::from)
+                    .ok_or("baseline requires --output PATH")?,
+            }))
+        }
+        other => Err(format!("unknown eval command: {other}")),
+    }
+}
+
+fn parse_perf_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("run");
+    match action {
+        "run" => Ok(Command::Perf(PerfCommand::Run {
+            runs: value_after(&args[1..], "--runs")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10),
+            output: value_after(&args[1..], "--output")?.map(PathBuf::from),
+            baseline: value_after(&args[1..], "--baseline")?.map(PathBuf::from),
+            max_regressions: value_after(&args[1..], "--max-regressions")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        })),
+        "show" => Ok(Command::Perf(PerfCommand::Show(
+            value_after(&args[1..], "--report")?
+                .map(PathBuf::from)
+                .or_else(|| args.get(1).cloned().map(PathBuf::from))
+                .ok_or("perf show requires REPORT")?,
+        ))),
+        "compare" => Ok(Command::Perf(PerfCommand::Compare {
+            current: value_after(&args[1..], "--current")?
+                .map(PathBuf::from)
+                .or_else(|| args.get(1).cloned().map(PathBuf::from))
+                .ok_or("perf compare requires current report")?,
+            baseline: value_after(&args[1..], "--baseline")?
+                .map(PathBuf::from)
+                .or_else(|| args.get(2).cloned().map(PathBuf::from))
+                .ok_or("perf compare requires baseline report")?,
+        })),
+        other => Err(format!("unknown perf command: {other}")),
+    }
 }
 
 fn parse_completion_command(args: &[String]) -> Result<Command, String> {
@@ -2157,6 +2264,167 @@ fn run_job_supervisor(args: &[String]) -> Result<(), String> {
     write_job(&workspace, &meta)
 }
 
+fn report_path(workspace: &Path, kind: &str, explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    let path = explicit
+        .unwrap_or_else(|| workspace.join(format!(".agent/reports/{kind}-{}.json", job_id())));
+    if path.exists() {
+        return Err("report output already exists; choose another path".into());
+    }
+    Ok(path)
+}
+
+fn embedded_suite(name: &str) -> Result<agent_evals::BenchmarkSuite, String> {
+    let source = match name {
+        "smoke" => include_str!("../../evals/fixtures/tasks.json").to_owned(),
+        "benchmark-100" => include_str!("../../evals/fixtures/benchmark-100.json").to_owned(),
+        path => fs::read_to_string(path).map_err(|error| error.to_string())?,
+    };
+    serde_json::from_str(&source).map_err(|error| format!("invalid eval suite: {error}"))
+}
+
+fn write_embedded_fixtures(root: &Path) -> Result<(), String> {
+    for (name, files) in [
+        ("inspect", vec![("README.txt", "before\n")]),
+        ("patch", vec![("README.txt", "before\n")]),
+        ("escape", vec![("README.txt", "before\n")]),
+        ("evidence", vec![("README.txt", "evidence seed\n")]),
+        ("multi", vec![("one.txt", "one\n"), ("two.txt", "two\n")]),
+    ] {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        for (file, content) in files {
+            fs::write(dir.join(file), content).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn eval_command(command: EvalCommand) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    match command {
+        EvalCommand::Run {
+            suite,
+            report,
+            baseline,
+            max_regressions,
+        } => {
+            let suite = embedded_suite(&suite)?;
+            let fixture_root =
+                std::env::temp_dir().join(format!("helios-eval-fixtures-{}", std::process::id()));
+            let work_root =
+                std::env::temp_dir().join(format!("helios-eval-work-{}", std::process::id()));
+            write_embedded_fixtures(&fixture_root)?;
+            let result = agent_evals::run_suite(&suite, &fixture_root, &work_root)
+                .map_err(|error| error.to_string());
+            let _ = fs::remove_dir_all(&fixture_root);
+            let _ = fs::remove_dir_all(&work_root);
+            let report_data = result?;
+            let path = report_path(&workspace, "eval", report)?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec_pretty(&report_data).map_err(|error| error.to_string())?,
+            )?;
+            println!(
+                "suite={} passed={} failed={} report={}",
+                report_data.suite,
+                report_data.passed,
+                report_data.failed,
+                path.display()
+            );
+            if let Some(baseline) = baseline {
+                let old: agent_evals::EvalReport =
+                    serde_json::from_slice(&fs::read(baseline).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                agent_evals::check_baseline(&report_data, &old, max_regressions)
+                    .map_err(|error| error.to_string())?;
+            }
+            if report_data.failed > 0 {
+                return Err(format!("eval failed: {} task(s)", report_data.failed));
+            }
+            Ok(())
+        }
+        EvalCommand::Show(path) => {
+            let report: agent_evals::EvalReport =
+                serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        EvalCommand::Baseline { input, output } => {
+            let report: agent_evals::EvalReport =
+                serde_json::from_slice(&fs::read(input).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            let path = report_path(&workspace, "baseline", Some(output))?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+            )?;
+            println!("{}", path.display());
+            Ok(())
+        }
+    }
+}
+
+fn perf_command(command: PerfCommand) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    match command {
+        PerfCommand::Run {
+            runs,
+            output,
+            baseline,
+            max_regressions,
+        } => {
+            let binary = env::current_exe().map_err(|error| error.to_string())?;
+            let report =
+                agent_perf::run_report(&binary, runs).map_err(|error| error.to_string())?;
+            let path = report_path(&workspace, "perf", output)?;
+            atomic_write(
+                &path,
+                &serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
+            )?;
+            if let Some(baseline) = baseline {
+                let old: agent_perf::PerfReport =
+                    serde_json::from_slice(&fs::read(baseline).map_err(|error| error.to_string())?)
+                        .map_err(|error| error.to_string())?;
+                agent_perf::compare(&report, &old, max_regressions)
+                    .map_err(|error| error.to_string())?;
+            }
+            println!(
+                "runs={} p50_ms={} p95_ms={} report={}",
+                report.runs,
+                report.p50_ms,
+                report.p95_ms,
+                path.display()
+            );
+            Ok(())
+        }
+        PerfCommand::Show(path) => {
+            let report: agent_perf::PerfReport =
+                serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        PerfCommand::Compare { current, baseline } => {
+            let current: agent_perf::PerfReport =
+                serde_json::from_slice(&fs::read(current).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            let baseline: agent_perf::PerfReport =
+                serde_json::from_slice(&fs::read(baseline).map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())?;
+            agent_perf::compare(&current, &baseline, 0).map_err(|error| error.to_string())?;
+            println!("performance baseline passed");
+            Ok(())
+        }
+    }
+}
+
 fn resolve_observability_session(
     database: &Database,
     workspace: &str,
@@ -2530,7 +2798,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap");
+    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
@@ -3486,6 +3754,18 @@ mod tests {
         assert!(matches!(
             parse_args(vec!["audit".into(), "list".into(), "--event".into(), "tool_completed".into()]).expect("audit"),
             Command::Audit(AuditCommand::List { event: Some(event), .. }) if event == "tool_completed"
+        ));
+    }
+
+    #[test]
+    fn eval_and_perf_commands_parse_reports_and_thresholds() {
+        assert!(matches!(
+            parse_args(vec!["eval".into(), "run".into(), "--suite".into(), "smoke".into(), "--max-regressions".into(), "2".into()]).expect("eval"),
+            Command::Eval(EvalCommand::Run { suite, max_regressions: 2, .. }) if suite == "smoke"
+        ));
+        assert!(matches!(
+            parse_args(vec!["perf".into(), "compare".into(), "--current".into(), "a.json".into(), "--baseline".into(), "b.json".into()]).expect("perf"),
+            Command::Perf(PerfCommand::Compare { current, baseline }) if current == Path::new("a.json") && baseline == Path::new("b.json")
         ));
     }
 

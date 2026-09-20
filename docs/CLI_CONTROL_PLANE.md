@@ -10,4 +10,6 @@ Session control is workspace-scoped: `sessions list|show|archive|unarchive|delet
 
 Persistent background jobs are managed with `jobs start -- COMMAND ARGS...`, `list`, `status`, `logs`, `cancel`, `wait`, and `reap`. Jobs run through a private supervisor process in a workspace-scoped `.agent/jobs` registry, use a separate Unix process group, clear the child environment, bound logs through the existing output files, and reject secret-like arguments. Cancellation verifies PID start time and process-group identity before signalling.
 
+Offline evaluation and startup performance checks are available from the same binary: `eval run --suite smoke|benchmark-100`, `eval show`, and `eval baseline create`, plus `perf run`, `perf show`, and `perf compare`. The built-in suites are embedded in the executable so an installed binary does not depend on the source checkout. Reports default to `.agent/reports/`, are written atomically with best-effort `0600` permissions, and existing files are never overwritten; baseline regressions return a non-zero status.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.
