@@ -3585,7 +3585,7 @@ fn print_command_help(path: &[String]) {
         "tui" => ("agent-cli tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
         "perf run" => ("agent-cli perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
         "status" => ("agent-cli status [--json]".into(), "Shows bounded aggregate state without secret values."),
-        _ => (generated_help_usage(path), "This action uses exact identifiers and bounded typed options; see the command family for available values."),
+        _ => (generated_help_usage(path), "Arguments are typed and bounded; values are validated before mutation, and secrets are never displayed."),
     };
     println!("Usage: {usage}\n\n{body}");
 }
@@ -3596,7 +3596,8 @@ fn generated_help_usage(path: &[String]) -> String {
     let suffix = match action {
         Some("list" | "show" | "status" | "version" | "path" | "validate" | "keys") => "",
         Some("get") => " KEY",
-        Some("set" | "unset" | "set-default") => " KEY VALUE",
+        Some("set" | "set-default") => " KEY VALUE",
+        Some("unset") => " KEY",
         Some(
             "add" | "enable" | "disable" | "revoke" | "remove" | "archive" | "unarchive" | "delete"
             | "cancel" | "wait" | "logs",
