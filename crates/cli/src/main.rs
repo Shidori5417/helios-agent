@@ -52,6 +52,14 @@ thread_local! {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let program_name = env::args()
+        .next()
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "helios".into());
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "__job-supervisor") {
         return match run_job_supervisor(&args[1..]) {
@@ -60,6 +68,10 @@ async fn main() -> ExitCode {
         };
     }
     match parse_args(args) {
+        Ok(Command::Version) => {
+            println!("{} {}", program_name, env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Ok(Command::Help) => {
             print_help();
             ExitCode::SUCCESS
@@ -454,6 +466,7 @@ impl HookRunner for RuntimeHooks {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
+    Version,
     Help,
     ContextHelp(Vec<String>),
     Run(RunOptions),
@@ -792,6 +805,9 @@ struct RunOptions {
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     let args = extract_workspace_flag(args)?;
+    if args.len() == 1 && args[0] == "--version" {
+        return Ok(Command::Version);
+    }
     if args.is_empty() || args[0] == "run" {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(if args.is_empty() {
@@ -5367,6 +5383,10 @@ mod tests {
         assert_eq!(
             parse_args(vec!["--help".into()]).expect("help"),
             Command::Help
+        );
+        assert_eq!(
+            parse_args(vec!["--version".into()]).expect("version"),
+            Command::Version
         );
         assert_eq!(
             parse_args(vec![
