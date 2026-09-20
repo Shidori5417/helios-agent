@@ -632,6 +632,14 @@ impl TuiModel {
                 return OverlayAction::Close;
             }
         }
+        if overlay.kind == OverlayKind::Palette
+            && key.code == KeyCode::Char(' ')
+            && !overlay.query.is_empty()
+        {
+            let text = format!("/{} ", overlay.query);
+            self.overlay = None;
+            return OverlayAction::Fill(text);
+        }
         match key.code {
             KeyCode::Up => {
                 overlay.selected = overlay.selected.saturating_sub(1);
@@ -1698,6 +1706,14 @@ mod tests {
             OverlayAction::Execute("/commands".into())
         );
         assert!(model.overlay.is_none());
+        model.open_overlay(OverlayKind::Palette);
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            OverlayAction::Fill("/new ".into())
+        );
         model.open_overlay(OverlayKind::Help);
         assert_eq!(
             model.handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
