@@ -20,6 +20,8 @@ agent-storage = { path = "../storage" }
 agent-tui = { path = "../tui" }
 agent-terminal = { path = "../terminal" }
 agent-lsp = { path = "../lsp" }
+agent-skills = { path = "../skills" }
+agent-subagents = { path = "../subagents" }
 serde_json.workspace = true
 serde.workspace = true
 rusqlite.workspace = true

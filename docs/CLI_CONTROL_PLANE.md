@@ -18,4 +18,6 @@ Plugin trust is controlled with `trust list|show|add|disable|enable|revoke|remov
 
 Configured extension smoke tests use `mcp test --id ID` and `lsp test --id ID`. MCP tests initialize and list tools without calling them; HTTP MCP additionally requires `--allow-network` and an exact configured host allowlist entry. LSP tests initialize and shut down the configured process, and `--file PATH` enables bounded document-open/symbol probing after workspace permission checks.
 
+Hooks, skills, and subagents use their real runtime boundaries: `hooks list|enable|disable|test`, `skills list|show|validate`, and `subagents show|config|run|test`. Hook enablement is persisted under `[plugins].enabled`; skills are discovered metadata-first from `skills/` and `.agent/skills`; subagent runs are deterministic offline `FakeExecutor` tasks governed by the persisted scheduler budgets.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.

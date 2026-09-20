@@ -20,7 +20,12 @@ use agent_providers::{
 };
 use agent_sandbox::PermissionEngine;
 use agent_sandbox::PermissionMode;
+use agent_skills::SkillCatalog;
 use agent_storage::{ContextRecord, Database, UsageRecord};
+use agent_subagents::{
+    Budgets as SubagentBudgets, CancellationToken as SubagentCancellation, FakeExecutor, Scheduler,
+    TaskSpec,
+};
 use agent_terminal::CancellationToken;
 use agent_tools::{ToolRegistry, ToolStatus};
 use serde::{Deserialize, Serialize};
@@ -3817,6 +3822,9 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     if section == "permissions" {
         return runtime_permissions_command(&args, &path);
     }
+    if matches!(section, "hooks" | "skills" | "subagents") {
+        return runtime_extensions_command(section, &args, &path);
+    }
     let mut document: toml::Value = if path.exists() {
         toml::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("invalid config: {e}"))?
@@ -3835,9 +3843,6 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
                 .unwrap_or(toml::Value::Table(Default::default()))
         );
         return Ok(());
-    }
-    if matches!(section, "mcp" | "lsp") && action == "test" {
-        return Err("external MCP/LSP tests are disabled in this offline control plane; use --help for configuration".into());
     }
     if matches!(section, "skills" | "hooks") && action == "validate" {
         return Ok(());
@@ -3931,6 +3936,294 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     }
     let bytes = toml::to_string_pretty(&document).map_err(|e| e.to_string())?;
     atomic_write(&path, bytes.as_bytes())
+}
+
+fn enabled_plugin_names(path: &Path) -> Result<Vec<String>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("invalid config: {e}"))?;
+    Ok(document
+        .get("plugins")
+        .and_then(|value| value.get("enabled"))
+        .and_then(toml::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+fn set_enabled_plugin(path: &Path, id: &str, enabled: bool) -> Result<(), String> {
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?;
+    let plugins = table
+        .entry("plugins")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("plugins config must be a table")?;
+    let enabled_list = plugins
+        .entry("enabled")
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("plugins.enabled must be an array")?;
+    enabled_list.retain(|value| value.as_str() != Some(id));
+    if enabled {
+        enabled_list.push(toml::Value::String(id.to_owned()));
+    }
+    atomic_write(
+        path,
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+}
+
+fn parse_hook_event(name: &str) -> Result<HookEvent, String> {
+    match name.to_ascii_lowercase().as_str() {
+        "sessionstart" | "session_start" => Ok(HookEvent::SessionStart),
+        "userpromptsubmit" | "user_prompt_submit" => Ok(HookEvent::UserPromptSubmit),
+        "pretooluse" | "pre_tool_use" => Ok(HookEvent::PreToolUse),
+        "posttooluse" | "post_tool_use" => Ok(HookEvent::PostToolUse),
+        "preedit" | "pre_edit" => Ok(HookEvent::PreEdit),
+        "postedit" | "post_edit" => Ok(HookEvent::PostEdit),
+        "permissionrequest" | "permission_request" => Ok(HookEvent::PermissionRequest),
+        "precompact" | "pre_compact" => Ok(HookEvent::PreCompact),
+        "stop" => Ok(HookEvent::Stop),
+        _ => Err(format!("unknown hook event: {name}")),
+    }
+}
+
+fn runtime_extensions_command(section: &str, args: &[String], path: &Path) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let workspace = workspace_root()?;
+    match section {
+        "hooks" => {
+            let mut registry = PluginRegistry::discover(workspace.join(".agent/plugins"))
+                .map_err(|e| e.to_string())?;
+            let enabled = enabled_plugin_names(path)?;
+            for id in &enabled {
+                registry.enable(id).map_err(|e| e.to_string())?;
+            }
+            match action {
+                "list" => {
+                    for plugin in registry.plugins() {
+                        let events = plugin
+                            .manifest
+                            .hooks
+                            .iter()
+                            .map(|hook| format!("{:?}", hook.event))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        println!(
+                            "{}\tenabled={}\tevents={}",
+                            plugin.manifest.name, plugin.enabled, events
+                        );
+                    }
+                    Ok(())
+                }
+                "enable" | "disable" => {
+                    let id = args
+                        .get(1)
+                        .or_else(|| {
+                            args.iter()
+                                .position(|arg| arg == "--id")
+                                .and_then(|index| args.get(index + 1))
+                        })
+                        .ok_or("hooks command requires exact plugin id")?;
+                    if !registry
+                        .plugins()
+                        .iter()
+                        .any(|plugin| plugin.manifest.name == *id)
+                    {
+                        return Err("plugin not found".into());
+                    }
+                    set_enabled_plugin(path, id, action == "enable")
+                }
+                "test" => {
+                    let id = args
+                        .get(1)
+                        .or_else(|| {
+                            args.iter()
+                                .position(|arg| arg == "--id")
+                                .and_then(|index| args.get(index + 1))
+                        })
+                        .ok_or("hooks test requires plugin id")?;
+                    let event_name =
+                        value_after(args, "--event")?.ok_or("hooks test requires --event EVENT")?;
+                    let event = parse_hook_event(&event_name)?;
+                    if !registry
+                        .plugins()
+                        .iter()
+                        .any(|plugin| plugin.manifest.name == *id)
+                    {
+                        return Err("plugin not found".into());
+                    }
+                    if !enabled.iter().any(|enabled_id| enabled_id == id) {
+                        return Err("plugin is disabled; enable it before testing".into());
+                    }
+                    let policy = load_runtime_policy(path)?;
+                    let permissions = PermissionEngine::new(&workspace, policy.mode)
+                        .map_err(|e| e.to_string())?;
+                    let cancellation = CancellationToken::default();
+                    let output = registry
+                        .execute_hook(id, event, &workspace, &permissions, &cancellation, 8 * 1024)
+                        .map_err(|e| e.to_string())?;
+                    println!(
+                        "status={:?} truncated={} output={}",
+                        output.status, output.truncated, output.output
+                    );
+                    Ok(())
+                }
+                _ => Err(format!("unsupported hooks action: {action}")),
+            }
+        }
+        "skills" => {
+            let permissions = PermissionEngine::new(&workspace, PermissionMode::ReadOnly)
+                .map_err(|e| e.to_string())?;
+            let mut roots = vec![workspace.join("skills"), workspace.join(".agent/skills")];
+            if let Some(root) = value_after(args, "--root")? {
+                roots = vec![workspace.join(root)];
+            }
+            let name = args.get(1).filter(|value| !value.starts_with('-')).cloned();
+            let mut found = Vec::new();
+            for root in roots {
+                if root.exists() {
+                    found.push(
+                        SkillCatalog::discover(root, permissions.clone())
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+            }
+            match action {
+                "list" => {
+                    for catalog in &found {
+                        for skill in catalog.metadata() {
+                            println!(
+                                "{}\t{}\tauto_invoke={}\trisk={}",
+                                skill.name, skill.description, skill.auto_invoke, skill.risk
+                            );
+                        }
+                    }
+                    Ok(())
+                }
+                "show" => {
+                    let name = name.ok_or("skills show requires NAME")?;
+                    for catalog in &found {
+                        if let Ok(body) = catalog.load_body(&name) {
+                            if body.len() > 128 * 1024 {
+                                return Err("skill body exceeds 128 KiB".into());
+                            }
+                            println!("{body}");
+                            return Ok(());
+                        }
+                    }
+                    Err("skill not found".into())
+                }
+                "validate" => {
+                    let target = name;
+                    if let Some(target) = target {
+                        if !found.iter().any(|catalog| {
+                            catalog.metadata().iter().any(|skill| skill.name == target)
+                        }) {
+                            return Err("skill not found".into());
+                        }
+                    }
+                    println!("validated {} skill catalog(s)", found.len());
+                    Ok(())
+                }
+                _ => Err(format!("unsupported skills action: {action}")),
+            }
+        }
+        "subagents" => subagents_command(args, path, &workspace),
+        _ => Err("unsupported extension section".into()),
+    }
+}
+
+fn subagent_budgets(path: &Path) -> Result<SubagentBudgets, String> {
+    let value: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = value.get("subagents");
+    Ok(SubagentBudgets {
+        max_iterations: table
+            .and_then(|v| v.get("max_iterations"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(8)
+            .max(1) as u32,
+        max_tokens: table
+            .and_then(|v| v.get("max_tokens"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(16_000)
+            .max(1) as u64,
+        max_tool_calls: table
+            .and_then(|v| v.get("max_tool_calls"))
+            .and_then(toml::Value::as_integer)
+            .unwrap_or(32)
+            .max(1) as u32,
+        wall_clock: Duration::from_secs(
+            table
+                .and_then(|v| v.get("wall_clock_seconds"))
+                .and_then(toml::Value::as_integer)
+                .unwrap_or(60)
+                .max(1) as u64,
+        ),
+    })
+}
+
+fn subagent_concurrency(path: &Path) -> Result<usize, String> {
+    let value: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    Ok(value
+        .get("subagents")
+        .and_then(|v| v.get("concurrency"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or(1)
+        .clamp(1, 16) as usize)
+}
+
+fn subagents_command(args: &[String], path: &Path, workspace: &Path) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("show");
+    match action {
+        "show" => println!("concurrency={} max_iterations={} max_tokens={} max_tool_calls={} wall_clock_seconds={}", subagent_concurrency(path)?, subagent_budgets(path)?.max_iterations, subagent_budgets(path)?.max_tokens, subagent_budgets(path)?.max_tool_calls, subagent_budgets(path)?.wall_clock.as_secs()),
+        "config" => {
+            let mut document: toml::Value = if path.exists() { toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())? } else { toml::Value::Table(Default::default()) };
+            let table = document.as_table_mut().ok_or("config root must be a table")?.entry("subagents").or_insert_with(|| toml::Value::Table(Default::default())).as_table_mut().ok_or("subagents config must be a table")?;
+            for (flag, key) in [("--concurrency", "concurrency"), ("--max-iterations", "max_iterations"), ("--max-tokens", "max_tokens"), ("--max-tool-calls", "max_tool_calls"), ("--wall-clock", "wall_clock_seconds")] { if let Some(value) = value_after(args, flag)? { table.insert(key.into(), toml::Value::Integer(value.parse().map_err(|_| format!("{flag} must be an integer"))?)); } }
+            atomic_write(path, toml::to_string_pretty(&document).map_err(|e| e.to_string())?.as_bytes())?;
+        }
+        "run" | "test" => {
+            let objective = if action == "test" { "complete offline subagent smoke".to_owned() } else { value_after(args, "--objective")?.ok_or("subagents run requires --objective TEXT")? };
+            if args.iter().any(|arg| arg == "--worktree") { return Err("subagents --worktree requires explicit manager integration and is not enabled by this offline command".into()); }
+            let scope = value_after(args, "--scope")?.map(|value| workspace.join(value)).unwrap_or_else(|| workspace.to_path_buf());
+            let permission = PermissionEngine::new(workspace, PermissionMode::ReadOnly).map_err(|e| e.to_string())?;
+            let task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_permission(PermissionMode::ReadOnly).with_budgets(subagent_budgets(path)?);
+            let results = Scheduler::new(subagent_concurrency(path)?).run(&permission, PermissionMode::ReadOnly, vec![task], &FakeExecutor, SubagentCancellation::default()).map_err(|e| e.to_string())?;
+            let result = results.first().ok_or("subagent returned no result")?;
+            println!("id={} reason={:?} iterations={} tokens={} tool_calls={} summary={}", result.id, result.stop_reason, result.iterations, result.tokens, result.tool_calls, result.summary);
+        }
+        _ => return Err(format!("unsupported subagents action: {action}")),
+    }
+    Ok(())
 }
 
 fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result<(), String> {

@@ -18,6 +18,15 @@ complete -c agent-cli -l registry-id -r -f
 complete -c agent-cli -l source -r -f
 complete -c agent-cli -l allow-network
 complete -c agent-cli -l file -r -f
+complete -c agent-cli -l root -r -f
+complete -c agent-cli -l objective -r -f
+complete -c agent-cli -l scope -r -f
+complete -c agent-cli -l worktree
+complete -c agent-cli -l concurrency -r -f
+complete -c agent-cli -l max-iterations -r -f
+complete -c agent-cli -l max-tokens -r -f
+complete -c agent-cli -l max-tool-calls -r -f
+complete -c agent-cli -l wall-clock -r -f
 complete -c agent-cli -l force
 complete -c agent-cli -l token-stdin
 complete -c agent-cli -l registry -r -f

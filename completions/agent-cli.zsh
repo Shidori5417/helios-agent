@@ -15,6 +15,15 @@ _agent_cli() {
     '--query[FTS query]:query:' \
     '--allow-network[allow configured MCP network host]' \
     '--file[LSP workspace file]:path:_files' \
+    '--root[skills root]:path:_files' \
+    '--objective[subagent objective]:text:' \
+    '--scope[subagent scope]:path:_files' \
+    '--worktree[request worktree isolation]' \
+    '--concurrency[subagent concurrency]:count:' \
+    '--max-iterations[subagent iteration budget]:count:' \
+    '--max-tokens[subagent token budget]:count:' \
+    '--max-tool-calls[subagent tool budget]:count:' \
+    '--wall-clock[subagent wall clock seconds]:count:' \
     '*:prompt:_message'
 }
 _agent_cli "$@"
