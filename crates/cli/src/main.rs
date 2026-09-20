@@ -149,10 +149,11 @@ impl RuntimeExecutor {
         workspace: &std::path::Path,
         cancellation: CancellationToken,
         lsp: Vec<LspServerConfig>,
+        permission_mode: PermissionMode,
     ) -> Result<Self, String> {
         let mut mcp = Vec::new();
         for server in servers {
-            let engine = PermissionEngine::new(workspace, PermissionMode::WorkspaceWrite)
+            let engine = PermissionEngine::new(workspace, permission_mode)
                 .map_err(|error| error.to_string())?;
             let advertised = server.config.tool_include.clone();
             let policy = HostAllowlist {
@@ -174,8 +175,8 @@ impl RuntimeExecutor {
                 client: None,
             })
             .collect();
-        let permissions = PermissionEngine::new(workspace, PermissionMode::WorkspaceWrite)
-            .map_err(|error| error.to_string())?;
+        let permissions =
+            PermissionEngine::new(workspace, permission_mode).map_err(|error| error.to_string())?;
         Ok(Self {
             builtin,
             mcp,
@@ -533,6 +534,9 @@ struct RunOptions {
     resume: Option<String>,
     tui: bool,
     config: Option<PathBuf>,
+    provider_explicit: bool,
+    model_explicit: bool,
+    base_url_explicit: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
@@ -775,16 +779,26 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         resume: None,
         tui: false,
         config: None,
+        provider_explicit: false,
+        model_explicit: false,
+        base_url_explicit: false,
     };
     let mut prompt = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" => return Ok(Command::Help),
-            "--provider" => options.provider = required_value(args, &mut index, "--provider")?,
-            "--model" => options.model = required_value(args, &mut index, "--model")?,
+            "--provider" => {
+                options.provider = required_value(args, &mut index, "--provider")?;
+                options.provider_explicit = true;
+            }
+            "--model" => {
+                options.model = required_value(args, &mut index, "--model")?;
+                options.model_explicit = true;
+            }
             "--base-url" => {
-                options.base_url = Some(required_value(args, &mut index, "--base-url")?)
+                options.base_url = Some(required_value(args, &mut index, "--base-url")?);
+                options.base_url_explicit = true
             }
             "--db-path" => {
                 options.db_path = PathBuf::from(required_value(args, &mut index, "--db-path")?)
@@ -835,7 +849,7 @@ fn default_db_path() -> Result<PathBuf, String> {
         .join(".agent/state.db"))
 }
 
-fn run_command(options: RunOptions) -> Result<(), String> {
+fn run_command(mut options: RunOptions) -> Result<(), String> {
     if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Err("--tui requires an interactive TTY".into());
     }
@@ -843,6 +857,25 @@ fn run_command(options: RunOptions) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .canonicalize()
         .map_err(|error| error.to_string())?;
+    let config_path = options
+        .config
+        .clone()
+        .unwrap_or_else(|| workspace.join(".agent/config.toml"));
+    let configured = load_user_config(&config_path)?;
+    let permission_mode = load_permission_mode(&config_path)?;
+    if !options.provider_explicit {
+        if let Some(provider) = configured.provider {
+            options.provider = provider;
+        }
+    }
+    if !options.model_explicit {
+        if let Some(model) = configured.model {
+            options.model = model;
+        }
+    }
+    if !options.base_url_explicit {
+        options.base_url = configured.base_url;
+    }
     let mut database = open_database(&options.db_path)?;
     let workspace_id = workspace.display().to_string();
     let (session_id, objective, messages) = if let Some(selector) = options.resume.as_deref() {
@@ -884,10 +917,7 @@ fn run_command(options: RunOptions) -> Result<(), String> {
             Vec::new(),
         )
     };
-    let config_path = options.config.clone().or_else(|| {
-        let path = workspace.join(".agent/config.toml");
-        path.is_file().then_some(path)
-    });
+    let config_path = config_path.is_file().then_some(config_path);
     let servers = config_path
         .as_ref()
         .map(|path| load_mcp_config(path, &workspace))
@@ -901,7 +931,7 @@ fn run_command(options: RunOptions) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     let cancellation = CancellationToken::default();
-    let builtin = ToolRegistry::new(&workspace, PermissionMode::WorkspaceWrite)
+    let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_cancellation(cancellation.clone());
     let mut tools = RuntimeExecutor::new(
@@ -910,8 +940,14 @@ fn run_command(options: RunOptions) -> Result<(), String> {
         &workspace,
         cancellation.clone(),
         lsp_servers,
+        permission_mode,
     )?;
-    let hooks = load_runtime_hooks(&workspace, config_path.as_deref(), cancellation.clone())?;
+    let hooks = load_runtime_hooks(
+        &workspace,
+        config_path.as_deref(),
+        cancellation.clone(),
+        permission_mode,
+    )?;
     let startup_memory = load_startup_memory(&options.db_path, &workspace_id, &options.prompt)?;
     if options.tui {
         let (sender, receiver) = agent_tui::bounded_event_channel(128);
@@ -1521,6 +1557,7 @@ fn load_runtime_hooks(
     workspace: &std::path::Path,
     config_path: Option<&std::path::Path>,
     cancellation: CancellationToken,
+    permission_mode: PermissionMode,
 ) -> Result<Option<Box<dyn HookRunner>>, String> {
     let plugins_root = workspace.join(".agent/plugins");
     if !plugins_root.is_dir() {
@@ -1551,8 +1588,8 @@ fn load_runtime_hooks(
     if !registry.plugins().iter().any(|plugin| plugin.enabled) {
         return Ok(None);
     }
-    let permissions = PermissionEngine::new(workspace, PermissionMode::WorkspaceWrite)
-        .map_err(|error| error.to_string())?;
+    let permissions =
+        PermissionEngine::new(workspace, permission_mode).map_err(|error| error.to_string())?;
     Ok(Some(Box::new(RuntimeHooks {
         registry,
         workspace: workspace.to_path_buf(),
@@ -1626,7 +1663,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n                       Manage typed workspace configuration\n  auth status|login|logout PROVIDER\n                       Manage provider credentials without printing secrets\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n                       Generate or install shell completion\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n                       Show durable context-plan summaries\n  usage [--session ID|latest] [--json]\n                       Show normalized durable token usage\n  memory list|search|add|supersede|delete\n                       Manage bounded workspace memory (delete needs exact --id)\n  plugins list|verify|install|update|uninstall\n                       Manage explicitly trusted signed plugins\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
+    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
@@ -1661,6 +1698,25 @@ fn load_user_config(path: &Path) -> Result<UserConfig, String> {
     }
     toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
         .map_err(|e| format!("invalid config: {e}"))
+}
+
+fn load_permission_mode(path: &Path) -> Result<PermissionMode, String> {
+    if !path.exists() {
+        return Ok(PermissionMode::WorkspaceWrite);
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("invalid config: {error}"))?;
+    let mode = document
+        .get("permissions")
+        .and_then(|value| value.get("mode"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("workspace-write");
+    match mode {
+        "read-only" | "readonly" => Ok(PermissionMode::ReadOnly),
+        "workspace-write" | "workspace_write" => Ok(PermissionMode::WorkspaceWrite),
+        other => Err(format!("invalid permissions.mode: {other}")),
+    }
 }
 
 fn config_command(command: ConfigCommand) -> Result<(), String> {
@@ -1878,6 +1934,12 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     };
     let action = args.first().map(String::as_str).unwrap_or("list");
     let path = config_path()?;
+    if section == "mcp" || section == "lsp" {
+        return runtime_server_array_command(section, &args, &path);
+    }
+    if section == "permissions" {
+        return runtime_permissions_command(&args, &path);
+    }
     let mut document: toml::Value = if path.exists() {
         toml::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("invalid config: {e}"))?
@@ -1994,11 +2056,166 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     atomic_write(&path, bytes.as_bytes())
 }
 
+fn runtime_permissions_command(args: &[String], path: &Path) -> Result<(), String> {
+    let action = args.first().map(String::as_str).unwrap_or("show");
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("invalid config: {error}"))?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?;
+    if matches!(action, "show" | "list") {
+        println!(
+            "{}",
+            table
+                .get("permissions")
+                .cloned()
+                .unwrap_or(toml::Value::Table(Default::default()))
+        );
+        return Ok(());
+    }
+    if action == "set-mode" {
+        let mode = value_after(&args[1..], "--mode")?
+            .or_else(|| args.get(1).cloned())
+            .ok_or("permissions set-mode requires read-only or workspace-write")?;
+        if !matches!(
+            mode.as_str(),
+            "read-only" | "readonly" | "workspace-write" | "workspace_write"
+        ) {
+            return Err("permissions mode must be read-only or workspace-write".into());
+        }
+        let permissions = table
+            .entry("permissions")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or("permissions config must be a table")?;
+        permissions.insert("mode".into(), toml::Value::String(mode));
+        let bytes = toml::to_string_pretty(&document).map_err(|error| error.to_string())?;
+        return atomic_write(path, bytes.as_bytes());
+    }
+    Err(format!("unsupported permissions action: {action}"))
+}
+
 fn safe_control_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn runtime_server_array_command(section: &str, args: &[String], path: &Path) -> Result<(), String> {
+    let mut document: toml::Value = if path.exists() {
+        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = document
+        .as_table_mut()
+        .ok_or("config root must be a table")?;
+    let key = if section == "mcp" {
+        "mcp_server"
+    } else {
+        "lsp_server"
+    };
+    let servers = table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("server config must be an array")?;
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let id = value_after(&args[1..], "--id")?.or_else(|| args.get(1).cloned());
+    if matches!(action, "list" | "show") {
+        println!("{}", toml::Value::Array(servers.clone()));
+        return Ok(());
+    }
+    if action == "test" {
+        return Err("external MCP/LSP tests are disabled in offline mode".into());
+    }
+    let id = id.ok_or("server command requires exact --id")?;
+    if !safe_control_id(&id) {
+        return Err("invalid server id".into());
+    }
+    let find =
+        |value: &toml::Value| value.get("name").and_then(toml::Value::as_str) == Some(id.as_str());
+    match action {
+        "remove" => {
+            if let Some(index) = servers.iter().position(find) {
+                servers.remove(index);
+            }
+        }
+        "enable" | "disable" => {
+            let server = servers
+                .iter_mut()
+                .find(|value| find(value))
+                .ok_or("server not found")?;
+            server
+                .as_table_mut()
+                .ok_or("server must be table")?
+                .insert("enabled".into(), toml::Value::Boolean(action == "enable"));
+        }
+        "add" => {
+            if servers.iter().any(find) {
+                return Err("server id already exists".into());
+            }
+            let mut entry = toml::map::Map::new();
+            entry.insert("name".into(), toml::Value::String(id));
+            entry.insert("enabled".into(), toml::Value::Boolean(true));
+            if section == "mcp" {
+                let url = value_after(&args[1..], "--url")?;
+                let command = value_after(&args[1..], "--command")?;
+                if url.is_some() == command.is_some() {
+                    return Err("mcp add requires exactly one of --url or --command".into());
+                }
+                if let Some(url) = url {
+                    if !url.starts_with("https://") {
+                        return Err("MCP HTTP requires https://".into());
+                    }
+                    entry.insert("transport".into(), toml::Value::String("http".into()));
+                    entry.insert("url".into(), toml::Value::String(url));
+                }
+                if let Some(command) = command {
+                    entry.insert("command".into(), toml::Value::String(command));
+                }
+                if let Some(auth) = value_after(&args[1..], "--auth-env")? {
+                    if !safe_env_name(&auth) {
+                        return Err("invalid auth env name".into());
+                    }
+                    entry.insert("auth_env".into(), toml::Value::String(auth));
+                }
+            } else {
+                for (flag, key) in [
+                    ("--language", "language"),
+                    ("--command", "command"),
+                    ("--cwd", "cwd"),
+                ] {
+                    if let Some(value) = value_after(&args[1..], flag)? {
+                        entry.insert(key.into(), toml::Value::String(value));
+                    }
+                }
+                if !entry.contains_key("language") || !entry.contains_key("command") {
+                    return Err("lsp add requires --language and --command".into());
+                }
+            }
+            servers.push(toml::Value::Table(entry));
+        }
+        _ => return Err(format!("unsupported {section} action: {action}")),
+    }
+    atomic_write(
+        path,
+        toml::to_string_pretty(&document)
+            .map_err(|e| e.to_string())?
+            .as_bytes(),
+    )
+}
+fn safe_env_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 struct PrintingSink {
@@ -2216,6 +2433,65 @@ mod tests {
                 0o600
             );
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_server_mutations_use_loader_shaped_arrays() {
+        let root =
+            std::env::temp_dir().join(format!("helios-runtime-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("config.toml");
+        runtime_server_array_command(
+            "mcp",
+            &[
+                "add".into(),
+                "--id".into(),
+                "local".into(),
+                "--command".into(),
+                "printf".into(),
+            ],
+            &path,
+        )
+        .expect("mcp");
+        runtime_server_array_command(
+            "lsp",
+            &[
+                "add".into(),
+                "--id".into(),
+                "rust".into(),
+                "--language".into(),
+                "rust".into(),
+                "--command".into(),
+                "rust-analyzer".into(),
+            ],
+            &path,
+        )
+        .expect("lsp");
+        let value: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).expect("read")).expect("toml");
+        assert_eq!(value["mcp_server"][0]["name"].as_str(), Some("local"));
+        assert_eq!(value["lsp_server"][0]["name"].as_str(), Some("rust"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn permission_mode_is_consumed_from_runtime_config() {
+        let root =
+            std::env::temp_dir().join(format!("helios-permission-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("config.toml");
+        runtime_permissions_command(&["set-mode".into(), "read-only".into()], &path)
+            .expect("set mode");
+        assert_eq!(
+            load_permission_mode(&path).expect("load mode"),
+            PermissionMode::ReadOnly
+        );
+        assert!(
+            runtime_permissions_command(&["set-mode".into(), "unsafe".into()], &path,).is_err()
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 79563
+    "bytes": 89701
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -305,15 +305,15 @@
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 597
+    "bytes": 657
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 675
+    "bytes": 735
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 771
+    "bytes": 831
   },
   {
     "path": "docs/INSTALL.md",

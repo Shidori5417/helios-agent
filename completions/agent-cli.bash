@@ -1,6 +1,6 @@
 _agent_cli() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local opts="init config auth doctor completion run sessions search context usage memory plugins verify diff --provider --model --base-url --db-path --resume --config --registry --trust-store --query --key --content --kind --importance --id --limit --session --json --force --token-stdin"
+  local opts="init config auth doctor completion providers permissions mcp lsp hooks skills subagents status run sessions search context usage memory plugins verify diff --provider --model --base-url --db-path --resume --config --registry --trust-store --query --key --content --kind --importance --id --limit --session --json --force --token-stdin"
   if [[ "${COMP_WORDS[*]}" == *"--provider"* ]]; then
     COMPREPLY=($(compgen -W "fake openai anthropic gemini generic openai-compatible" -- "${cur}"))
   else
