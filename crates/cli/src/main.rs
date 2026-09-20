@@ -28,7 +28,7 @@ use agent_subagents::{
     TaskResult, TaskSpec, WorktreeManager,
 };
 use agent_terminal::CancellationToken;
-use agent_tools::{ToolRegistry, ToolStatus};
+use agent_tools::{ApprovalBroker, ApprovalDecision, ToolRegistry, ToolStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -1277,6 +1277,7 @@ struct RunOptions {
     output_format: OutputFormat,
     exec: bool,
     event_sender: Option<SyncSender<agent_protocol::Event>>,
+    approval: Option<ApprovalBroker>,
 }
 
 impl PartialEq for RunOptions {
@@ -1320,6 +1321,7 @@ fn default_run_options(
         output_format: OutputFormat::Text,
         exec: false,
         event_sender,
+        approval: None,
     }
 }
 
@@ -1967,6 +1969,7 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
         output_format: OutputFormat::Text,
         exec,
         event_sender: None,
+        approval: None,
     };
     let mut prompt = Vec::new();
     let mut index = 0;
@@ -2061,6 +2064,8 @@ fn interactive_command() -> Result<(), String> {
     };
     let tui_context = interactive_tui_context(&paths);
     let (sender, receiver) = agent_tui::bounded_event_channel(settings.channel_capacity);
+    let approval = ApprovalBroker::new(sender.clone());
+    let approval_for_ui = approval.clone();
     let ui_cancellation = CancellationToken::default();
     let first_turn = Arc::new(AtomicBool::new(true));
     let session_model = Arc::new(Mutex::new(None::<String>));
@@ -2069,7 +2074,7 @@ fn interactive_command() -> Result<(), String> {
     let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
     let workspace_path = paths.workspace.clone();
-    agent_tui::run_interactive_with_context(
+    agent_tui::run_interactive_with_context_and_approval(
         receiver,
         sender.clone(),
         ui_cancellation,
@@ -2170,6 +2175,7 @@ fn interactive_command() -> Result<(), String> {
             let options =
                 default_run_options(prompt, db_path.clone(), resume, Some(events.clone()));
             let mut options = options;
+            options.approval = Some(approval.clone());
             if let Ok(selected) = session_provider.lock() {
                 if let Some(provider) = selected.clone() {
                     options.provider = provider;
@@ -2207,6 +2213,14 @@ fn interactive_command() -> Result<(), String> {
                 }
             });
             false
+        },
+        move |id, decision| {
+            let mapped = match decision {
+                agent_tui::PermissionDecision::AllowOnce => ApprovalDecision::AllowOnce,
+                agent_tui::PermissionDecision::AllowSession => ApprovalDecision::AllowSession,
+                agent_tui::PermissionDecision::Deny => ApprovalDecision::Deny,
+            };
+            let _ = approval_for_ui.decide(id, mapped);
         },
     )
     .map_err(|error| error.to_string())
@@ -2673,6 +2687,11 @@ fn run_command_with_cancellation(
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_cancellation(cancellation.clone());
+    let builtin = if let Some(approval) = options.approval.clone() {
+        builtin.with_approval_broker(approval)
+    } else {
+        builtin
+    };
     let mut tools = RuntimeExecutor::new(
         builtin,
         servers,
@@ -6724,6 +6743,7 @@ mod tests {
             output_format: OutputFormat::Text,
             exec: false,
             event_sender: None,
+            approval: None,
         };
         let (resolved, _policy, workspace) = resolve_runtime_options(options).expect("resolve");
         assert_eq!(workspace, root.canonicalize().expect("canonical workspace"));

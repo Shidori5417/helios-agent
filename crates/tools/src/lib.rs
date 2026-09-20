@@ -3,8 +3,10 @@ use agent_terminal::{run, CancellationToken, CommandSpec, CommandStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
 
@@ -42,6 +44,148 @@ pub enum ToolStatus {
     Denied,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalRequest {
+    pub id: u64,
+    pub class: PermissionClass,
+    pub risk: &'static str,
+    pub action: String,
+}
+
+#[derive(Debug)]
+struct PendingApproval {
+    request: ApprovalRequest,
+    response: mpsc::SyncSender<ApprovalDecision>,
+}
+
+/// Bounded, fail-closed approval bridge for interactive frontends. The broker
+/// emits only redacted request text and never grants policy access by itself.
+#[derive(Clone, Debug)]
+pub struct ApprovalBroker {
+    events: mpsc::SyncSender<agent_protocol::Event>,
+    pending: Arc<Mutex<HashMap<u64, PendingApproval>>>,
+    session: Arc<Mutex<HashMap<String, bool>>>,
+    next_id: Arc<std::sync::atomic::AtomicU64>,
+    timeout: Duration,
+}
+
+impl ApprovalBroker {
+    pub fn new(events: mpsc::SyncSender<agent_protocol::Event>) -> Self {
+        Self {
+            events,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            session: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            timeout: Duration::from_secs(60),
+        }
+    }
+
+    pub fn decide(&self, id: u64, decision: ApprovalDecision) -> bool {
+        let pending = self
+            .pending
+            .lock()
+            .ok()
+            .and_then(|mut values| values.remove(&id));
+        let Some(pending) = pending else { return false };
+        if decision == ApprovalDecision::AllowSession {
+            if let Ok(mut values) = self.session.lock() {
+                values.insert(session_key(&pending.request), true);
+            }
+        }
+        pending.response.send(decision).is_ok()
+    }
+
+    fn approve(
+        &self,
+        class: PermissionClass,
+        action: String,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, ToolError> {
+        let request = ApprovalRequest {
+            id: self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            class,
+            risk: risk_for(class),
+            action: action.chars().take(512).collect(),
+        };
+        if self
+            .session
+            .lock()
+            .ok()
+            .and_then(|values| values.get(&session_key(&request)).copied())
+            == Some(true)
+        {
+            return Ok(true);
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.pending
+            .lock()
+            .map_err(|_| ToolError::Approval("approval state unavailable".into()))?
+            .insert(
+                request.id,
+                PendingApproval {
+                    request: request.clone(),
+                    response: sender,
+                },
+            );
+        let event = agent_protocol::Event::PermissionRequested(format!(
+            "id={};class={:?};risk={};action={}",
+            request.id, request.class, request.risk, request.action
+        ));
+        if self.events.send(event).is_err() {
+            let _ = self
+                .pending
+                .lock()
+                .map(|mut values| values.remove(&request.id));
+            return Ok(false);
+        }
+        let started = std::time::Instant::now();
+        while started.elapsed() < self.timeout {
+            if cancellation.is_cancelled() {
+                let _ = self
+                    .pending
+                    .lock()
+                    .map(|mut values| values.remove(&request.id));
+                return Ok(false);
+            }
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession) => {
+                    return Ok(request.risk != "high")
+                }
+                Ok(ApprovalDecision::Deny) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok(false)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        let _ = self
+            .pending
+            .lock()
+            .map(|mut values| values.remove(&request.id));
+        Ok(false)
+    }
+}
+
+fn session_key(request: &ApprovalRequest) -> String {
+    format!("{:?}:{}", request.class, request.action)
+}
+
+fn risk_for(class: PermissionClass) -> &'static str {
+    match class {
+        PermissionClass::ReadOnly => "low",
+        PermissionClass::WorkspaceWrite => "medium",
+        PermissionClass::Process | PermissionClass::Network | PermissionClass::Dangerous => "high",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub status: ToolStatus,
@@ -73,6 +217,8 @@ pub enum ToolError {
     Terminal(#[from] agent_terminal::TerminalError),
     #[error("patch conflict: file changed since it was read")]
     PatchConflict,
+    #[error("approval denied or timed out")]
+    Approval(String),
 }
 
 #[derive(Clone)]
@@ -82,6 +228,7 @@ pub struct ToolRegistry {
     timeout: Duration,
     spill_dir: PathBuf,
     cancellation: CancellationToken,
+    approval: Option<ApprovalBroker>,
 }
 
 impl agent_core::ToolExecutor for ToolRegistry {
@@ -132,6 +279,7 @@ impl agent_core::ToolExecutor for ToolRegistry {
                     },
                     ToolError::UnknownTool(_) => agent_core::ToolFailureKind::InvalidInput,
                     ToolError::Io(_) | ToolError::Terminal(_) => agent_core::ToolFailureKind::Fatal,
+                    ToolError::Approval(_) => agent_core::ToolFailureKind::PermissionDenied,
                 };
                 agent_core::ToolFailure {
                     kind,
@@ -150,11 +298,17 @@ impl ToolRegistry {
             timeout: Duration::from_secs(30),
             spill_dir: root.join(".agent/spill"),
             cancellation: CancellationToken::default(),
+            approval: None,
         })
     }
 
     pub fn with_cancellation(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
+        self
+    }
+
+    pub fn with_approval_broker(mut self, approval: ApprovalBroker) -> Self {
+        self.approval = Some(approval);
         self
     }
 
@@ -237,7 +391,26 @@ impl ToolRegistry {
         let metadata = self
             .metadata(name)
             .ok_or_else(|| ToolError::UnknownTool(name.into()))?;
-        self.permissions.authorize(metadata.permission_class)?;
+        let policy_result = self.permissions.authorize(metadata.permission_class);
+        let interactive_approval = self
+            .approval
+            .as_ref()
+            .filter(|_| metadata.permission_class != PermissionClass::ReadOnly)
+            .map(|broker| {
+                broker.approve(
+                    metadata.permission_class,
+                    safe_action(name, &args),
+                    cancellation,
+                )
+            })
+            .transpose()?;
+        if let Some(approved) = interactive_approval {
+            if !approved {
+                return Err(ToolError::Approval(format!("{name} requires approval")));
+            }
+        } else if let Err(permission_error) = policy_result {
+            return Err(ToolError::Permission(permission_error));
+        }
         match name {
             "read_file" => self.read_file(args),
             "search_files" => self.search_files(args),
@@ -440,6 +613,38 @@ impl ToolRegistry {
     }
 }
 
+fn safe_action(name: &str, args: &Value) -> String {
+    let mut value = args.clone();
+    redact_secret_values(&mut value);
+    format!("{name} {value}")
+}
+
+fn redact_secret_values(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                if [
+                    "token",
+                    "password",
+                    "secret",
+                    "api_key",
+                    "apikey",
+                    "authorization",
+                ]
+                .iter()
+                .any(|marker| key.to_ascii_lowercase().contains(marker))
+                {
+                    *item = Value::String("[REDACTED]".into());
+                } else {
+                    redact_secret_values(item);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_secret_values),
+        _ => {}
+    }
+}
+
 fn parse<T: for<'a> Deserialize<'a>>(tool: &str, args: Value) -> Result<T, ToolError> {
     serde_json::from_value(args).map_err(|error| ToolError::InvalidArguments {
         tool: tool.into(),
@@ -537,6 +742,41 @@ mod tests {
                 class: PermissionClass::WorkspaceWrite
             })
         ));
+    }
+
+    #[test]
+    fn approval_blocks_before_write_and_allows_exact_request() {
+        let root = root("approval");
+        let file = root.join("file.txt");
+        fs::write(&file, "old").expect("write");
+        let (events, receiver) = mpsc::sync_channel(4);
+        let broker = ApprovalBroker::new(events);
+        let worker_broker = broker.clone();
+        let worker_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            ToolRegistry::new(&worker_root, PermissionMode::ReadOnly)
+                .expect("registry")
+                .with_approval_broker(worker_broker)
+                .execute(
+                    "apply_patch",
+                    json!({"path":"file.txt","expected_content":"old","replacement":"new"}),
+                    &CancellationToken::default(),
+                )
+        });
+        let event = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("request");
+        let agent_protocol::Event::PermissionRequested(text) = event else {
+            panic!("request event")
+        };
+        let id = text
+            .split(';')
+            .find_map(|part| part.strip_prefix("id=")?.parse::<u64>().ok())
+            .expect("request id");
+        assert_eq!(fs::read_to_string(&file).expect("before approval"), "old");
+        assert!(broker.decide(id, ApprovalDecision::AllowOnce));
+        worker.join().expect("worker").expect("approved");
+        assert_eq!(fs::read_to_string(file).expect("after approval"), "new");
     }
 
     #[cfg(unix)]

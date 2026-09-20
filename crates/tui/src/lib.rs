@@ -163,6 +163,7 @@ pub enum PermissionDecision {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PermissionPrompt {
+    pub id: u64,
     pub action: String,
     pub risk: String,
     pub class: String,
@@ -179,12 +180,32 @@ pub struct ToolCard {
 
 fn parse_permission_prompt(value: &str) -> PermissionPrompt {
     let bounded = value.chars().take(512).collect::<String>();
-    let (class, action) = bounded
-        .split_once(':')
-        .map(|(class, action)| (class.trim(), action.trim()))
-        .unwrap_or(("unknown", bounded.as_str()));
-    let risk = if class.eq_ignore_ascii_case("read-only") || class.eq_ignore_ascii_case("readonly")
-    {
+    let mut id = 0;
+    let mut class = "unknown";
+    let mut action = bounded.as_str();
+    let mut risk = "";
+    for part in bounded.split(';') {
+        if let Some((key, value)) = part.split_once('=') {
+            match key {
+                "id" => id = value.parse().unwrap_or(0),
+                "class" => class = value,
+                "risk" => risk = value,
+                "action" => action = value,
+                _ => {}
+            }
+        }
+    }
+    if class == "unknown" {
+        let (parsed_class, parsed_action) = bounded
+            .split_once(':')
+            .map(|(class, action)| (class.trim(), action.trim()))
+            .unwrap_or((class, action));
+        class = parsed_class;
+        action = parsed_action;
+    }
+    let risk = if !risk.is_empty() {
+        risk
+    } else if class.eq_ignore_ascii_case("read-only") || class.eq_ignore_ascii_case("readonly") {
         "low"
     } else if class.eq_ignore_ascii_case("workspace-write")
         || class.eq_ignore_ascii_case("workspacewrite")
@@ -194,6 +215,7 @@ fn parse_permission_prompt(value: &str) -> PermissionPrompt {
         "high"
     };
     PermissionPrompt {
+        id,
         action: action.to_owned(),
         risk: risk.into(),
         class: class.to_owned(),
@@ -1218,10 +1240,34 @@ pub fn run_interactive_with_context<F>(
     cancellation: agent_terminal::CancellationToken,
     settings: TuiSettings,
     context: TuiContext,
-    mut submit: F,
+    submit: F,
 ) -> io::Result<()>
 where
     F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+{
+    run_interactive_with_context_and_approval(
+        receiver,
+        sender,
+        cancellation,
+        settings,
+        context,
+        submit,
+        |_id, _decision| {},
+    )
+}
+
+pub fn run_interactive_with_context_and_approval<F, D>(
+    receiver: Receiver<Event>,
+    sender: SyncSender<Event>,
+    cancellation: agent_terminal::CancellationToken,
+    settings: TuiSettings,
+    context: TuiContext,
+    mut submit: F,
+    mut decide: D,
+) -> io::Result<()>
+where
+    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+    D: FnMut(u64, PermissionDecision),
 {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
@@ -1265,6 +1311,7 @@ where
                 }
                 crossterm::event::Event::Key(key) => {
                     if model.overlay.is_some() {
+                        let permission_id = model.permission_decision().map(|prompt| prompt.id);
                         let overlay_action = model.handle_overlay_key(key);
                         if let OverlayAction::Execute(command) = &overlay_action {
                             if let Some(selected) = command.strip_prefix("/model ") {
@@ -1304,6 +1351,9 @@ where
                                 model.composer.cursor = model.composer.text.len();
                             }
                             OverlayAction::Permission(decision) => {
+                                if let Some(id) = permission_id {
+                                    decide(id, decision);
+                                }
                                 if decision == PermissionDecision::Deny {
                                     if let Some(turn) = &active_cancellation {
                                         turn.cancel();
