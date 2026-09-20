@@ -2059,15 +2059,17 @@ fn interactive_command() -> Result<(), String> {
     } else {
         agent_tui::TuiSettings::default()
     };
+    let tui_context = interactive_tui_context(&paths);
     let (sender, receiver) = agent_tui::bounded_event_channel(settings.channel_capacity);
     let ui_cancellation = CancellationToken::default();
     let first_turn = Arc::new(AtomicBool::new(true));
     let db_path = paths.db_path;
-    agent_tui::run_interactive(
+    agent_tui::run_interactive_with_context(
         receiver,
         sender.clone(),
         ui_cancellation,
         settings,
+        tui_context,
         move |prompt, events, turn_cancellation| {
             let command = prompt.trim().to_ascii_lowercase();
             if command == "/exit" || command == "/quit" {
@@ -2109,6 +2111,46 @@ fn interactive_command() -> Result<(), String> {
         },
     )
     .map_err(|error| error.to_string())
+}
+
+fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
+    let config_path = paths.effective_project_config();
+    let config = load_user_config(config_path).ok();
+    let policy = load_runtime_policy(config_path).ok();
+    let (branch, dirty_files) = git_state_snapshot(&paths.workspace);
+    agent_tui::TuiContext {
+        workspace: Some(
+            paths
+                .workspace
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| paths.workspace.display().to_string()),
+        ),
+        branch,
+        dirty_files,
+        model: config.as_ref().and_then(|value| value.model.clone()),
+        permission_mode: policy.map(|value| format!("{:?}", value.mode)),
+        ..agent_tui::TuiContext::default()
+    }
+}
+
+fn git_state_snapshot(workspace: &Path) -> (Option<String>, Option<usize>) {
+    let branch = OsCommand::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let dirty_files = OsCommand::new("git")
+        .args(["status", "--porcelain=v1"])
+        .current_dir(workspace)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).lines().count());
+    (branch, dirty_files)
 }
 
 fn direct_command_output(input: &str, cancellation: &CancellationToken) -> String {
@@ -5306,6 +5348,9 @@ fn load_tui_settings(path: &Path) -> Result<agent_tui::TuiSettings, String> {
     }
     if let Some(value) = table.get("scroll_step").and_then(toml::Value::as_integer) {
         settings.scroll_step = value.clamp(1, 100) as usize;
+    }
+    if let Some(value) = table.get("alternate_screen").and_then(toml::Value::as_bool) {
+        settings.alternate_screen = value;
     }
     settings.color = match table.get("color").and_then(toml::Value::as_str) {
         Some("always") => agent_tui::TuiColor::Always,

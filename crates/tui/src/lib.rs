@@ -9,7 +9,8 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    text::Text,
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
 use std::{
@@ -18,10 +19,10 @@ use std::{
     time::Duration,
 };
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiModel {
     pub status: String,
-    pub transcript: Vec<String>,
+    pub transcript: Vec<TranscriptItem>,
     pub tool: Option<String>,
     pub permission: Option<String>,
     pub verification: Option<String>,
@@ -33,6 +34,77 @@ pub struct TuiModel {
     pub history: Vec<String>,
     pub history_index: Option<usize>,
     pub active_turn: bool,
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
+    pub dirty_files: Option<usize>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub context_percent: Option<u8>,
+    pub permission_mode: Option<String>,
+    pub changes_delta: Option<i64>,
+    pub background_jobs: Option<usize>,
+}
+
+impl Default for TuiModel {
+    fn default() -> Self {
+        Self {
+            status: String::new(),
+            transcript: Vec::new(),
+            tool: None,
+            permission: None,
+            verification: None,
+            context: None,
+            scroll: 0,
+            viewport_height: 0,
+            scroll_step: 1,
+            composer: Composer::default(),
+            history: Vec::new(),
+            history_index: None,
+            active_turn: false,
+            workspace: None,
+            branch: None,
+            dirty_files: None,
+            model: None,
+            effort: None,
+            context_percent: None,
+            permission_mode: None,
+            changes_delta: None,
+            background_jobs: None,
+        }
+    }
+}
+
+pub const MAX_TRANSCRIPT_ITEMS: usize = 512;
+pub const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
+pub const MAX_STREAM_ITEM_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TranscriptItem {
+    User(String),
+    Assistant(String),
+    Activity(String),
+    Tool { name: String, output: String },
+    FileChange(String),
+    Error(String),
+    Notification(String),
+}
+
+impl TranscriptItem {
+    fn render(&self) -> String {
+        match self {
+            Self::User(text) => format!("> {text}"),
+            Self::Assistant(text) => format!("assistant: {text}"),
+            Self::Activity(text) => format!("· {text}"),
+            Self::Tool { name, output } => format!("tool {name}: {output}"),
+            Self::FileChange(path) => format!("change: {path}"),
+            Self::Error(error) => format!("error: {error}"),
+            Self::Notification(text) => text.clone(),
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.render().len()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -158,23 +230,85 @@ impl Composer {
 }
 
 impl TuiModel {
+    pub fn set_runtime_context(&mut self, context: TuiContext) {
+        self.workspace = context.workspace;
+        self.branch = context.branch;
+        self.dirty_files = context.dirty_files;
+        self.model = context.model;
+        self.effort = context.effort;
+        self.permission_mode = context.permission_mode;
+        self.background_jobs = context.background_jobs;
+    }
+
+    pub fn push_item(&mut self, item: TranscriptItem) {
+        self.transcript.push(item);
+        while self.transcript.len() > MAX_TRANSCRIPT_ITEMS
+            || self
+                .transcript
+                .iter()
+                .map(TranscriptItem::size)
+                .sum::<usize>()
+                > MAX_TRANSCRIPT_BYTES
+        {
+            if self.transcript.len() <= 1 {
+                break;
+            }
+            self.transcript.remove(0);
+        }
+    }
+
+    fn append_assistant_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Some(TranscriptItem::Assistant(text)) = self.transcript.last_mut() {
+            let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(text.len());
+            text.extend(delta.chars().take(remaining));
+            return;
+        }
+        self.push_item(TranscriptItem::Assistant(
+            delta.chars().take(MAX_STREAM_ITEM_BYTES).collect(),
+        ));
+    }
+
+    fn append_tool_delta(&mut self, delta: &str) {
+        let name = self.tool.clone().unwrap_or_else(|| "tool".into());
+        if let Some(TranscriptItem::Tool {
+            name: current,
+            output,
+        }) = self.transcript.last_mut()
+        {
+            if *current == name {
+                let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(output.len());
+                output.extend(delta.chars().take(remaining));
+                return;
+            }
+        }
+        self.push_item(TranscriptItem::Tool {
+            name,
+            output: delta.chars().take(MAX_STREAM_ITEM_BYTES).collect(),
+        });
+    }
+
     pub fn reduce(&mut self, event: &Event) {
         match event {
             Event::TurnStarted => {
                 self.status = "turn started".into();
                 self.active_turn = true;
             }
-            Event::ModelDelta(text) => self.transcript.push(format!("model: {text}")),
+            Event::ModelDelta(text) => self.append_assistant_delta(text),
             Event::ReasoningSummaryDelta(text) => {
-                self.transcript.push(format!("reasoning: {text}"))
+                self.push_item(TranscriptItem::Activity(format!("reasoning: {text}")))
             }
             Event::ToolRequested(name) | Event::ToolStarted(name) => self.tool = Some(name.clone()),
-            Event::ToolOutputDelta(text) => self.transcript.push(format!("tool output: {text}")),
+            Event::ToolOutputDelta(text) => {
+                self.append_tool_delta(text);
+            }
             Event::ToolCompleted(status) => {
                 self.status = format!("tool: {status}");
                 self.tool = None;
             }
-            Event::PatchProduced(path) => self.transcript.push(format!("patch: {path}")),
+            Event::PatchProduced(path) => self.push_item(TranscriptItem::FileChange(path.clone())),
             Event::VerificationStarted(command) => {
                 self.verification = Some(format!("started: {command}"))
             }
@@ -183,11 +317,21 @@ impl TuiModel {
             }
             Event::PermissionRequested(request) => self.permission = Some(request.clone()),
             Event::ContextCompacted(summary) => self.context = Some(summary.clone()),
-            Event::UsageUpdated(usage) => self.transcript.push(format!("usage: {usage}")),
-            Event::HookStarted(name) => self.transcript.push(format!("hook started: {name}")),
-            Event::HookResult(result) => self.transcript.push(format!("hook: {result}")),
-            Event::McpToolDiscovered(name) => self.transcript.push(format!("MCP tool: {name}")),
-            Event::McpToolResult(result) => self.transcript.push(format!("MCP result: {result}")),
+            Event::UsageUpdated(usage) => {
+                self.push_item(TranscriptItem::Activity(format!("usage: {usage}")))
+            }
+            Event::HookStarted(name) => {
+                self.push_item(TranscriptItem::Activity(format!("hook started: {name}")))
+            }
+            Event::HookResult(result) => {
+                self.push_item(TranscriptItem::Activity(format!("hook: {result}")))
+            }
+            Event::McpToolDiscovered(name) => {
+                self.push_item(TranscriptItem::Activity(format!("MCP tool: {name}")))
+            }
+            Event::McpToolResult(result) => {
+                self.push_item(TranscriptItem::Activity(format!("MCP result: {result}")))
+            }
             Event::TurnCompleted => {
                 self.status = "turn completed".into();
                 self.active_turn = false;
@@ -195,12 +339,13 @@ impl TuiModel {
             Event::Error(error) => {
                 self.status = format!("error: {error}");
                 self.active_turn = false;
+                self.push_item(TranscriptItem::Error(error.clone()));
             }
         }
     }
     pub fn as_text(&self) -> String {
         let mut lines = vec![format!("status: {}", self.status)];
-        lines.extend(self.transcript.clone());
+        lines.extend(self.transcript.iter().map(TranscriptItem::render));
         if let Some(tool) = &self.tool {
             lines.push(format!("tool: {tool}"));
         }
@@ -254,6 +399,7 @@ pub struct TuiSettings {
     pub channel_capacity: usize,
     pub scroll_step: usize,
     pub color: TuiColor,
+    pub alternate_screen: bool,
 }
 
 impl Default for TuiSettings {
@@ -263,6 +409,7 @@ impl Default for TuiSettings {
             channel_capacity: 128,
             scroll_step: 1,
             color: TuiColor::Auto,
+            alternate_screen: true,
         }
     }
 }
@@ -286,28 +433,156 @@ pub fn bounded_event_channel(capacity: usize) -> (SyncSender<Event>, Receiver<Ev
     std::sync::mpsc::sync_channel(capacity.max(1))
 }
 
-struct TerminalGuard;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TuiContext {
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
+    pub dirty_files: Option<usize>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub permission_mode: Option<String>,
+    pub background_jobs: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutMode {
+    Large,
+    Normal,
+    Narrow,
+    TooSmall,
+}
+
+pub fn layout_mode(width: u16, height: u16) -> LayoutMode {
+    if width < 40 || height < 8 {
+        LayoutMode::TooSmall
+    } else if width < 72 {
+        LayoutMode::Narrow
+    } else if width >= 120 || height >= 36 {
+        LayoutMode::Large
+    } else {
+        LayoutMode::Normal
+    }
+}
+
+fn color_enabled(settings: TuiSettings) -> bool {
+    settings.color == TuiColor::Always
+        || (settings.color == TuiColor::Auto && std::env::var_os("NO_COLOR").is_none())
+}
+
+fn header_text(model: &TuiModel, mode: LayoutMode) -> String {
+    let mut parts = vec!["Helios".to_owned()];
+    if let Some(workspace) = &model.workspace {
+        parts.push(workspace.clone());
+    }
+    if let Some(branch) = &model.branch {
+        let dirty = model
+            .dirty_files
+            .map(|count| format!(" +{count}"))
+            .unwrap_or_default();
+        parts.push(format!("{branch}{dirty}"));
+    }
+    if let Some(model_name) = &model.model {
+        parts.push(format!("model:{model_name}"));
+    }
+    if let Some(percent) = model.context_percent {
+        parts.push(format!("ctx:{percent}%"));
+    }
+    if let Some(permission) = &model.permission_mode {
+        parts.push(format!("perm:{permission}"));
+    }
+    let mut text = parts.join(" · ");
+    if mode == LayoutMode::Narrow {
+        text = text.chars().take(70).collect();
+    }
+    text
+}
+
+fn composer_text(model: &TuiModel, width: u16, height: u16) -> Text<'static> {
+    let mut text = model.composer.text.clone();
+    let cursor = model.composer.cursor.min(text.len());
+    text.insert(cursor, '▌');
+    let max_bytes = usize::from(width.max(1)) * usize::from(height.max(1)) * 4;
+    text.truncate(text.len().min(max_bytes));
+    Text::from(text)
+}
+
+fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiSettings) {
+    let area = frame.area();
+    let mode = layout_mode(area.width, area.height);
+    if mode == LayoutMode::TooSmall {
+        frame.render_widget(
+            Paragraph::new("Terminal too small — resize to continue")
+                .block(Block::default().borders(Borders::ALL).title("Helios")),
+            area,
+        );
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let border_style = if color_enabled(settings) {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(Paragraph::new(header_text(model, mode)), chunks[0]);
+    let body = model.as_text();
+    frame.render_widget(
+        Paragraph::new(body)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(border_style),
+            )
+            .wrap(Wrap { trim: false }),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(composer_text(
+            model,
+            chunks[2].width.saturating_sub(2),
+            chunks[2].height.saturating_sub(2),
+        ))
+        .block(Block::default().borders(Borders::ALL).title("Composer"))
+        .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+    let mut footer = model.status.clone();
+    if let Some(delta) = model.changes_delta {
+        footer.push_str(&format!(" · changes:{delta:+}"));
+    }
+    if let Some(jobs) = model.background_jobs {
+        footer.push_str(&format!(" · jobs:{jobs}"));
+    }
+    frame.render_widget(Paragraph::new(footer), chunks[3]);
+}
+
+struct TerminalGuard {
+    alternate_screen: bool,
+}
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
+    fn enter(alternate_screen: bool) -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(
-            io::stdout(),
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            Hide
-        )?;
-        Ok(Self)
+        if alternate_screen {
+            execute!(io::stdout(), EnterAlternateScreen)?;
+        }
+        execute!(io::stdout(), EnableBracketedPaste, Hide)?;
+        Ok(Self { alternate_screen })
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            Show,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
+        if self.alternate_screen {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
     }
 }
 
@@ -341,7 +616,7 @@ pub fn run_channel_with_settings(
             "TUI requires an interactive TTY",
         ));
     }
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(settings.alternate_screen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut model = TuiModel {
@@ -413,6 +688,27 @@ pub fn run_interactive<F>(
     sender: SyncSender<Event>,
     cancellation: agent_terminal::CancellationToken,
     settings: TuiSettings,
+    submit: F,
+) -> io::Result<()>
+where
+    F: FnMut(String, SyncSender<Event>, agent_terminal::CancellationToken) -> bool,
+{
+    run_interactive_with_context(
+        receiver,
+        sender,
+        cancellation,
+        settings,
+        TuiContext::default(),
+        submit,
+    )
+}
+
+pub fn run_interactive_with_context<F>(
+    receiver: Receiver<Event>,
+    sender: SyncSender<Event>,
+    cancellation: agent_terminal::CancellationToken,
+    settings: TuiSettings,
+    context: TuiContext,
     mut submit: F,
 ) -> io::Result<()>
 where
@@ -424,7 +720,7 @@ where
             "interactive mode requires an interactive TTY",
         ));
     }
-    let _guard = TerminalGuard::enter()?;
+    let _guard = TerminalGuard::enter(settings.alternate_screen)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut model = TuiModel {
@@ -432,11 +728,14 @@ where
         scroll_step: settings.scroll_step.max(1),
         ..TuiModel::default()
     };
+    model.set_runtime_context(context);
     let mut active_cancellation: Option<agent_terminal::CancellationToken> = None;
     let tick = Duration::from_millis(settings.tick_ms.clamp(10, 1000));
+    let mut needs_draw = true;
     loop {
         while let Ok(event) = receiver.try_recv() {
             model.reduce(&event);
+            needs_draw = true;
             if matches!(event, Event::TurnCompleted | Event::Error(_)) {
                 active_cancellation = None;
             }
@@ -444,27 +743,16 @@ where
         if cancellation.is_cancelled() {
             break;
         }
-        terminal.draw(|frame| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(2)])
-                .split(frame.area());
-            let title = if settings.color == TuiColor::Never {
-                "Helios"
-            } else {
-                "Helios interactive"
-            };
-            let block = Block::default().borders(Borders::ALL).title(title);
-            frame.render_widget(Paragraph::new(model.as_text()).block(block), chunks[0]);
-            let composer = format!(
-                "{}▌\nEnter submit · Alt/Shift+Enter newline · Ctrl-C cancel · Ctrl-D exit · /help",
-                model.composer.text
-            );
-            frame.render_widget(Paragraph::new(composer), chunks[1]);
-        })?;
+        if needs_draw {
+            terminal.draw(|frame| render_frame(frame, &model, settings))?;
+            needs_draw = false;
+        }
         if crossterm::event::poll(tick)? {
             match crossterm::event::read()? {
-                crossterm::event::Event::Paste(value) => model.composer.paste(&value),
+                crossterm::event::Event::Paste(value) => {
+                    model.composer.paste(&value);
+                    needs_draw = true;
+                }
                 crossterm::event::Event::Key(key) => {
                     if key.code == KeyCode::Up && !model.active_turn {
                         if let Some(index) = model.history_index {
@@ -478,6 +766,7 @@ where
                             model.composer.text = model.history[index].clone();
                             model.composer.cursor = model.composer.text.len();
                         }
+                        needs_draw = true;
                         continue;
                     }
                     if key.code == KeyCode::Down && !model.active_turn {
@@ -491,18 +780,22 @@ where
                             }
                             model.composer.cursor = model.composer.text.len();
                         }
+                        needs_draw = true;
                         continue;
                     }
                     if key.code == KeyCode::PageUp {
                         model.reduce_input(&InputEvent::ScrollUp);
+                        needs_draw = true;
                         continue;
                     }
                     if key.code == KeyCode::PageDown {
                         model.reduce_input(&InputEvent::ScrollDown);
+                        needs_draw = true;
                         continue;
                     }
                     match model.composer.handle_key(key) {
                         ComposerAction::Submit(prompt) => {
+                            needs_draw = true;
                             model.history.push(prompt.clone());
                             model.history_index = None;
                             model.active_turn = true;
@@ -513,6 +806,7 @@ where
                             }
                         }
                         ComposerAction::Cancel => {
+                            needs_draw = true;
                             if let Some(turn) = &active_cancellation {
                                 turn.cancel();
                             } else {
@@ -525,12 +819,14 @@ where
                         }
                         ComposerAction::Redraw => {
                             terminal.clear()?;
+                            needs_draw = true;
                         }
-                        ComposerAction::None => {}
+                        ComposerAction::None => needs_draw = true,
                     }
                 }
                 crossterm::event::Event::Resize(width, height) => {
                     model.reduce_input(&InputEvent::Resize { width, height });
+                    needs_draw = true;
                 }
                 _ => {}
             }
@@ -592,7 +888,7 @@ mod tests {
             two.reduce(&event);
         }
         assert_eq!(one, two);
-        assert_eq!(one.as_text(), "status: turn completed\nmodel: ok");
+        assert_eq!(one.as_text(), "status: turn completed\nassistant: ok");
     }
 
     #[test]
@@ -673,5 +969,43 @@ mod tests {
         assert_eq!(action, ComposerAction::Cancel);
         composer.paste(&"x".repeat(70 * 1024));
         assert!(composer.text.len() <= Composer::MAX_INPUT_BYTES);
+    }
+
+    #[test]
+    fn streaming_deltas_coalesce_and_transcript_stays_bounded() {
+        let mut model = TuiModel::default();
+        model.reduce(&Event::ModelDelta("hel".into()));
+        model.reduce(&Event::ModelDelta("🙂".into()));
+        assert_eq!(
+            model.transcript,
+            vec![TranscriptItem::Assistant("hel🙂".into())]
+        );
+        for index in 0..(MAX_TRANSCRIPT_ITEMS + 20) {
+            model.push_item(TranscriptItem::Notification(index.to_string()));
+        }
+        assert!(model.transcript.len() <= MAX_TRANSCRIPT_ITEMS);
+    }
+
+    #[test]
+    fn responsive_layout_and_typed_items_are_deterministic() {
+        assert_eq!(layout_mode(120, 36), LayoutMode::Large);
+        assert_eq!(layout_mode(80, 24), LayoutMode::Normal);
+        assert_eq!(layout_mode(60, 20), LayoutMode::Narrow);
+        assert_eq!(layout_mode(30, 7), LayoutMode::TooSmall);
+        let mut model = TuiModel::default();
+        model.set_runtime_context(TuiContext {
+            workspace: Some("project".into()),
+            branch: Some("main".into()),
+            dirty_files: Some(2),
+            model: Some("fake".into()),
+            permission_mode: Some("workspace-write".into()),
+            ..TuiContext::default()
+        });
+        model.push_item(TranscriptItem::Tool {
+            name: "read".into(),
+            output: "bounded".into(),
+        });
+        assert!(header_text(&model, LayoutMode::Normal).contains("main +2"));
+        assert!(model.as_text().contains("tool read: bounded"));
     }
 }
