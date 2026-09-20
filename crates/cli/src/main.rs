@@ -120,12 +120,14 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
-        Ok(Command::Tasks(command)) | Ok(Command::Agents(command)) => {
-            match tasks_command(command) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => fail(error),
-            }
-        }
+        Ok(Command::Tasks(command)) => match tasks_command(command, None) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Agents(command)) => match tasks_command(command, Some("subagent")) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Ok(Command::Eval(command)) => match eval_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
@@ -1000,7 +1002,7 @@ fn command_registry() -> Vec<CommandDefinition> {
         },
         CommandDefinition {
             name: "tasks",
-            aliases: &["agents"],
+            aliases: &[],
             description: "manage durable background agent tasks",
             category: "runtime",
             arguments: "bg|list|show|status|cancel|adopt",
@@ -1008,6 +1010,18 @@ fn command_registry() -> Vec<CommandDefinition> {
             requires_agent: false,
             local: true,
             handler_id: "tasks",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "agents",
+            aliases: &[],
+            description: "run and inspect isolated subagents",
+            category: "runtime",
+            arguments: "run|list|status|show|cancel|adopt",
+            destructive: true,
+            requires_agent: false,
+            local: true,
+            handler_id: "agents",
             source: "builtin",
         },
         CommandDefinition {
@@ -1226,6 +1240,12 @@ enum JobCommand {
 #[derive(Debug, PartialEq, Eq)]
 enum TaskCommand {
     Background(String),
+    Run {
+        objective: String,
+        scope: Option<String>,
+        max_iterations: Option<u32>,
+        max_tokens: Option<u64>,
+    },
     List,
     Show(String),
     Status(String),
@@ -1898,6 +1918,18 @@ fn parse_agents_command(args: &[String]) -> Result<Command, String> {
     if args.is_empty() {
         return Ok(Command::Agents(TaskCommand::List));
     }
+    if args.first().map(String::as_str) == Some("run") {
+        let objective = value_after(&args[1..], "--objective")?
+            .or_else(|| args.get(1).filter(|value| !value.starts_with('-')).cloned())
+            .ok_or("agents run requires --objective TEXT")?;
+        return Ok(Command::Agents(TaskCommand::Run {
+            objective,
+            scope: value_after(&args[1..], "--scope")?,
+            max_iterations: value_after(&args[1..], "--max-iterations")?
+                .and_then(|v| v.parse().ok()),
+            max_tokens: value_after(&args[1..], "--max-tokens")?.and_then(|v| v.parse().ok()),
+        }));
+    }
     parse_tasks_command(args).map(|command| match command {
         Command::Tasks(task) => Command::Agents(task),
         _ => unreachable!(),
@@ -2402,8 +2434,8 @@ fn interactive_command() -> Result<(), String> {
             }
             if command.starts_with("/tasks ") || command.starts_with("/agents ") {
                 let args = prompt.split_whitespace().skip(1).map(str::to_owned).collect::<Vec<_>>();
-                let parsed = parse_tasks_command(&args);
-                match parsed.and_then(|command| match command { Command::Tasks(task) | Command::Agents(task) => tasks_command(task), _ => unreachable!() }) {
+                let parsed = if command.starts_with("/agents ") { parse_agents_command(&args) } else { parse_tasks_command(&args) };
+                match parsed.and_then(|command| match command { Command::Tasks(task) => tasks_command(task, None), Command::Agents(task) => tasks_command(task, Some("subagent")), _ => unreachable!() }) {
                     Ok(()) => {}, Err(error) => { let _ = events.send(agent_protocol::Event::Error(redact_output(&error))); }
                 }
                 return agent_tui::SubmitAction::Continue;
@@ -3335,6 +3367,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
     let policy = load_runtime_policy(config_path).ok();
     let (branch, dirty_files) = git_state_snapshot(&paths.workspace);
     let mut tasks = Vec::new();
+    let mut agents = Vec::new();
     if let Ok(entries) = fs::read_dir(&paths.jobs_dir) {
         for entry in entries.filter_map(Result::ok) {
             let name = entry.file_name().to_string_lossy().to_string();
@@ -3346,12 +3379,16 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
                     if let Ok(job) = read_job(&paths.workspace, &task.job_id) {
                         task.state = task_state_from_job(&job).into();
                     }
-                    tasks.push(agent_tui::TaskOption {
+                    let option = agent_tui::TaskOption {
                         id: task.id,
                         state: task.state,
                         objective: task.objective,
                         result: task.result,
-                    });
+                    };
+                    if task.kind == "subagent" {
+                        agents.push(option.clone());
+                    }
+                    tasks.push(option);
                 }
             }
         }
@@ -3747,6 +3784,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         skills,
         hooks,
         tasks,
+        agents,
         usage_summary,
         cost_summary: Some("cost unavailable (no explicit pricing configured)".into()),
         context_summary,
@@ -5350,8 +5388,14 @@ struct TaskMeta {
     job_id: String,
     workspace: String,
     objective: String,
+    #[serde(default)]
+    kind: String,
     state: String,
     provider: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    scope: String,
     permission: String,
     max_iterations: u32,
     max_tokens: u64,
@@ -5562,6 +5606,17 @@ fn jobs_command(command: JobCommand) -> Result<(), String> {
 }
 
 fn start_background_task(workspace: &Path, objective: String) -> Result<TaskMeta, String> {
+    start_agent_task(workspace, objective, "background", None, None, None)
+}
+
+fn start_agent_task(
+    workspace: &Path,
+    objective: String,
+    kind: &str,
+    scope: Option<String>,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u64>,
+) -> Result<TaskMeta, String> {
     let workspace = workspace.canonicalize().map_err(|e| e.to_string())?;
     let directory = jobs_dir(&workspace);
     fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
@@ -5589,18 +5644,34 @@ fn start_background_task(workspace: &Path, objective: String) -> Result<TaskMeta
         stderr: format!("{id}.stderr"),
     };
     write_job(&workspace, &job)?;
+    let config = AppPaths::discover(&workspace)
+        .ok()
+        .and_then(|paths| load_user_config(paths.effective_project_config()).ok())
+        .unwrap_or_default();
+    let provider = config.provider.unwrap_or_else(|| "fake".into());
+    let model = config.model.unwrap_or_else(|| "offline-subagent".into());
+    let scope_value = scope
+        .clone()
+        .unwrap_or_else(|| workspace.display().to_string());
+    let configured_budgets = AppPaths::discover(&workspace)
+        .ok()
+        .and_then(|paths| subagent_budgets(paths.effective_project_config()).ok())
+        .unwrap_or_default();
     let task = TaskMeta {
         id: id.clone(),
         job_id: id.clone(),
         workspace: workspace.display().to_string(),
         objective: redact_output(&objective).chars().take(4096).collect(),
+        kind: kind.into(),
         state: "pending".into(),
-        provider: "fake".into(),
+        provider: provider.clone(),
+        model: model.clone(),
+        scope: scope_value.clone(),
         permission: "read-only".into(),
-        max_iterations: 8,
-        max_tokens: 16_000,
-        max_tool_calls: 32,
-        wall_clock_seconds: 120,
+        max_iterations: max_iterations.unwrap_or(configured_budgets.max_iterations),
+        max_tokens: max_tokens.unwrap_or(configured_budgets.max_tokens),
+        max_tool_calls: configured_budgets.max_tool_calls,
+        wall_clock_seconds: configured_budgets.wall_clock.as_secs(),
         result: None,
     };
     write_task(&workspace, &task)?;
@@ -5614,15 +5685,23 @@ fn start_background_task(workspace: &Path, objective: String) -> Result<TaskMeta
         "--",
     ]);
     let child_executable = env::current_exe().map_err(|e| e.to_string())?;
-    supervisor.args([
-        &child_executable.display().to_string(),
-        "subagents",
-        "run",
-        "--objective",
-        &objective,
-        "--provider",
-        "fake",
-    ]);
+    let mut child_args = vec![
+        child_executable.display().to_string(),
+        "subagents".into(),
+        "run".into(),
+        "--objective".into(),
+        objective.clone(),
+    ];
+    if let Some(scope) = scope {
+        child_args.extend(["--scope".into(), scope]);
+    }
+    if let Some(value) = max_iterations {
+        child_args.extend(["--max-iterations".into(), value.to_string()]);
+    }
+    if let Some(value) = max_tokens {
+        child_args.extend(["--max-tokens".into(), value.to_string()]);
+    }
+    supervisor.args(child_args);
     supervisor
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -5652,12 +5731,28 @@ fn ensure_task_workspace(task: &TaskMeta, workspace: &Path) -> Result<(), String
     }
 }
 
-fn tasks_command(command: TaskCommand) -> Result<(), String> {
+fn tasks_command(command: TaskCommand, kind_filter: Option<&str>) -> Result<(), String> {
     let workspace = current_workspace()?;
     fs::create_dir_all(jobs_dir(&workspace)).map_err(|e| e.to_string())?;
     match command {
         TaskCommand::Background(objective) => {
             let task = start_background_task(&workspace, objective)?;
+            println!("{}", task.id);
+        }
+        TaskCommand::Run {
+            objective,
+            scope,
+            max_iterations,
+            max_tokens,
+        } => {
+            let task = start_agent_task(
+                &workspace,
+                objective,
+                "subagent",
+                scope,
+                max_iterations,
+                max_tokens,
+            )?;
             println!("{}", task.id);
         }
         TaskCommand::List => {
@@ -5685,7 +5780,9 @@ fn tasks_command(command: TaskCommand) -> Result<(), String> {
             tasks.sort();
             for id in tasks {
                 let mut task = read_task(&workspace, &id)?;
-                if task.workspace != workspace.display().to_string() {
+                if task.workspace != workspace.display().to_string()
+                    || kind_filter.is_some_and(|kind| task.kind != kind)
+                {
                     continue;
                 }
                 if let Ok(job) = read_job(&workspace, &task.job_id) {
@@ -5697,6 +5794,9 @@ fn tasks_command(command: TaskCommand) -> Result<(), String> {
         TaskCommand::Show(id) | TaskCommand::Status(id) => {
             let mut task = read_task(&workspace, &id)?;
             ensure_task_workspace(&task, &workspace)?;
+            if kind_filter.is_some_and(|kind| task.kind != kind) {
+                return Err("task is not a subagent".into());
+            }
             if let Ok(job) = read_job(&workspace, &task.job_id) {
                 task.state = task_state_from_job(&job).into();
             }
@@ -5708,6 +5808,9 @@ fn tasks_command(command: TaskCommand) -> Result<(), String> {
         TaskCommand::Cancel(id) => {
             let mut task = read_task(&workspace, &id)?;
             ensure_task_workspace(&task, &workspace)?;
+            if kind_filter.is_some_and(|kind| task.kind != kind) {
+                return Err("task is not a subagent".into());
+            }
             cancel_job(&workspace, &task.job_id)?;
             task.state = "cancelling".into();
             write_task(&workspace, &task)?;
@@ -5716,6 +5819,9 @@ fn tasks_command(command: TaskCommand) -> Result<(), String> {
         TaskCommand::Adopt(id) => {
             let mut task = read_task(&workspace, &id)?;
             ensure_task_workspace(&task, &workspace)?;
+            if kind_filter.is_some_and(|kind| task.kind != kind) {
+                return Err("task is not a subagent".into());
+            }
             let job = read_job(&workspace, &task.job_id)?;
             if !matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
                 return Err("task is still running".into());
@@ -7054,6 +7160,7 @@ fn print_command_help(path: &[String]) {
         "jobs start" => ("helios jobs start -- COMMAND ARGS...".into(), "Shell interpolation is not used; secret-like arguments are rejected."),
         "tasks" | "agents" => ("helios tasks bg|list|show|status|cancel|adopt [ID]".into(), "Background tasks are bounded, workspace-scoped, fake/offline by default, and never auto-applied."),
         "tasks bg" | "agents bg" => ("helios tasks bg PROMPT".into(), "Starts a durable isolated task and returns immediately."),
+        "agents run" => ("helios agents run --objective TEXT [--scope PATH] [--max-iterations N] [--max-tokens N]".into(), "Runs a real bounded subagent through the existing Scheduler and configured provider; results remain isolated until explicitly adopted."),
         "tasks show" | "tasks status" | "agents show" | "agents status" => ("helios tasks show|status ID".into(), "Shows bounded task state and budget metadata."),
         "tasks cancel" | "agents cancel" => ("helios tasks cancel ID".into(), "Cancels only the exact owned process group."),
         "tasks adopt" | "agents adopt" => ("helios tasks adopt ID".into(), "Explicitly reads a bounded completed result; it does not mutate the foreground session."),
@@ -8626,7 +8733,11 @@ fn subagents_command(args: &[String], path: &Path, workspace: &Path) -> Result<(
                     context.push(ContextSegment::new(SegmentKind::Memory, Priority::Normal, Stability::Static, format!("[{}] {}", memory.entry.key, memory.entry.content)));
                 }
             }
-            let mut task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_context(context).with_permission(policy.mode).with_budgets(subagent_budgets(path)?);
+            let mut budgets = subagent_budgets(path)?;
+            if let Some(value) = value_after(args, "--max-iterations")?.and_then(|v| v.parse().ok()) { budgets.max_iterations = value; }
+            if let Some(value) = value_after(args, "--max-tokens")?.and_then(|v| v.parse().ok()) { budgets.max_tokens = value; }
+            if let Some(value) = value_after(args, "--max-tool-calls")?.and_then(|v| v.parse().ok()) { budgets.max_tool_calls = value; }
+            let mut task = TaskSpec::new("cli-subagent", objective).with_scope(vec![scope]).with_context(context).with_permission(policy.mode).with_budgets(budgets);
             let cancellation = SubagentCancellation::default();
             let keep_worktree = args.iter().any(|arg| arg == "--keep-worktree");
             let mut manager = None;
@@ -10050,6 +10161,23 @@ mod tests {
         assert_eq!(
             parse_args(vec!["agents".into(), "status".into(), "task-1".into()]).expect("agents"),
             Command::Agents(TaskCommand::Status("task-1".into()))
+        );
+        assert_eq!(
+            parse_args(vec![
+                "agents".into(),
+                "run".into(),
+                "--objective".into(),
+                "inspect".into(),
+                "--scope".into(),
+                "src".into()
+            ])
+            .expect("agent run"),
+            Command::Agents(TaskCommand::Run {
+                objective: "inspect".into(),
+                scope: Some("src".into()),
+                max_iterations: None,
+                max_tokens: None
+            })
         );
         assert!(parse_args(vec!["tasks".into(), "bg".into()]).is_err());
     }

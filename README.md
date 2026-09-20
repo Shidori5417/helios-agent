@@ -133,7 +133,7 @@ Subagents can optionally use manager-owned detached Git worktrees. The manager v
 
 Recoverable tool failures such as patch conflicts are bounded and fed back to the provider as tool error messages. Permission, path-escape, and other fail-closed errors are not retried. Each CLI turn is journaled transactionally as `running`, `complete`, or `failed` with a bounded error message, so resume can safely observe an incomplete/failed turn.
 
-Foreground control remains separate from durable background work. `helios tasks bg PROMPT` starts an isolated, bounded offline subagent through the existing job supervisor; `tasks list|show|status|cancel|adopt` manages its workspace-scoped record and only an explicit `adopt` reads the bounded result. `helios agents` is a read/status alias. Background results are never auto-applied to the foreground session.
+Foreground control remains separate from durable background work. `helios tasks bg PROMPT` starts an isolated, bounded task through the existing job supervisor; it uses the configured provider/model (falling back to deterministic fake when none is configured). `helios agents run --objective TEXT` is the explicit Scheduler-backed subagent path with bounded scope/budgets. `tasks|agents list|show|status|cancel|adopt` manages workspace-scoped records and only an explicit `adopt` reads the bounded result. Results are never auto-applied to the foreground session.
 
 ## Proposed repository layout
 

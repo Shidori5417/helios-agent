@@ -63,6 +63,7 @@ pub struct TuiModel {
     pub skills: Vec<ExtensionOption>,
     pub hooks: Vec<ExtensionOption>,
     pub tasks: Vec<TaskOption>,
+    pub agents: Vec<TaskOption>,
 }
 
 impl Default for TuiModel {
@@ -110,6 +111,7 @@ impl Default for TuiModel {
             skills: Vec::new(),
             hooks: Vec::new(),
             tasks: Vec::new(),
+            agents: Vec::new(),
         }
     }
 }
@@ -732,7 +734,12 @@ impl TuiModel {
                 local: true,
             }]
         } else if matches!(kind, OverlayKind::Tasks | OverlayKind::Agents) {
-            self.tasks
+            let entries = if kind == OverlayKind::Agents {
+                &self.agents
+            } else {
+                &self.tasks
+            };
+            entries
                 .iter()
                 .map(|task| PaletteCommand {
                     name: task.id.clone(),
@@ -1074,6 +1081,7 @@ impl TuiModel {
         self.skills = context.skills;
         self.hooks = context.hooks;
         self.tasks = context.tasks;
+        self.agents = context.agents;
         self.usage_summary = context.usage_summary;
         self.cost_summary = context.cost_summary;
         self.context_summary = context.context_summary;
@@ -1362,6 +1370,7 @@ pub struct TuiContext {
     pub skills: Vec<ExtensionOption>,
     pub hooks: Vec<ExtensionOption>,
     pub tasks: Vec<TaskOption>,
+    pub agents: Vec<TaskOption>,
     pub context_summary: Option<String>,
 }
 
