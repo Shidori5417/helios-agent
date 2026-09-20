@@ -10,6 +10,19 @@ cargo build --release --locked
 ./target/release/helios doctor
 ```
 
+For automation, use the headless command. It shares the normal session,
+provider, tool, permission, and resume paths and never initializes the TUI:
+
+```sh
+helios exec --output-format text "inspect this repository"
+helios exec --output-format json "inspect this repository"
+helios exec --output-format stream-json "inspect this repository"
+```
+
+Machine formats use bounded envelopes with `schema_version`, monotonic
+`sequence`, session/turn identity, and typed payloads. Human diagnostics are
+written to stderr; failures return non-zero.
+
 The preferred user-facing path is CLI-controlled: `self install` performs an
 atomic user-local install without sudo, and `completion install` installs an
 explicit shell completion path. The legacy `install -Dm755` command below is

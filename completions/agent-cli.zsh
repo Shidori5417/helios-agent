@@ -1,7 +1,7 @@
 #compdef helios agent-cli
 _helios() {
   _arguments \
-    '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff)' \
+    '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff)' \
     '--workspace[workspace root]:path:_files' \
     '--provider[provider adapter]:provider:(fake openai anthropic gemini generic openai-compatible)' \
     '--model[model name]:model:' \
@@ -15,6 +15,7 @@ _helios() {
     '--context-file[bounded workspace context file]:path:_files' \
     '--memory-query[bounded workspace memory query]:query:' \
     '--json[JSON output]' \
+    '--output-format[headless output format]:format:(text json stream-json)' \
     '--query[FTS query]:query:' \
     '--allow-network[allow configured MCP network host]' \
     '--file[LSP workspace file]:path:_files' \

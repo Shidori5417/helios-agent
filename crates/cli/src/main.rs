@@ -80,10 +80,18 @@ async fn main() -> ExitCode {
             print_command_help(&path);
             ExitCode::SUCCESS
         }
-        Ok(Command::Run(options)) => match run_command(options) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => fail(error),
-        },
+        Ok(Command::Run(options)) => {
+            let machine = options.output_format != OutputFormat::Text;
+            match run_command(options) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    if machine {
+                        println!("{}", error_envelope(&error));
+                    }
+                    fail(error)
+                }
+            }
+        }
         Ok(Command::Sessions { command, db_path }) => match sessions_command(command, db_path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
@@ -190,6 +198,50 @@ async fn main() -> ExitCode {
 fn fail(error: String) -> ExitCode {
     eprintln!("helios error: {error}");
     ExitCode::from(1)
+}
+
+fn output_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn error_envelope(error: &str) -> String {
+    serde_json::json!({
+        "schema_version": 1,
+        "sequence": 0,
+        "timestamp": output_timestamp(),
+        "session_id": null,
+        "turn_id": null,
+        "kind": "error",
+        "payload": {"status": "failed", "error": redact_output(error)},
+    })
+    .to_string()
+}
+
+fn redact_output(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if [
+        "api_key",
+        "apikey",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return "[REDACTED]".into();
+    }
+    const MAX_OUTPUT: usize = 8 * 1024;
+    if value.len() > MAX_OUTPUT {
+        let prefix = value.chars().take(MAX_OUTPUT).collect::<String>();
+        format!("{prefix}…[truncated]")
+    } else {
+        value.into()
+    }
 }
 
 struct RuntimeExecutor {
@@ -511,6 +563,19 @@ enum Command {
     Completion(CompletionCommand),
     Runtime(RuntimeCommand),
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputFormat {
+    Text,
+    Json,
+    StreamJson,
+}
+
+#[derive(Debug)]
+struct RunOutcome {
+    turn_id: i64,
+    events: Vec<agent_protocol::Event>,
+}
 #[derive(Debug, PartialEq, Eq)]
 enum SessionCommand {
     List,
@@ -801,6 +866,8 @@ struct RunOptions {
     provider_explicit: bool,
     model_explicit: bool,
     base_url_explicit: bool,
+    output_format: OutputFormat,
+    exec: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
@@ -808,19 +875,25 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
     if args.len() == 1 && args[0] == "--version" {
         return Ok(Command::Version);
     }
-    if args.is_empty() || args[0] == "run" {
+    if args.is_empty() || args[0] == "run" || args[0] == "exec" {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
             return Ok(if args.is_empty() {
                 Command::Help
             } else {
-                Command::ContextHelp(vec!["run".into()])
+                Command::ContextHelp(vec![args[0].clone()])
             });
         }
-        return parse_run(if args.first().is_some_and(|arg| arg == "run") {
-            &args[1..]
-        } else {
-            &args
-        });
+        return parse_run(
+            if args
+                .first()
+                .is_some_and(|arg| arg == "run" || arg == "exec")
+            {
+                &args[1..]
+            } else {
+                &args
+            },
+            args.first().is_some_and(|arg| arg == "exec"),
+        );
     }
     if args
         .iter()
@@ -888,7 +961,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         ))),
         "tui" => Ok(Command::Runtime(RuntimeCommand::Tui(args[1..].to_vec()))),
         "status" => Ok(Command::Runtime(RuntimeCommand::Status(args[1..].to_vec()))),
-        _ => parse_run(&args),
+        _ => parse_run(&args, false),
     }
 }
 
@@ -1417,7 +1490,7 @@ fn parse_plugins(args: &[String]) -> Result<Command, String> {
     };
     Ok(Command::Plugins(command))
 }
-fn parse_run(args: &[String]) -> Result<Command, String> {
+fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
     let mut options = RunOptions {
         provider: "fake".into(),
         model: "gpt-5".into(),
@@ -1430,6 +1503,8 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         provider_explicit: false,
         model_explicit: false,
         base_url_explicit: false,
+        output_format: OutputFormat::Text,
+        exec,
     };
     let mut prompt = Vec::new();
     let mut index = 0;
@@ -1453,6 +1528,15 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
             }
             "--resume" => options.resume = Some(required_value(args, &mut index, "--resume")?),
             "--tui" => options.tui = true,
+            "--output-format" => {
+                options.output_format =
+                    match required_value(args, &mut index, "--output-format")?.as_str() {
+                        "text" => OutputFormat::Text,
+                        "json" => OutputFormat::Json,
+                        "stream-json" => OutputFormat::StreamJson,
+                        other => return Err(format!("unknown output format: {other}")),
+                    };
+            }
             "--config" => {
                 options.config = Some(PathBuf::from(required_value(args, &mut index, "--config")?))
             }
@@ -1467,6 +1551,12 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
     } else {
         prompt.join(" ")
     };
+    if !exec && options.output_format != OutputFormat::Text {
+        return Err("--output-format is only available with exec".into());
+    }
+    if exec && options.tui {
+        return Err("exec is headless and cannot initialize the TUI".into());
+    }
     Ok(Command::Run(options))
 }
 fn required_value(args: &[String], index: &mut usize, name: &str) -> Result<String, String> {
@@ -1499,10 +1589,7 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
     if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
         return Err("--tui requires an interactive TTY".into());
     }
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let config_path = options
         .config
         .as_deref()
@@ -1595,6 +1682,16 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         runtime_policy.filter_env(&mut server.env_allowlist);
     }
     let cancellation = CancellationToken::default();
+    if options.exec {
+        let signal_cancellation = cancellation.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    signal_cancellation.cancel();
+                }
+            });
+        }
+    }
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_cancellation(cancellation.clone());
@@ -1646,7 +1743,7 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
                 .map(|_| ())
         });
     }
-    let events = run_selected_provider(
+    let outcome = run_selected_provider(
         &options,
         &mut tools,
         &mut database,
@@ -1656,15 +1753,116 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         startup_memory,
         hooks,
         None,
-        !options.tui,
+        options.exec && options.output_format == OutputFormat::Text,
         cancellation,
     )?;
-    for event in events {
-        if !matches!(event, agent_protocol::Event::ModelDelta(_)) {
-            println!("{event:?}");
+    if options.exec {
+        emit_headless_output(&options, session_id, &outcome);
+    } else {
+        for event in outcome.events {
+            if !matches!(event, agent_protocol::Event::ModelDelta(_)) {
+                println!("{event:?}");
+            }
         }
     }
     Ok(())
+}
+
+fn emit_headless_output(options: &RunOptions, session_id: i64, outcome: &RunOutcome) {
+    let mut sequence = 0_u64;
+    let mut emit = |kind: &str, payload: serde_json::Value| {
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "sequence": sequence,
+            "timestamp": output_timestamp(),
+            "session_id": session_id,
+            "turn_id": outcome.turn_id,
+            "kind": kind,
+            "payload": payload,
+        });
+        if options.output_format == OutputFormat::StreamJson {
+            println!("{}", envelope);
+        }
+        sequence = sequence.saturating_add(1);
+    };
+    let mut result = String::new();
+    let mut tool_calls = 0_u64;
+    let mut errors = Vec::new();
+    let mut usage = serde_json::Map::new();
+    for event in &outcome.events {
+        match event {
+            agent_protocol::Event::ModelDelta(text) => {
+                result.push_str(&redact_output(text));
+                if options.output_format == OutputFormat::StreamJson {
+                    emit(
+                        "model_delta",
+                        serde_json::json!({"text": redact_output(text)}),
+                    );
+                }
+            }
+            agent_protocol::Event::ToolRequested(name) => {
+                tool_calls = tool_calls.saturating_add(1);
+                if options.output_format == OutputFormat::StreamJson {
+                    emit("tool", serde_json::json!({"name": redact_output(name)}));
+                }
+            }
+            agent_protocol::Event::ToolStarted(name)
+            | agent_protocol::Event::ToolCompleted(name) => {
+                if options.output_format == OutputFormat::StreamJson {
+                    emit("tool", serde_json::json!({"name": redact_output(name)}));
+                }
+            }
+            agent_protocol::Event::UsageUpdated(value) => {
+                usage.insert(
+                    "raw".into(),
+                    serde_json::Value::String(redact_output(value)),
+                );
+                if options.output_format == OutputFormat::StreamJson {
+                    emit("usage", serde_json::json!({"value": redact_output(value)}));
+                }
+            }
+            agent_protocol::Event::Error(error) => {
+                errors.push(redact_output(error));
+                if options.output_format == OutputFormat::StreamJson {
+                    emit("error", serde_json::json!({"error": redact_output(error)}));
+                }
+            }
+            _ => {}
+        }
+    }
+    let status = if errors.is_empty() {
+        "complete"
+    } else {
+        "failed"
+    };
+    emit(
+        "result",
+        serde_json::json!({
+            "status": status,
+            "result": result,
+            "usage": usage,
+            "tool_calls": tool_calls,
+            "errors": errors,
+        }),
+    );
+    if options.output_format == OutputFormat::Json {
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "sequence": 0,
+            "timestamp": output_timestamp(),
+            "session_id": session_id,
+            "turn_id": outcome.turn_id,
+            "kind": "result",
+            "payload": {
+                "status": status,
+                "result": result,
+                "usage": usage,
+                "tool_calls": tool_calls,
+                "errors": errors,
+            },
+        });
+        println!("{}", envelope);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1680,7 +1878,7 @@ fn run_selected_provider(
     live_events: Option<SyncSender<agent_protocol::Event>>,
     live_stdout: bool,
     cancellation: CancellationToken,
-) -> Result<Vec<agent_protocol::Event>, String> {
+) -> Result<RunOutcome, String> {
     match options.provider.as_str() {
         "fake" => run_provider(
             FakeProvider,
@@ -1804,14 +2002,9 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
     live_stdout: bool,
     live_events: Option<SyncSender<agent_protocol::Event>>,
     cancellation: CancellationToken,
-) -> Result<Vec<agent_protocol::Event>, String> {
+) -> Result<RunOutcome, String> {
     let previous = messages.len();
-    let memory_scope = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .display()
-        .to_string();
+    let memory_scope = workspace_root()?.display().to_string();
     let mut agent = AgentLoop::new(provider)
         .with_memory_scope(memory_scope)
         .with_memory_retriever(Box::new(StaticMemory(startup_memory)))
@@ -1865,7 +2058,10 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
             return Err(message);
         }
     }.map_err(|error| error.to_string())?;
-    Ok(sink.events)
+    Ok(RunOutcome {
+        turn_id,
+        events: sink.events,
+    })
 }
 
 fn journal_observability(
@@ -3612,13 +3808,14 @@ fn print_help() {
     ] {
         println!("{line}");
     }
-    println!("\nGlobal options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui\nUse `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
+    println!("\nGlobal options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)\nUse `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
 }
 
 fn print_command_help(path: &[String]) {
     let key = path.join(" ");
     let (usage, body) = match key.as_str() {
         "run" => ("helios run [OPTIONS] PROMPT".into(), "Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config."),
+        "exec" => ("helios exec [OPTIONS] PROMPT".into(), "Headless execution; --output-format is text, json, or stream-json. No TUI or alternate screen is initialized."),
         "auth" => ("helios auth status|login|logout PROVIDER [--token-stdin]".into(), "login uses hidden TTY input or explicit non-TTY --token-stdin; token values are never arguments or output."),
         "auth login" => ("helios auth login PROVIDER [--token-stdin]".into(), "Stores the token in the OS keyring; plaintext fallback is refused."),
         "self" => ("helios self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
@@ -5400,6 +5597,44 @@ mod tests {
                 argv: vec!["cargo".into(), "test".into()]
             }
         );
+    }
+
+    #[test]
+    fn exec_parses_headless_output_formats() {
+        let command = parse_args(vec![
+            "exec".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "prompt".into(),
+        ])
+        .expect("exec");
+        assert!(matches!(
+            command,
+            Command::Run(RunOptions {
+                exec: true,
+                output_format: OutputFormat::StreamJson,
+                prompt,
+                ..
+            }) if prompt == "prompt"
+        ));
+        assert!(parse_args(vec![
+            "run".into(),
+            "--output-format".into(),
+            "json".into(),
+            "prompt".into(),
+        ])
+        .is_err());
+        assert!(parse_args(vec!["exec".into(), "--tui".into(), "prompt".into()]).is_err());
+    }
+
+    #[test]
+    fn headless_error_envelope_is_bounded_and_redacted() {
+        let value: serde_json::Value =
+            serde_json::from_str(&error_envelope("authorization token should not leak"))
+                .expect("error envelope");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["kind"], "error");
+        assert_eq!(value["payload"]["error"], "[REDACTED]");
     }
     #[test]
     fn run_parses_resume_and_db() {

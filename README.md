@@ -57,6 +57,18 @@ cargo run -p agent-cli --bin helios -- "inspect this repository"
 cargo run -p agent-cli --bin helios -- --provider openai --model gpt-5 "fix the failing test"
 ```
 
+Headless automation uses the same runtime without initializing the TUI:
+
+```bash
+helios exec --provider fake --output-format text "inspect this repository"
+helios exec --provider fake --output-format json "inspect this repository"
+helios exec --provider fake --output-format stream-json "inspect this repository"
+```
+
+`json` emits one bounded final envelope; `stream-json` emits ordered JSON
+envelopes with a stable schema version and sequence. Diagnostics remain on
+stderr and failed/cancelled executions return a non-zero exit status.
+
 Provider adapters resolve credentials keyring-first through `auth login PROVIDER`, with separate environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `GENERIC_API_KEY`) as an explicit compatibility fallback. Their `*_BASE_URL` variables (or CLI `--base-url`) select a test/local endpoint. Secret values are never put in errors, logs, or model context. Provider profiles expose typed tool-shape, caching, compaction, reasoning, and streaming capabilities while keeping wire formats outside core.
 
 For example: `cargo run -p agent-cli --bin helios -- --provider anthropic --model claude-3-5-sonnet "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.

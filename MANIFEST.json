@@ -9,7 +9,7 @@
   },
   {
     "path": "README.md",
-    "bytes": 13779
+    "bytes": 14680
   },
   {
     "path": ".gitignore",
@@ -157,7 +157,7 @@
   },
   {
     "path": "Cargo.toml",
-    "bytes": 1129
+    "bytes": 1157
   },
   {
     "path": "crates/cli/Cargo.toml",
@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 189568
+    "bytes": 227437
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -257,7 +257,7 @@
   },
   {
     "path": "Cargo.lock",
-    "bytes": 63190
+    "bytes": 63590
   },
   {
     "path": "crates/mcp/Cargo.toml",
@@ -305,19 +305,19 @@
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 1124
+    "bytes": 1230
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 1739
+    "bytes": 2899
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 1440
+    "bytes": 1808
   },
   {
     "path": "docs/INSTALL.md",
-    "bytes": 2202
+    "bytes": 3396
   },
   {
     "path": "examples/plugins/sample/plugin.json",

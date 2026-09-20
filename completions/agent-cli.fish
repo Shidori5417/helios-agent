@@ -1,12 +1,13 @@
 complete -c helios -l provider -r -f -a 'fake openai anthropic gemini generic openai-compatible'
 complete -c helios -l workspace -r -f
-complete -c helios -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
+complete -c helios -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
 complete -c helios -l model -r -f
 complete -c helios -l base-url -r -f
 complete -c helios -l db-path -r -f
 complete -c helios -l resume -r -f
 complete -c helios -l config -r -f
 complete -c helios -l json
+complete -c helios -l output-format -r -f -a 'text json stream-json'
 complete -c helios -l prefix -r -f
 complete -c helios -l name -r -f
 complete -c helios -l output -r -f
@@ -30,7 +31,8 @@ complete -c agent-cli -l worktree
 complete -c agent-cli -l keep-worktree
 complete -c agent-cli -l ref -r -f
 complete -c agent-cli -l json
-complete -c agent-cli -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
+complete -c agent-cli -l output-format -r -f -a 'text json stream-json'
+complete -c agent-cli -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec sessions database audit jobs eval perf self trust registry search context usage memory plugins verify diff'
 complete -c agent-cli -l prefix -r -f
 complete -c agent-cli -l name -r -f
 complete -c agent-cli -l from -r -f
