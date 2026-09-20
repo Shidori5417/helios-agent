@@ -1,5 +1,5 @@
 use agent_storage::Database;
-use rusqlite::{params, OptionalExtension, Result as SqlResult};
+use rusqlite::{params, Result as SqlResult};
 use std::path::Path;
 
 pub const STARTUP_MEMORY_TOKEN_TARGET: usize = 1_000;
@@ -141,18 +141,21 @@ impl MemoryStore for SqliteMemoryStore {
         let max_entries = self.max_entries;
         let scope = entry.scope;
         let kind = entry.kind;
-        let key = entry.key;
+        let key = normalize_key(&entry.key);
         let content = entry.content;
         let confidence = entry.confidence;
         let importance = entry.importance;
         let source_session_id = entry.source_session_id;
         let id = self.database.transactional(|transaction| {
             let count: i64 = transaction.query_row("SELECT COUNT(*) FROM memory WHERE status = 'active'", [], |row| row.get(0))?;
-            let existing: Option<i64> = transaction.query_row("SELECT id FROM memory WHERE scope = ?1 AND kind = ?2 AND key = ?3 AND status = 'active' ORDER BY id DESC LIMIT 1", params![&scope, &kind, &key], |row| row.get(0)).optional()?;
+            let mut candidates = transaction.prepare("SELECT id, key FROM memory WHERE scope = ?1 AND kind = ?2 AND status = 'active' ORDER BY id DESC")?;
+            let existing = candidates.query_map(params![&scope, &kind], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?.into_iter().find(|(_, old_key)| normalize_key(old_key) == key).map(|(id, _)| id);
             if existing.is_none() && count as usize >= max_entries { return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(LimitReached { limit: max_entries }))); }
-            if let Some(old_id) = existing { transaction.execute("UPDATE memory SET status = 'superseded' WHERE id = ?1", params![old_id])?; }
             transaction.execute("INSERT INTO memory(scope, kind, key, content, confidence, importance, source_session_id, created_at, updated_at, last_accessed_at, access_count, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%s','now'), strftime('%s','now'), strftime('%s','now'), 0, 'active')", params![&scope, &kind, &key, &content, confidence, importance, source_session_id])?;
-            Ok(transaction.last_insert_rowid())
+            let new_id = transaction.last_insert_rowid();
+            if let Some(old_id) = existing { transaction.execute("UPDATE memory SET status = 'superseded', superseded_by = ?1, updated_at = strftime('%s','now') WHERE id = ?2", params![new_id, old_id])?; }
+            Ok(new_id)
         }).map_err(|error| match error { rusqlite::Error::ToSqlConversionFailure(source) if source.downcast_ref::<LimitReached>().is_some() => MemoryError::EntryLimit { limit: max_entries }, other => MemoryError::Database(other) })?;
         Ok(id)
     }
@@ -301,6 +304,14 @@ fn is_secret_like(value: &str) -> bool {
     .any(|pattern| value.contains(pattern))
 }
 
+fn normalize_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +403,26 @@ mod tests {
             store.put(invalid),
             Err(MemoryError::InvalidKind(_))
         ));
+    }
+
+    #[test]
+    fn normalized_keys_supersede_and_link_previous_record() {
+        let mut store = SqliteMemoryStore::in_memory(4, 1024).expect("store");
+        let old = store.put(entry("Build System", "cargo")).expect("old");
+        let new = store
+            .put(entry(" build-system! ", "cargo test"))
+            .expect("new");
+        assert_ne!(old, new);
+        assert_eq!(store.list("project", 10).expect("active").len(), 1);
+        let link: i64 = store
+            .database
+            .connection()
+            .query_row(
+                "SELECT superseded_by FROM memory WHERE id = ?1",
+                params![old],
+                |row| row.get(0),
+            )
+            .expect("link");
+        assert_eq!(link, new);
     }
 }

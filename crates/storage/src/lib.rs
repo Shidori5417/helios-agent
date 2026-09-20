@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 8;
+pub const STORAGE_FORMAT_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -69,6 +69,12 @@ pub struct SessionOverride {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionToolOverride {
+    pub enabled: Vec<String>,
+    pub disabled: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,7 +216,14 @@ impl Database {
         if version < 8 {
             self.connection.execute_batch(
                 "CREATE TABLE IF NOT EXISTS pending_memory (id INTEGER PRIMARY KEY, scope TEXT NOT NULL, kind TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, confidence REAL NOT NULL, importance INTEGER NOT NULL, created_at INTEGER NOT NULL);
-                 PRAGMA user_version = 8;",
+                PRAGMA user_version = 8;",
+            )?;
+        }
+        if version < 9 {
+            self.connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN tools_enabled TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE sessions ADD COLUMN tools_disabled TEXT NOT NULL DEFAULT '[]';
+                 PRAGMA user_version = 9;",
             )?;
         }
         Ok(())
@@ -343,6 +356,34 @@ impl Database {
         Ok(self.connection.execute(
             "UPDATE sessions SET provider = COALESCE(?1, provider), model = COALESCE(?2, model), effort = COALESCE(?3, effort), git_branch = COALESCE(?4, git_branch) WHERE id = ?5 AND workspace = ?6 AND archived = 0 AND deleted_at IS NULL",
             params![provider, model, effort, git_branch, id, workspace],
+        )? == 1)
+    }
+
+    pub fn session_tool_override(
+        &self,
+        id: i64,
+        workspace: &str,
+    ) -> SqlResult<Option<SessionToolOverride>> {
+        self.connection.query_row(
+            "SELECT tools_enabled, tools_disabled FROM sessions WHERE id = ?1 AND workspace = ?2 AND archived = 0 AND deleted_at IS NULL",
+            params![id, workspace],
+            |row| {
+                let enabled = serde_json::from_str(&row.get::<_, String>(0)?).unwrap_or_default();
+                let disabled = serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default();
+                Ok(SessionToolOverride { enabled, disabled })
+            },
+        ).optional()
+    }
+
+    pub fn set_session_tool_override(
+        &self,
+        id: i64,
+        workspace: &str,
+        override_: &SessionToolOverride,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET tools_enabled = ?1, tools_disabled = ?2 WHERE id = ?3 AND workspace = ?4 AND archived = 0 AND deleted_at IS NULL",
+            params![serde_json::to_string(&override_.enabled).unwrap_or_else(|_| "[]".into()), serde_json::to_string(&override_.disabled).unwrap_or_else(|_| "[]".into()), id, workspace],
         )? == 1)
     }
 
@@ -722,14 +763,44 @@ impl Database {
     }
 
     pub fn approve_pending_memory(&self, id: i64, scope: &str) -> SqlResult<bool> {
-        let changed = self.connection.execute("INSERT INTO memory(scope, kind, key, content, confidence, importance, created_at, updated_at, last_accessed_at, access_count, status) SELECT scope, kind, key, content, confidence, importance, strftime('%s','now'), strftime('%s','now'), strftime('%s','now'), 0, 'active' FROM pending_memory WHERE id = ?1 AND scope = ?2", params![id, scope])?;
-        if changed == 1 {
-            self.connection.execute(
-                "DELETE FROM pending_memory WHERE id = ?1 AND scope = ?2",
-                params![id, scope],
+        let transaction = self.connection.unchecked_transaction()?;
+        let pending: Option<(String, String, String, String, f64, i64)> = transaction.query_row(
+            "SELECT scope, kind, key, content, confidence, importance FROM pending_memory WHERE id = ?1 AND scope = ?2",
+            params![id, scope],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+        ).optional()?;
+        let Some((scope, kind, key, content, confidence, importance)) = pending else {
+            return Ok(false);
+        };
+        let normalized: String = key
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        let old: Option<i64> = {
+            let mut statement = transaction.prepare(
+                "SELECT id, key FROM memory WHERE scope = ?1 AND kind = ?2 AND status = 'active' ORDER BY id DESC",
             )?;
+            let rows = statement
+                .query_map(params![&scope, &kind], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<SqlResult<Vec<_>>>()?;
+            rows.into_iter()
+                .find(|(_, key)| normalize_memory_key(key) == normalized)
+                .map(|(id, _)| id)
+        };
+        transaction.execute("INSERT INTO memory(scope, kind, key, content, confidence, importance, created_at, updated_at, last_accessed_at, access_count, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s','now'), strftime('%s','now'), strftime('%s','now'), 0, 'active')", params![&scope, &kind, &normalized, &content, confidence, importance])?;
+        let new_id = transaction.last_insert_rowid();
+        if let Some(old_id) = old {
+            transaction.execute("UPDATE memory SET status = 'superseded', superseded_by = ?1, updated_at = strftime('%s','now') WHERE id = ?2", params![new_id, old_id])?;
         }
-        Ok(changed == 1)
+        transaction.execute(
+            "DELETE FROM pending_memory WHERE id = ?1 AND scope = ?2",
+            params![id, scope],
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn reject_pending_memory(&self, id: i64, scope: &str) -> SqlResult<bool> {
@@ -738,6 +809,14 @@ impl Database {
             params![id, scope],
         )? == 1)
     }
+}
+
+fn normalize_memory_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 pub fn bounded_event_payload(payload: &str) -> String {
@@ -845,6 +924,30 @@ mod tests {
         assert_eq!(summaries[0].id, session);
         assert_eq!(summaries[0].turn_count, 1);
         assert_eq!(summaries[0].git_branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn session_tool_override_is_workspace_scoped_and_persistent() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("tools", "/workspace")
+            .expect("session");
+        let override_ = SessionToolOverride {
+            enabled: vec!["shell".into()],
+            disabled: vec!["read".into()],
+        };
+        assert!(db
+            .set_session_tool_override(session, "/workspace", &override_)
+            .expect("write"));
+        assert_eq!(
+            db.session_tool_override(session, "/workspace")
+                .expect("read"),
+            Some(override_)
+        );
+        assert!(db
+            .session_tool_override(session, "/other")
+            .expect("wrong scope")
+            .is_none());
     }
 
     #[test]

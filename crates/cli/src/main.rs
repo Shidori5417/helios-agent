@@ -2141,6 +2141,7 @@ fn interactive_command() -> Result<(), String> {
                 let worker_config = project_config_path.clone();
                 let worker_approval = approval.clone();
                 let worker_cancellation = turn_cancellation.clone();
+                let worker_session = active_session.lock().ok().and_then(|value| *value);
                 std::thread::spawn(move || {
                     let argv = match parse_direct_argv(&input) {
                         Ok(argv) => argv,
@@ -2158,7 +2159,7 @@ fn interactive_command() -> Result<(), String> {
                     let registry = match ToolRegistry::new(&worker_workspace, policy.mode) {
                         Ok(registry) => registry
                             .with_disabled_tools(
-                                effective_disabled_tool_names(&worker_config).unwrap_or_default(),
+                                effective_disabled_tool_names_for_session(&worker_config, worker_session).unwrap_or_default(),
                             )
                             .with_cancellation(worker_cancellation.clone())
                             .with_approval_broker(worker_approval),
@@ -2586,7 +2587,14 @@ fn interactive_command() -> Result<(), String> {
                     Some("enable") | Some("disable") => {
                         let mode = action.split_whitespace().next().unwrap_or_default();
                         let name = parts.next().ok_or_else(|| "tool name required".to_string());
-                        Some(name.and_then(|name| runtime_command(RuntimeCommand::Tools(vec![mode.into(), "--id".into(), name.into()])).map(|_| format!("tool={name} enabled={}", mode == "enable"))).unwrap_or_else(|error| error))
+                        let scope = action.split_whitespace().skip(2).collect::<Vec<_>>().windows(2).find(|pair| pair[0] == "--scope").map(|pair| pair[1]);
+                        let mut args: Vec<String> = vec![mode.into(), "--id".into()];
+                        if let Ok(name) = name.clone() { args.push(name.to_string()); }
+                        if scope == Some("session") {
+                            args.extend(["--scope".into(), "session".into()]);
+                            if let Some(id) = active_session.lock().ok().and_then(|value| *value) { args.extend(["--session".into(), id.to_string()]); }
+                        }
+                        Some(name.and_then(|name| runtime_command(RuntimeCommand::Tools(args)).map(|_| format!("tool={name} enabled={}", mode == "enable"))).unwrap_or_else(|error| error))
                     }
                     Some("info") => {
                         let name = parts.next().unwrap_or_default();
@@ -2802,7 +2810,23 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let disabled = effective_disabled_tool_names(config_path).unwrap_or_default();
+    let active_session = Database::open(&paths.db_path)
+        .ok()
+        .and_then(|db| {
+            db.latest_session(&paths.workspace.display().to_string())
+                .ok()
+                .flatten()
+        })
+        .map(|session| session.id);
+    let session_tool_override = active_session.and_then(|session_id| {
+        Database::open(&paths.db_path).ok().and_then(|db| {
+            db.session_tool_override(session_id, &paths.workspace.display().to_string())
+                .ok()
+                .flatten()
+        })
+    });
+    let disabled =
+        effective_disabled_tool_names_for_session(config_path, active_session).unwrap_or_default();
     let tools = ToolRegistry::new(
         &paths.workspace,
         policy
@@ -2822,8 +2846,16 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
                         name: definition.name,
                         description: definition.description,
                         enabled: !disabled.iter().any(|name| name == &metadata.id),
-                        scope: if disabled.iter().any(|name| name == &metadata.id) {
-                            "project".into()
+                        scope: if session_tool_override.as_ref().is_some_and(|override_| {
+                            override_
+                                .enabled
+                                .iter()
+                                .chain(override_.disabled.iter())
+                                .any(|name| name == &metadata.id)
+                        }) {
+                            "session".into()
+                        } else if disabled.iter().any(|name| name == &metadata.id) {
+                            "project/global".into()
                         } else {
                             "default".into()
                         },
@@ -3315,7 +3347,8 @@ fn run_command_with_cancellation(
             });
         }
     }
-    let disabled_tools = effective_disabled_tool_names(&runtime_config_path)?;
+    let disabled_tools =
+        effective_disabled_tool_names_for_session(&runtime_config_path, Some(session_id))?;
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_disabled_tools(disabled_tools)
@@ -5720,7 +5753,10 @@ fn disabled_tool_names(path: &Path) -> Result<Vec<String>, String> {
         .unwrap_or_default())
 }
 
-fn effective_disabled_tool_names(project: &Path) -> Result<Vec<String>, String> {
+fn effective_disabled_tool_names_for_session(
+    project: &Path,
+    session_id: Option<i64>,
+) -> Result<Vec<String>, String> {
     let paths = app_paths()?;
     let mut disabled = disabled_tool_names(&paths.global_config)?;
     let project_disabled = disabled_tool_names(project)?;
@@ -5729,6 +5765,20 @@ fn effective_disabled_tool_names(project: &Path) -> Result<Vec<String>, String> 
     for name in project_disabled {
         if !disabled.iter().any(|current| current == &name) {
             disabled.push(name);
+        }
+    }
+    if let Some(session_id) = session_id {
+        let db = Database::open(&paths.db_path).map_err(|error| error.to_string())?;
+        if let Some(override_) = db
+            .session_tool_override(session_id, &paths.workspace.display().to_string())
+            .map_err(|error| error.to_string())?
+        {
+            disabled.retain(|name| !override_.enabled.iter().any(|enabled| enabled == name));
+            for name in override_.disabled {
+                if !disabled.iter().any(|current| current == &name) {
+                    disabled.push(name);
+                }
+            }
         }
     }
     disabled.sort();
@@ -6323,14 +6373,30 @@ fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
     let workspace = workspace_root()?;
     let policy = load_runtime_policy(path).unwrap_or_default();
     let registry = ToolRegistry::new(&workspace, policy.mode).map_err(|e| e.to_string())?;
-    let mut document: toml::Value = if path.exists() {
-        toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+    let scope = value_after(&args[1..], "--scope")?.unwrap_or_else(|| "project".into());
+    let session_id = value_after(&args[1..], "--session")?
+        .map(|value| value.parse::<i64>())
+        .transpose()
+        .map_err(|_| "--session expects an integer id")?;
+    if scope == "session" && session_id.is_none() {
+        return Err("session tool scope requires --session ID".into());
+    }
+    if !matches!(scope.as_str(), "global" | "project" | "session") {
+        return Err("tool scope must be global, project, or session".into());
+    }
+    let mutation_path = if scope == "global" {
+        app_paths()?.global_config
+    } else {
+        path.to_path_buf()
+    };
+    let mut document: toml::Value = if mutation_path.exists() {
+        toml::from_str(&fs::read_to_string(&mutation_path).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?
     } else {
         toml::Value::Table(Default::default())
     };
     if action == "list" || action == "info" {
-        let disabled = effective_disabled_tool_names(path)?;
+        let disabled = effective_disabled_tool_names_for_session(path, session_id)?;
         let requested = args.get(1).cloned();
         for definition in registry
             .definitions()
@@ -6351,6 +6417,45 @@ fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
         .ok_or("tools action requires exact tool id")?;
     if registry.metadata(&id).is_none() {
         return Err("unknown tool".into());
+    }
+    if scope == "session" {
+        let paths = app_paths()?;
+        let db = Database::open(&paths.db_path).map_err(|error| error.to_string())?;
+        let mut override_ = db
+            .session_tool_override(
+                session_id.expect("validated"),
+                &workspace.display().to_string(),
+            )
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        match action {
+            "enable" => {
+                override_.disabled.retain(|name| name != &id);
+                if !override_.enabled.iter().any(|name| name == &id) {
+                    override_.enabled.push(id);
+                }
+            }
+            "disable" => {
+                override_.enabled.retain(|name| name != &id);
+                if !override_.disabled.iter().any(|name| name == &id) {
+                    override_.disabled.push(id);
+                }
+            }
+            _ => return Err(format!("unsupported tools action: {action}")),
+        }
+        override_.enabled.sort();
+        override_.disabled.sort();
+        if !db
+            .set_session_tool_override(
+                session_id.expect("validated"),
+                &workspace.display().to_string(),
+                &override_,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err("session not found in workspace".into());
+        }
+        return Ok(());
     }
     let table = document
         .as_table_mut()
@@ -6394,7 +6499,7 @@ fn tools_config_command(args: &[String], path: &Path) -> Result<(), String> {
         _ => unreachable!(),
     }
     atomic_write(
-        path,
+        &mutation_path,
         toml::to_string_pretty(&document)
             .map_err(|e| e.to_string())?
             .as_bytes(),
