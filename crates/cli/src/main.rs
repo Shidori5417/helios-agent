@@ -2083,6 +2083,13 @@ fn interactive_command() -> Result<(), String> {
                 exec: false,
                 event_sender: Some(events.clone()),
             };
+            let options = match resolve_runtime_options(options) {
+                Ok((options, _policy, _workspace)) => options,
+                Err(error) => {
+                    let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
+                    return false;
+                }
+            };
             std::thread::spawn(move || {
                 if let Err(error) = run_command_with_cancellation(options, turn_cancellation) {
                     let _ = events.send(agent_protocol::Event::Error(redact_output(&error)));
@@ -2188,13 +2195,13 @@ fn run_command(options: RunOptions) -> Result<(), String> {
     run_command_with_cancellation(options, CancellationToken::default())
 }
 
-fn run_command_with_cancellation(
+/// Resolve the provider-facing runtime settings once for every entry point.
+/// Keeping this ahead of the interactive and headless paths makes the
+/// precedence contract identical: project/global config, environment, then
+/// explicit CLI/session values, with fake as the offline default.
+fn resolve_runtime_options(
     mut options: RunOptions,
-    cancellation: CancellationToken,
-) -> Result<(), String> {
-    if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
-        return Err("--tui requires an interactive TTY".into());
-    }
+) -> Result<(RunOptions, RuntimePolicy, PathBuf), String> {
     let workspace = workspace_root()?;
     let config_path = options
         .config
@@ -2205,7 +2212,6 @@ fn run_command_with_cancellation(
     let configured = load_user_config(&config_path)?;
     let runtime_config_path = effective_config_path(&config_path)?;
     let runtime_policy = load_runtime_policy(&runtime_config_path)?;
-    let permission_mode = runtime_policy.mode;
     if !options.provider_explicit {
         if let Some(provider) = configured.provider {
             options.provider = provider;
@@ -2219,6 +2225,25 @@ fn run_command_with_cancellation(
     if !options.base_url_explicit {
         options.base_url = configured.base_url;
     }
+    Ok((options, runtime_policy, workspace))
+}
+
+fn run_command_with_cancellation(
+    options: RunOptions,
+    cancellation: CancellationToken,
+) -> Result<(), String> {
+    if options.tui && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()) {
+        return Err("--tui requires an interactive TTY".into());
+    }
+    let (options, runtime_policy, workspace) = resolve_runtime_options(options)?;
+    let permission_mode = runtime_policy.mode;
+    let config_path = options
+        .config
+        .as_deref()
+        .map(|path| resolve_workspace_file(path, &workspace))
+        .transpose()?
+        .unwrap_or_else(|| workspace.join(".helios/config.toml"));
+    let runtime_config_path = effective_config_path(&config_path)?;
     let mut database = open_database(&options.db_path)?;
     let workspace_id = workspace.display().to_string();
     let (session_id, objective, messages) = if let Some(selector) = options.resume.as_deref() {
@@ -6304,6 +6329,46 @@ mod tests {
             command,
             Command::Run(RunOptions { config: Some(path), .. }) if path == std::path::Path::new(".agent/config.toml")
         ));
+    }
+
+    #[test]
+    fn interactive_runtime_uses_project_provider_configuration() {
+        let root = std::env::temp_dir().join(format!(
+            "helios-interactive-runtime-{}-{}",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION")
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".helios")).expect("workspace");
+        fs::write(
+            root.join(".helios/config.toml"),
+            "provider = 'generic'\nmodel = 'configured-model'\nbase_url = 'http://127.0.0.1:4310'\n",
+        )
+        .expect("config");
+        WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
+        let options = RunOptions {
+            provider: "fake".into(),
+            model: "gpt-5".into(),
+            base_url: None,
+            prompt: "hello".into(),
+            db_path: root.join("state.db"),
+            resume: None,
+            tui: false,
+            config: None,
+            provider_explicit: false,
+            model_explicit: false,
+            base_url_explicit: false,
+            output_format: OutputFormat::Text,
+            exec: false,
+            event_sender: None,
+        };
+        let (resolved, _policy, workspace) = resolve_runtime_options(options).expect("resolve");
+        assert_eq!(workspace, root.canonicalize().expect("canonical workspace"));
+        assert_eq!(resolved.provider, "generic");
+        assert_eq!(resolved.model, "configured-model");
+        assert_eq!(resolved.base_url.as_deref(), Some("http://127.0.0.1:4310"));
+        WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
