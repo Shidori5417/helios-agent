@@ -2066,6 +2066,7 @@ fn interactive_command() -> Result<(), String> {
     let session_model = Arc::new(Mutex::new(None::<String>));
     let session_provider = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
+    let project_config_path = paths.effective_project_config().to_path_buf();
     let db_path = paths.db_path;
     let workspace_path = paths.workspace.clone();
     agent_tui::run_interactive_with_context(
@@ -2133,6 +2134,20 @@ fn interactive_command() -> Result<(), String> {
                         }
                     }
                     Some(format!("session model={model}"))
+                }
+            } else if let Some(theme) = command.strip_prefix("/theme ") {
+                if matches!(theme, "dark" | "light" | "system" | "monochrome") {
+                    let result = tui_config_command(
+                        &["set".into(), "--theme".into(), theme.into()],
+                        &project_config_path,
+                    );
+                    Some(
+                        result
+                            .map(|_| format!("theme={theme}"))
+                            .unwrap_or_else(|error| error),
+                    )
+                } else {
+                    Some("theme must be dark, light, system, or monochrome".into())
                 }
             } else if command.starts_with('!') {
                 Some(direct_command_output(prompt.trim(), &turn_cancellation))
@@ -2275,6 +2290,10 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         .into_iter()
         .map(session_option)
         .collect();
+    let diff = ToolRegistry::new(&paths.workspace, PermissionMode::ReadOnly)
+        .ok()
+        .and_then(|registry| registry.git_diff().ok())
+        .map(|result| result.data);
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -2290,6 +2309,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         palette,
         models,
         sessions,
+        diff,
         ..agent_tui::TuiContext::default()
     }
 }
@@ -5594,6 +5614,12 @@ fn tui_config_command(args: &[String], path: &Path) -> Result<(), String> {
         }
         tui.insert("color".into(), toml::Value::String(color));
     }
+    if let Some(theme) = value_after(args, "--theme")? {
+        if !matches!(theme.as_str(), "dark" | "light" | "system" | "monochrome") {
+            return Err("--theme must be dark, light, system, or monochrome".into());
+        }
+        tui.insert("theme".into(), toml::Value::String(theme));
+    }
     atomic_write(
         path,
         toml::to_string_pretty(&document)
@@ -5632,6 +5658,12 @@ fn load_tui_settings(path: &Path) -> Result<agent_tui::TuiSettings, String> {
         Some("always") => agent_tui::TuiColor::Always,
         Some("never") => agent_tui::TuiColor::Never,
         _ => agent_tui::TuiColor::Auto,
+    };
+    settings.theme = match table.get("theme").and_then(toml::Value::as_str) {
+        Some("dark") => agent_tui::TuiTheme::Dark,
+        Some("light") => agent_tui::TuiTheme::Light,
+        Some("monochrome") => agent_tui::TuiTheme::Monochrome,
+        _ => agent_tui::TuiTheme::System,
     };
     Ok(settings)
 }

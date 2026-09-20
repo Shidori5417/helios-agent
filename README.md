@@ -109,6 +109,8 @@ The explicit `--tui` run path remains non-interactive outside a TTY and restores
 
 Running bare `helios` in a TTY now opens the interactive Helios session with an editable composer, history, slash commands, bounded streaming events, and fake-provider turns persisted to the normal session database. `/help`, `/commands`, `/status`, `/context`, `/permissions`, `/sessions`, `/diff`, `/version`, and `/exit` are local commands; non-TTY automation should use `helios exec`.
 
+The interactive renderer also provides bounded permission prompts (A/S/D, with Esc fail-closed), a read-only diff overlay, lifecycle tool cards, safe plain-markdown presentation, and Dark/Light/System/Monochrome rendering. Theme and TUI bounds are stored through `tui set`; `NO_COLOR` and monochrome mode disable decorative colour. Large tool/diff content is truncated or referenced rather than retained in the screen model.
+
 The CLI control plane includes `init`, typed atomic `config`, OS-keyring-backed `auth`, `doctor`, and shell `completion` commands. Secret status exposes source only; login never accepts secret arguments or falls back to plaintext when Secret Service/keyring storage is unavailable. See `docs/CLI_CONTROL_PLANE.md`.
 
 Runtime extensions are also controlled through typed `providers`, `permissions`, `mcp`, `lsp`, `hooks`, `skills`, `subagents`, and `status` commands. Hooks, skills, and subagents use their real runtime boundaries; MCP/LSP test commands perform bounded configured handshakes and require explicit network policy for HTTP.

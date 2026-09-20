@@ -47,6 +47,10 @@ pub struct TuiModel {
     pub models: Vec<ModelOption>,
     pub sessions: Vec<SessionOption>,
     pub overlay: Option<OverlayState>,
+    pub theme: TuiTheme,
+    pub diff: Option<String>,
+    pub permission_request: Option<PermissionPrompt>,
+    pub tool_cards: Vec<ToolCard>,
 }
 
 impl Default for TuiModel {
@@ -78,6 +82,10 @@ impl Default for TuiModel {
             models: Vec::new(),
             sessions: Vec::new(),
             overlay: None,
+            theme: TuiTheme::System,
+            diff: None,
+            permission_request: None,
+            tool_cards: Vec::new(),
         }
     }
 }
@@ -122,6 +130,10 @@ pub enum OverlayKind {
     Sessions,
     Context,
     Status,
+    Permission,
+    Diff,
+    Theme,
+    Keybindings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,6 +151,108 @@ pub enum OverlayAction {
     Open(OverlayKind),
     Execute(String),
     Fill(String),
+    Permission(PermissionDecision),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionPrompt {
+    pub action: String,
+    pub risk: String,
+    pub class: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCard {
+    pub name: String,
+    pub status: String,
+    pub summary: String,
+    pub output: String,
+    pub expanded: bool,
+}
+
+fn parse_permission_prompt(value: &str) -> PermissionPrompt {
+    let bounded = value.chars().take(512).collect::<String>();
+    let (class, action) = bounded
+        .split_once(':')
+        .map(|(class, action)| (class.trim(), action.trim()))
+        .unwrap_or(("unknown", bounded.as_str()));
+    let risk = if class.eq_ignore_ascii_case("read-only") || class.eq_ignore_ascii_case("readonly")
+    {
+        "low"
+    } else if class.eq_ignore_ascii_case("workspace-write")
+        || class.eq_ignore_ascii_case("workspacewrite")
+    {
+        "medium"
+    } else {
+        "high"
+    };
+    PermissionPrompt {
+        action: action.to_owned(),
+        risk: risk.into(),
+        class: class.to_owned(),
+    }
+}
+
+fn bounded_diff_text(diff: &str, query: &str) -> String {
+    let mut lines = diff.lines().map(str::to_owned).collect::<Vec<_>>();
+    if !query.is_empty() {
+        let needle = query.to_ascii_lowercase();
+        lines.retain(|line| line.to_ascii_lowercase().contains(&needle));
+    }
+    let mut output = String::new();
+    for line in lines.into_iter().take(2_000) {
+        let marker = if line.starts_with('+') && !line.starts_with("+++") {
+            "+"
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            "-"
+        } else {
+            " "
+        };
+        output.push_str(marker);
+        output.push_str(line.get(1..).unwrap_or(&line));
+        output.push('\n');
+    }
+    if output.is_empty() {
+        "(no diff lines)".into()
+    } else {
+        output.chars().take(128 * 1024).collect()
+    }
+}
+
+/// Safe, dependency-free markdown presentation for the terminal. It intentionally
+/// keeps URLs visible; OSC8 is handled only by a capability-aware renderer.
+pub fn markdown_plain(input: &str) -> String {
+    input
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") {
+                "▌".to_owned()
+            } else if trimmed.starts_with('#') {
+                trimmed.trim_start_matches('#').trim().to_uppercase()
+            } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+                format!("• {}", trimmed[2..].replace('`', ""))
+            } else {
+                line.replace("**", "").replace('`', "")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuiTheme {
+    Dark,
+    Light,
+    System,
+    Monochrome,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +407,27 @@ impl Composer {
 }
 
 impl TuiModel {
+    pub fn set_diff(&mut self, diff: impl Into<String>) {
+        self.diff = Some(diff.into().chars().take(128 * 1024).collect());
+    }
+
+    pub fn open_permission(&mut self, prompt: PermissionPrompt) {
+        self.permission_request = Some(prompt);
+        self.overlay = Some(OverlayState {
+            kind: OverlayKind::Permission,
+            query: String::new(),
+            selected: 0,
+            commands: Vec::new(),
+        });
+    }
+
+    pub fn set_theme(&mut self, theme: TuiTheme) {
+        self.theme = theme;
+    }
+
+    pub fn permission_decision(&self) -> Option<&PermissionPrompt> {
+        self.permission_request.as_ref()
+    }
     pub fn set_palette(&mut self, commands: Vec<PaletteCommand>) {
         self.palette = commands.clone();
         self.overlay = Some(OverlayState {
@@ -384,7 +519,31 @@ impl TuiModel {
             OverlayKind::Sessions => "Sessions",
             OverlayKind::Context => "Context",
             OverlayKind::Status => "Status",
+            OverlayKind::Permission => "Permission request",
+            OverlayKind::Diff => "Diff (read-only)",
+            OverlayKind::Theme => "Theme",
+            OverlayKind::Keybindings => "Keybindings",
         };
+        if overlay.kind == OverlayKind::Permission {
+            if let Some(request) = &self.permission_request {
+                return format!(
+                    "Permission request\n{}\nrisk: {} · class: {}\n[A] allow once  [S] allow session  [D]/Esc deny",
+                    request.action, request.risk, request.class
+                );
+            }
+        }
+        if overlay.kind == OverlayKind::Diff {
+            return bounded_diff_text(self.diff.as_deref().unwrap_or(""), overlay.query.as_str());
+        }
+        if overlay.kind == OverlayKind::Theme {
+            return format!(
+                "Theme (current: {:?})\n> dark\n  light\n  system\n  monochrome\n\nEnter selects · Esc closes",
+                self.theme
+            );
+        }
+        if overlay.kind == OverlayKind::Keybindings {
+            return "Keybindings\nEnter submit · Alt+Enter newline · Ctrl-C cancel\nEsc close · PageUp/PageDown scroll · Ctrl-L redraw".into();
+        }
         let mut lines = vec![format!("{title}  /{}  (Esc close)", overlay.query)];
         let commands = self.filtered_palette();
         for (index, command) in commands.iter().enumerate() {
@@ -406,7 +565,39 @@ impl TuiModel {
         };
         if key.code == KeyCode::Esc {
             self.overlay = None;
+            if self.permission_request.is_some() {
+                self.permission_request = None;
+                return OverlayAction::Permission(PermissionDecision::Deny);
+            }
             return OverlayAction::Close;
+        }
+        if overlay.kind == OverlayKind::Permission {
+            let decision = match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => Some(PermissionDecision::AllowOnce),
+                KeyCode::Char('s') | KeyCode::Char('S') => Some(PermissionDecision::AllowSession),
+                KeyCode::Char('d') | KeyCode::Char('D') => Some(PermissionDecision::Deny),
+                _ => None,
+            };
+            if let Some(decision) = decision {
+                self.permission_request = None;
+                self.overlay = None;
+                return OverlayAction::Permission(decision);
+            }
+            return OverlayAction::None;
+        }
+        if overlay.kind == OverlayKind::Theme {
+            let theme = match key.code {
+                KeyCode::Char('1') => Some(TuiTheme::Dark),
+                KeyCode::Char('2') => Some(TuiTheme::Light),
+                KeyCode::Char('3') => Some(TuiTheme::System),
+                KeyCode::Char('4') => Some(TuiTheme::Monochrome),
+                _ => None,
+            };
+            if let Some(theme) = theme {
+                self.theme = theme;
+                self.overlay = None;
+                return OverlayAction::Close;
+            }
         }
         match key.code {
             KeyCode::Up => {
@@ -476,6 +667,8 @@ impl TuiModel {
                     };
                 }
             }
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.scroll_step.max(1)),
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_add(self.scroll_step.max(1)),
             _ => {}
         }
         OverlayAction::None
@@ -492,6 +685,10 @@ impl TuiModel {
         self.palette = context.palette;
         self.models = context.models;
         self.sessions = context.sessions;
+        self.diff = context.diff.clone();
+        if let Some(diff) = context.diff {
+            self.set_diff(diff);
+        }
     }
 
     pub fn push_item(&mut self, item: TranscriptItem) {
@@ -554,12 +751,32 @@ impl TuiModel {
             Event::ReasoningSummaryDelta(text) => {
                 self.push_item(TranscriptItem::Activity(format!("reasoning: {text}")))
             }
-            Event::ToolRequested(name) | Event::ToolStarted(name) => self.tool = Some(name.clone()),
+            Event::ToolRequested(name) | Event::ToolStarted(name) => {
+                self.tool = Some(name.clone());
+                self.tool_cards.push(ToolCard {
+                    name: name.clone(),
+                    status: "running".into(),
+                    summary: "tool execution".into(),
+                    output: String::new(),
+                    expanded: false,
+                });
+                if self.tool_cards.len() > 64 {
+                    self.tool_cards.remove(0);
+                }
+            }
             Event::ToolOutputDelta(text) => {
                 self.append_tool_delta(text);
+                if let Some(card) = self.tool_cards.last_mut() {
+                    let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(card.output.len());
+                    card.output.extend(text.chars().take(remaining));
+                    card.summary = card.output.chars().take(120).collect();
+                }
             }
             Event::ToolCompleted(status) => {
                 self.status = format!("tool: {status}");
+                if let Some(card) = self.tool_cards.last_mut() {
+                    card.status = status.chars().take(160).collect();
+                }
                 self.tool = None;
             }
             Event::PatchProduced(path) => self.push_item(TranscriptItem::FileChange(path.clone())),
@@ -569,7 +786,10 @@ impl TuiModel {
             Event::VerificationResult(result) => {
                 self.verification = Some(format!("result: {result}"))
             }
-            Event::PermissionRequested(request) => self.permission = Some(request.clone()),
+            Event::PermissionRequested(request) => {
+                self.permission = Some(request.clone());
+                self.open_permission(parse_permission_prompt(request));
+            }
             Event::ContextCompacted(summary) => self.context = Some(summary.clone()),
             Event::UsageUpdated(usage) => {
                 self.push_item(TranscriptItem::Activity(format!("usage: {usage}")))
@@ -599,7 +819,10 @@ impl TuiModel {
     }
     pub fn as_text(&self) -> String {
         let mut lines = vec![format!("status: {}", self.status)];
-        lines.extend(self.transcript.iter().map(TranscriptItem::render));
+        lines.extend(self.transcript.iter().map(|item| match item {
+            TranscriptItem::Assistant(text) => format!("assistant: {}", markdown_plain(text)),
+            _ => item.render(),
+        }));
         if let Some(tool) = &self.tool {
             lines.push(format!("tool: {tool}"));
         }
@@ -611,6 +834,15 @@ impl TuiModel {
         }
         if let Some(context) = &self.context {
             lines.push(format!("context: {context}"));
+        }
+        if let Some(prompt) = &self.permission_request {
+            lines.push(format!(
+                "permission pending: {} ({})",
+                prompt.action, prompt.risk
+            ));
+        }
+        if let Some(card) = self.tool_cards.last() {
+            lines.push(format!("tool card: {} [{}]", card.name, card.status));
         }
         let start = self.scroll.min(lines.len().saturating_sub(1));
         let limit = if self.viewport_height == 0 {
@@ -654,6 +886,7 @@ pub struct TuiSettings {
     pub scroll_step: usize,
     pub color: TuiColor,
     pub alternate_screen: bool,
+    pub theme: TuiTheme,
 }
 
 impl Default for TuiSettings {
@@ -664,6 +897,7 @@ impl Default for TuiSettings {
             scroll_step: 1,
             color: TuiColor::Auto,
             alternate_screen: true,
+            theme: TuiTheme::System,
         }
     }
 }
@@ -699,6 +933,7 @@ pub struct TuiContext {
     pub palette: Vec<PaletteCommand>,
     pub models: Vec<ModelOption>,
     pub sessions: Vec<SessionOption>,
+    pub diff: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -783,7 +1018,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
             Constraint::Length(1),
         ])
         .split(area);
-    let border_style = if color_enabled(settings) {
+    let border_style = if color_enabled(settings) && model.theme != TuiTheme::Monochrome {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default()
@@ -895,6 +1130,7 @@ pub fn run_channel_with_settings(
     let mut model = TuiModel {
         viewport_height: 24,
         scroll_step: settings.scroll_step.max(1),
+        theme: settings.theme,
         ..TuiModel::default()
     };
     let tick = Duration::from_millis(settings.tick_ms.clamp(10, 1000));
@@ -999,6 +1235,7 @@ where
     let mut model = TuiModel {
         viewport_height: 20,
         scroll_step: settings.scroll_step.max(1),
+        theme: settings.theme,
         ..TuiModel::default()
     };
     model.set_runtime_context(context);
@@ -1039,6 +1276,21 @@ where
                         }
                         match overlay_action {
                             OverlayAction::Execute(command) => {
+                                if command == "/diff" {
+                                    model.open_overlay(OverlayKind::Diff);
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                if command == "/theme" {
+                                    model.open_overlay(OverlayKind::Theme);
+                                    needs_draw = true;
+                                    continue;
+                                }
+                                if command == "/keybindings" {
+                                    model.open_overlay(OverlayKind::Keybindings);
+                                    needs_draw = true;
+                                    continue;
+                                }
                                 let turn_cancellation =
                                     agent_terminal::CancellationToken::default();
                                 active_cancellation = Some(turn_cancellation.clone());
@@ -1050,6 +1302,13 @@ where
                             OverlayAction::Fill(text) => {
                                 model.composer.text = text;
                                 model.composer.cursor = model.composer.text.len();
+                            }
+                            OverlayAction::Permission(decision) => {
+                                if decision == PermissionDecision::Deny {
+                                    if let Some(turn) = &active_cancellation {
+                                        turn.cancel();
+                                    }
+                                }
                             }
                             OverlayAction::Open(_) | OverlayAction::Close | OverlayAction::None => {
                             }
@@ -1099,6 +1358,18 @@ where
                     match model.composer.handle_key(key) {
                         ComposerAction::Submit(prompt) => {
                             needs_draw = true;
+                            if prompt.trim() == "/diff" {
+                                model.open_overlay(OverlayKind::Diff);
+                                continue;
+                            }
+                            if prompt.trim() == "/theme" {
+                                model.open_overlay(OverlayKind::Theme);
+                                continue;
+                            }
+                            if prompt.trim() == "/keybindings" {
+                                model.open_overlay(OverlayKind::Keybindings);
+                                continue;
+                            }
                             model.history.push(prompt.clone());
                             model.history_index = None;
                             model.active_turn = true;
@@ -1382,5 +1653,37 @@ mod tests {
             model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             OverlayAction::Execute("/session-resume 7".into())
         );
+    }
+
+    #[test]
+    fn permission_modal_is_bounded_and_fail_closed_on_escape() {
+        let mut model = TuiModel::default();
+        model.reduce(&Event::PermissionRequested(
+            "WorkspaceWrite: apply_patch secret.txt".into(),
+        ));
+        assert!(model.overlay.is_some());
+        assert!(model.overlay_text().contains("risk: medium"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            OverlayAction::Permission(PermissionDecision::Deny)
+        );
+        assert!(model.permission_decision().is_none());
+    }
+
+    #[test]
+    fn diff_theme_markdown_and_tool_card_are_deterministic() {
+        let mut model = TuiModel::default();
+        model.set_diff("@@ -1 +1 @@\n-old\n+new");
+        model.open_overlay(OverlayKind::Diff);
+        assert!(model.overlay_text().contains("+new"));
+        model.open_overlay(OverlayKind::Theme);
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE));
+        assert_eq!(model.theme, TuiTheme::Monochrome);
+        model.reduce(&Event::ToolStarted("shell".into()));
+        model.reduce(&Event::ToolOutputDelta("bounded output".into()));
+        model.reduce(&Event::ToolCompleted("ok".into()));
+        assert_eq!(model.tool_cards[0].status, "ok");
+        assert_eq!(model.tool_cards[0].output, "bounded output");
+        assert_eq!(markdown_plain("# title\n- `code`"), "TITLE\n• code");
     }
 }
