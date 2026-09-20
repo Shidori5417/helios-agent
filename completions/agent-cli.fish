@@ -16,6 +16,8 @@ complete -c agent-cli -l compat-agent-cli
 complete -c agent-cli -l public-key-file -r -f
 complete -c agent-cli -l registry-id -r -f
 complete -c agent-cli -l source -r -f
+complete -c agent-cli -l allow-network
+complete -c agent-cli -l file -r -f
 complete -c agent-cli -l force
 complete -c agent-cli -l token-stdin
 complete -c agent-cli -l registry -r -f

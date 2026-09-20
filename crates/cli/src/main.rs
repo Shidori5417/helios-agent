@@ -3809,6 +3809,9 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     let action = args.first().map(String::as_str).unwrap_or("list");
     let path = config_path()?;
     if section == "mcp" || section == "lsp" {
+        if action == "test" {
+            return configured_server_test(section, &args, &path);
+        }
         return runtime_server_array_command(section, &args, &path);
     }
     if section == "permissions" {
@@ -3928,6 +3931,118 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     }
     let bytes = toml::to_string_pretty(&document).map_err(|e| e.to_string())?;
     atomic_write(&path, bytes.as_bytes())
+}
+
+fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result<(), String> {
+    let id = value_after(&args[1..], "--id")?
+        .or_else(|| args.get(1).cloned())
+        .ok_or("test requires exact --id")?;
+    let timeout_ms = value_after(&args[1..], "--timeout")?
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| "--timeout must be milliseconds".to_string())
+        })
+        .transpose()?
+        .unwrap_or(10_000)
+        .clamp(1, 60_000);
+    let workspace = workspace_root()?;
+    if section == "mcp" {
+        let mut server = load_mcp_config(path, &workspace)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|server| server.config.name == id)
+            .ok_or("MCP server not found")?;
+        server.config.startup_timeout = Duration::from_millis(timeout_ms);
+        server.config.tool_timeout = Duration::from_millis(timeout_ms);
+        let allow_network = args.iter().any(|arg| arg == "--allow-network");
+        if let agent_mcp::McpTransport::StreamableHttp { ref url, .. } = server.config.transport {
+            let host = reqwest::Url::parse(url)
+                .map_err(|error| error.to_string())?
+                .host_str()
+                .ok_or("MCP URL has no host")?
+                .to_string();
+            let normalized_host = normalize_host(&host).map_err(|error| error.to_string())?;
+            if !allow_network {
+                return Err("HTTP MCP test requires explicit --allow-network".into());
+            }
+            if !server
+                .allowed_hosts
+                .iter()
+                .any(|allowed| allowed == &normalized_host)
+            {
+                return Err("HTTP MCP host is not in configured allowed_hosts".into());
+            }
+        } else if allow_network {
+            return Err("--allow-network is only valid for HTTP MCP".into());
+        }
+        let engine = PermissionEngine::new(&workspace, PermissionMode::ReadOnly)
+            .map_err(|error| error.to_string())?;
+        let policy = HostAllowlist {
+            inner: PermissionPolicy::new(engine),
+            allowed_hosts: if allow_network {
+                server.allowed_hosts.clone()
+            } else {
+                Vec::new()
+            },
+        };
+        let cancellation = CancellationToken::default();
+        let mut client = McpClient::new(server.config, policy, 64 * 1024);
+        client
+            .initialize(&cancellation)
+            .map_err(|error| error.to_string())?;
+        let tools = client
+            .discover_tools(&cancellation)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "mcp={} tools={}",
+            id,
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .take(128)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        return Ok(());
+    }
+    let mut server = load_lsp_config(path, &workspace)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|server| server.name == id)
+        .ok_or("LSP server not found")?;
+    server.timeout_ms = timeout_ms;
+    let engine = PermissionEngine::new(&workspace, PermissionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let mut client = LspClient::new(
+        StdioTransport::spawn(&server, &workspace).map_err(|error| error.to_string())?,
+        Duration::from_millis(timeout_ms),
+    );
+    client
+        .initialize(&workspace)
+        .map_err(|error| error.to_string())?;
+    if let Some(file) = value_after(&args[1..], "--file")? {
+        let path = engine
+            .resolve_path(workspace.join(&file))
+            .map_err(|error| error.to_string())?;
+        let text = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+        if text.len() > 1024 * 1024 {
+            return Err("LSP test file exceeds 1 MiB bound".into());
+        }
+        let uri = format!("file://{}", path.display());
+        client
+            .did_open(&uri, &server.language, &text)
+            .map_err(|error| error.to_string())?;
+        let result = client.symbols(&uri).map_err(|error| error.to_string())?;
+        println!(
+            "lsp={} symbols={}",
+            id,
+            serde_json::to_string(&result).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("lsp={} initialized", id);
+    }
+    client.shutdown().map_err(|error| error.to_string())
 }
 
 fn runtime_permissions_command(args: &[String], path: &Path) -> Result<(), String> {

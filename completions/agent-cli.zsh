@@ -13,6 +13,8 @@ _agent_cli() {
     '--session[session id or latest]:selector:' \
     '--json[JSON output]' \
     '--query[FTS query]:query:' \
+    '--allow-network[allow configured MCP network host]' \
+    '--file[LSP workspace file]:path:_files' \
     '*:prompt:_message'
 }
 _agent_cli "$@"

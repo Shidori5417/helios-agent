@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 167709
+    "bytes": 172330
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -305,15 +305,15 @@
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 934
+    "bytes": 957
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 1103
+    "bytes": 1178
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 881
+    "bytes": 987
   },
   {
     "path": "docs/INSTALL.md",
@@ -405,7 +405,7 @@
   },
   {
     "path": "docs/CLI_CONTROL_PLANE.md",
-    "bytes": 3684
+    "bytes": 4075
   },
   {
     "path": "docs/CLI_RUNTIME_CONTROL.md",

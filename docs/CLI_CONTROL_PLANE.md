@@ -16,4 +16,6 @@ Self-management is explicit and user-scoped: `self version`, `self install --pre
 
 Plugin trust is controlled with `trust list|show|add|disable|enable|revoke|remove`; only 32-byte Ed25519 public-key hex is accepted, and the default store is `.agent/trust-store.json` with atomic `0600` writes. `registry status|reset|verify` exposes rollback state, requires exact reset confirmation, and verifies signed envelopes without mutating state. Private-key material is rejected.
 
+Configured extension smoke tests use `mcp test --id ID` and `lsp test --id ID`. MCP tests initialize and list tools without calling them; HTTP MCP additionally requires `--allow-network` and an exact configured host allowlist entry. LSP tests initialize and shut down the configured process, and `--file PATH` enables bounded document-open/symbol probing after workspace permission checks.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.
