@@ -26,3 +26,4 @@ toml.workspace = true
 keyring.workspace = true
 rpassword.workspace = true
 zeroize.workspace = true
+libc.workspace = true

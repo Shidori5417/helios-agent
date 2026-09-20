@@ -8,4 +8,6 @@ Provider credentials are never accepted as ordinary command arguments. `auth log
 
 Session control is workspace-scoped: `sessions list|show|archive|unarchive|delete|export|import` uses exact IDs, requires `--confirm ID` for deletion, and stores deletion as a recoverable tombstone. Exports are bounded, redacted JSON and imports require schema version and matching canonical workspace. `database backup` uses SQLite `VACUUM INTO`; restore requires `--confirm-workspace`, validates integrity/schema, and keeps a rollback copy during replacement. `audit list|show|export` exposes bounded, already-redacted lifecycle events only.
 
+Persistent background jobs are managed with `jobs start -- COMMAND ARGS...`, `list`, `status`, `logs`, `cancel`, `wait`, and `reap`. Jobs run through a private supervisor process in a workspace-scoped `.agent/jobs` registry, use a separate Unix process group, clear the child environment, bound logs through the existing output files, and reject secret-like arguments. Cancellation verifies PID start time and process-group identity before signalling.
+
 `doctor` reports binary/config/database/tool/provider-presence diagnostics without printing secret values. `completion generate` writes the committed shell completion to stdout; `completion install SHELL --path ABSOLUTE_PATH` writes it atomically.

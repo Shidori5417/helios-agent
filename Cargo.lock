@@ -20,6 +20,7 @@ dependencies = [
  "agent-tools",
  "agent-tui",
  "keyring",
+ "libc",
  "rpassword",
  "rusqlite",
  "serde",

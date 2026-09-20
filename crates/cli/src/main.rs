@@ -28,18 +28,26 @@ use std::{
     env, fs,
     io::{self, IsTerminal, Read},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command as OsCommand, ExitCode, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::SyncSender,
         Arc,
     },
+    time::Duration,
 };
 use zeroize::Zeroizing;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    match parse_args(env::args().skip(1).collect()) {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "__job-supervisor") {
+        return match run_job_supervisor(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        };
+    }
+    match parse_args(args) {
         Ok(Command::Help) => {
             print_help();
             ExitCode::SUCCESS
@@ -61,6 +69,10 @@ async fn main() -> ExitCode {
             Err(error) => fail(error),
         },
         Ok(Command::Audit(command)) => match audit_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Jobs(command)) => match jobs_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -414,6 +426,7 @@ enum Command {
     },
     Database(DatabaseCommand),
     Audit(AuditCommand),
+    Jobs(JobCommand),
     Search {
         db_path: PathBuf,
         query: String,
@@ -474,6 +487,27 @@ enum AuditCommand {
         output: PathBuf,
         session: Option<i64>,
         limit: usize,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum JobCommand {
+    Start {
+        argv: Vec<String>,
+    },
+    List,
+    Status(String),
+    Logs {
+        id: String,
+        stderr: bool,
+        tail: usize,
+    },
+    Cancel(String),
+    Wait {
+        id: String,
+        timeout: Duration,
+    },
+    Reap {
+        id: Option<String>,
     },
 }
 #[derive(Debug, PartialEq, Eq)]
@@ -628,6 +662,7 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "sessions" => parse_sessions_command(&args[1..]),
         "database" => parse_database_command(&args[1..]),
         "audit" => parse_audit_command(&args[1..]),
+        "jobs" => parse_jobs_command(&args[1..]),
         "search" => {
             let db_path = path_option(&args[1..], "--db-path")?;
             let query = value_after(&args[1..], "--query")?.ok_or("search requires --query")?;
@@ -818,6 +853,52 @@ fn parse_audit_command(args: &[String]) -> Result<Command, String> {
         })),
         other => Err(format!("unknown audit command: {other}")),
     }
+}
+
+fn parse_jobs_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let command = match action {
+        "start" => {
+            let separator = args
+                .iter()
+                .position(|arg| arg == "--")
+                .ok_or("jobs start requires argv after --")?;
+            let argv = args[separator + 1..].to_vec();
+            if argv.is_empty() {
+                return Err("jobs start requires a non-empty argv".into());
+            }
+            if argv.iter().any(|arg| secret_arg(arg)) {
+                return Err("secret-like job arguments are rejected".into());
+            }
+            JobCommand::Start { argv }
+        }
+        "list" => JobCommand::List,
+        "status" => JobCommand::Status(args.get(1).cloned().ok_or("jobs status requires ID")?),
+        "logs" => JobCommand::Logs {
+            id: args.get(1).cloned().ok_or("jobs logs requires ID")?,
+            stderr: args.iter().any(|arg| arg == "--stderr"),
+            tail: value_after(args, "--tail")?
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(100),
+        },
+        "cancel" => JobCommand::Cancel(args.get(1).cloned().ok_or("jobs cancel requires ID")?),
+        "wait" => JobCommand::Wait {
+            id: args.get(1).cloned().ok_or("jobs wait requires ID")?,
+            timeout: Duration::from_secs(
+                value_after(args, "--timeout")?
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(30),
+            ),
+        },
+        "reap" => JobCommand::Reap {
+            id: args
+                .get(1)
+                .cloned()
+                .or_else(|| value_after(args, "--id").ok().flatten()),
+        },
+        other => return Err(format!("unknown jobs command: {other}")),
+    };
+    Ok(Command::Jobs(command))
 }
 
 fn parse_completion_command(args: &[String]) -> Result<Command, String> {
@@ -1776,6 +1857,306 @@ fn audit_command(command: AuditCommand) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JobMeta {
+    id: String,
+    workspace: String,
+    executable: String,
+    argv_hash: String,
+    pid: Option<u32>,
+    pgid: Option<i32>,
+    start_ticks: Option<u64>,
+    status: String,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+fn jobs_dir(workspace: &Path) -> PathBuf {
+    workspace.join(".agent/jobs")
+}
+fn job_path(workspace: &Path, id: &str) -> PathBuf {
+    jobs_dir(workspace).join(format!("{id}.json"))
+}
+fn safe_job_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+fn secret_arg(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "token=",
+        "secret=",
+        "password=",
+        "api_key=",
+        "--token",
+        "--secret",
+        "--password",
+        "sk-",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn job_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+fn argv_digest(argv: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    argv.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn read_job(workspace: &Path, id: &str) -> Result<JobMeta, String> {
+    if !safe_job_id(id) {
+        return Err("invalid job id".into());
+    }
+    let path = job_path(workspace, id);
+    serde_json::from_slice(&fs::read(path).map_err(|_| "job not found".to_owned())?)
+        .map_err(|error| format!("invalid job metadata: {error}"))
+}
+
+fn write_job(workspace: &Path, meta: &JobMeta) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(meta).map_err(|error| error.to_string())?;
+    atomic_write(&job_path(workspace, &meta.id), &bytes)
+}
+
+fn jobs_command(command: JobCommand) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    fs::create_dir_all(jobs_dir(&workspace)).map_err(|error| error.to_string())?;
+    match command {
+        JobCommand::Start { argv } => {
+            let entries = fs::read_dir(jobs_dir(&workspace))
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count();
+            if entries >= 32 {
+                return Err("job limit reached (32)".into());
+            }
+            let id = job_id();
+            let meta = JobMeta {
+                id: id.clone(),
+                workspace: workspace.display().to_string(),
+                executable: argv[0].clone(),
+                argv_hash: argv_digest(&argv),
+                pid: None,
+                pgid: None,
+                start_ticks: None,
+                status: "starting".into(),
+                exit_code: None,
+                stdout: format!("{id}.stdout"),
+                stderr: format!("{id}.stderr"),
+            };
+            write_job(&workspace, &meta)?;
+            let executable = env::current_exe().map_err(|error| error.to_string())?;
+            let mut supervisor = OsCommand::new(executable);
+            supervisor.args([
+                "__job-supervisor",
+                "--workspace",
+                &workspace.display().to_string(),
+                "--job-id",
+                &id,
+                "--",
+            ]);
+            supervisor.args(argv);
+            supervisor
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            supervisor.spawn().map_err(|error| error.to_string())?;
+            println!("{id}");
+            Ok(())
+        }
+        JobCommand::List => {
+            let mut ids = Vec::new();
+            for entry in fs::read_dir(jobs_dir(&workspace)).map_err(|error| error.to_string())? {
+                let path = entry.map_err(|error| error.to_string())?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    if let Some(id) = path.file_stem().and_then(|value| value.to_str()) {
+                        ids.push(id.to_owned());
+                    }
+                }
+            }
+            ids.sort();
+            for id in ids {
+                let meta = read_job(&workspace, &id)?;
+                println!("{}\t{}\t{}", meta.id, meta.status, meta.executable);
+            }
+            Ok(())
+        }
+        JobCommand::Status(id) => {
+            let meta = read_job(&workspace, &id)?;
+            println!(
+                "{}",
+                serde_json::to_string(&meta).map_err(|error| error.to_string())?
+            );
+            Ok(())
+        }
+        JobCommand::Logs { id, stderr, tail } => {
+            let meta = read_job(&workspace, &id)?;
+            let path = jobs_dir(&workspace).join(if stderr { meta.stderr } else { meta.stdout });
+            let text = fs::read_to_string(path).unwrap_or_default();
+            let lines = text.lines().collect::<Vec<_>>();
+            println!(
+                "{}",
+                lines
+                    .into_iter()
+                    .rev()
+                    .take(tail)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            Ok(())
+        }
+        JobCommand::Cancel(id) => cancel_job(&workspace, &id),
+        JobCommand::Wait { id, timeout } => wait_job(&workspace, &id, timeout),
+        JobCommand::Reap { id } => {
+            let ids = id.into_iter().collect::<Vec<_>>();
+            let candidates = if ids.is_empty() {
+                fs::read_dir(jobs_dir(&workspace))
+                    .map_err(|error| error.to_string())?
+                    .filter_map(Result::ok)
+                    .filter_map(|entry| {
+                        entry
+                            .path()
+                            .file_stem()
+                            .and_then(|value| value.to_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            } else {
+                ids
+            };
+            for id in candidates {
+                let meta = read_job(&workspace, &id)?;
+                if matches!(meta.status.as_str(), "completed" | "failed" | "cancelled") {
+                    let _ = fs::remove_file(job_path(&workspace, &id));
+                    let _ = fs::remove_file(jobs_dir(&workspace).join(meta.stdout));
+                    let _ = fs::remove_file(jobs_dir(&workspace).join(meta.stderr));
+                    println!("{id}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let content = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = content
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    fields.get(19)?.parse().ok()
+}
+
+fn cancel_job(workspace: &Path, id: &str) -> Result<(), String> {
+    let mut meta = read_job(workspace, id)?;
+    let (Some(pid), Some(pgid), Some(start)) = (meta.pid, meta.pgid, meta.start_ticks) else {
+        return Err("job has not started".into());
+    };
+    if proc_start_ticks(pid) != Some(start) {
+        return Err("job PID identity mismatch; refusing cancel".into());
+    }
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(-pgid, libc::SIGTERM) != 0 {
+            return Err("failed to cancel job process group".into());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        return Err("job cancellation requires Unix".into());
+    }
+    meta.status = "cancelling".into();
+    write_job(workspace, &meta)
+}
+
+fn wait_job(workspace: &Path, id: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let meta = read_job(workspace, id)?;
+        if matches!(meta.status.as_str(), "completed" | "failed" | "cancelled") {
+            println!("{}\t{}", meta.id, meta.status);
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("job wait timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_job_supervisor(args: &[String]) -> Result<(), String> {
+    let workspace = value_after(args, "--workspace")?
+        .map(PathBuf::from)
+        .ok_or("supervisor workspace missing")?;
+    let id = value_after(args, "--job-id")?.ok_or("supervisor job id missing")?;
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or("supervisor argv missing")?;
+    let argv = &args[separator + 1..];
+    if argv.is_empty() || !safe_job_id(&id) {
+        return Err("invalid supervisor argv".into());
+    }
+    let mut meta = read_job(&workspace, &id)?;
+    let stdout = fs::File::create(jobs_dir(&workspace).join(&meta.stdout))
+        .map_err(|error| error.to_string())?;
+    let stderr = fs::File::create(jobs_dir(&workspace).join(&meta.stderr))
+        .map_err(|error| error.to_string())?;
+    let mut child = OsCommand::new(&argv[0]);
+    child
+        .args(&argv[1..])
+        .current_dir(&workspace)
+        .env_clear()
+        .env("PATH", env::var("PATH").unwrap_or_default())
+        .stdout(stdout)
+        .stderr(stderr)
+        .stdin(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        child.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = child.spawn().map_err(|error| error.to_string())?;
+    let pid = child.id();
+    meta.pid = Some(pid);
+    meta.pgid = Some(pid as i32);
+    meta.start_ticks = proc_start_ticks(pid);
+    meta.status = "running".into();
+    write_job(&workspace, &meta)?;
+    let status = child.wait().map_err(|error| error.to_string())?;
+    meta.exit_code = status.code();
+    meta.status = if status.success() {
+        "completed"
+    } else if status.code() == Some(143) {
+        "cancelled"
+    } else {
+        "failed"
+    }
+    .into();
+    write_job(&workspace, &meta)
+}
+
 fn resolve_observability_session(
     database: &Database,
     workspace: &str,
@@ -2149,7 +2530,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export");
+    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
