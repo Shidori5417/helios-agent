@@ -3519,10 +3519,7 @@ fn sessions_command(command: SessionCommand, db_path: PathBuf) -> Result<(), Str
 }
 
 fn current_workspace() -> Result<PathBuf, String> {
-    env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())
+    workspace_root()
 }
 
 fn session_show(db_path: PathBuf, id: i64) -> Result<(), String> {
