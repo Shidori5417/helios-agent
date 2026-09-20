@@ -6,6 +6,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
     widgets::{Block, Borders, Paragraph},
     Terminal,
 };
@@ -25,6 +26,7 @@ pub struct TuiModel {
     pub context: Option<String>,
     pub scroll: usize,
     pub viewport_height: usize,
+    pub scroll_step: usize,
 }
 
 impl TuiModel {
@@ -91,9 +93,39 @@ impl TuiModel {
     pub fn reduce_input(&mut self, input: &InputEvent) {
         match input {
             InputEvent::Resize { height, .. } => self.viewport_height = (*height).max(1) as usize,
-            InputEvent::ScrollUp => self.scroll = self.scroll.saturating_sub(1),
-            InputEvent::ScrollDown => self.scroll = self.scroll.saturating_add(1),
+            InputEvent::ScrollUp => {
+                self.scroll = self.scroll.saturating_sub(self.scroll_step.max(1))
+            }
+            InputEvent::ScrollDown => {
+                self.scroll = self.scroll.saturating_add(self.scroll_step.max(1))
+            }
             InputEvent::None | InputEvent::Quit => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiColor {
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TuiSettings {
+    pub tick_ms: u64,
+    pub channel_capacity: usize,
+    pub scroll_step: usize,
+    pub color: TuiColor,
+}
+
+impl Default for TuiSettings {
+    fn default() -> Self {
+        Self {
+            tick_ms: 50,
+            channel_capacity: 128,
+            scroll_step: 1,
+            color: TuiColor::Auto,
         }
     }
 }
@@ -148,6 +180,14 @@ pub fn run_channel(
     receiver: Receiver<Event>,
     cancellation: agent_terminal::CancellationToken,
 ) -> io::Result<()> {
+    run_channel_with_settings(receiver, cancellation, TuiSettings::default())
+}
+
+pub fn run_channel_with_settings(
+    receiver: Receiver<Event>,
+    cancellation: agent_terminal::CancellationToken,
+    settings: TuiSettings,
+) -> io::Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::NotConnected,
@@ -159,9 +199,10 @@ pub fn run_channel(
     let mut terminal = Terminal::new(backend)?;
     let mut model = TuiModel {
         viewport_height: 24,
+        scroll_step: settings.scroll_step.max(1),
         ..TuiModel::default()
     };
-    let tick = Duration::from_millis(50);
+    let tick = Duration::from_millis(settings.tick_ms.clamp(10, 1000));
     let mut disconnected = false;
     while !disconnected && !cancellation.is_cancelled() {
         loop {
@@ -179,11 +220,11 @@ pub fn run_channel(
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(frame.area());
-            frame.render_widget(
-                Paragraph::new(model.as_text())
-                    .block(Block::default().borders(Borders::ALL).title("agent-cli")),
-                chunks[0],
-            );
+            let mut block = Block::default().borders(Borders::ALL).title("agent-cli");
+            if settings.color == TuiColor::Always {
+                block = block.border_style(Style::default().fg(Color::Cyan));
+            }
+            frame.render_widget(Paragraph::new(model.as_text()).block(block), chunks[0]);
             frame.render_widget(
                 Paragraph::new("q/Esc/Ctrl-C: cancel  ↑/↓: scroll"),
                 chunks[1],

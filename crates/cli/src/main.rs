@@ -1533,7 +1533,12 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
     )?;
     let startup_memory = load_startup_memory(&options.db_path, &workspace_id, &options.prompt)?;
     if options.tui {
-        let (sender, receiver) = agent_tui::bounded_event_channel(128);
+        let tui_settings = config_path
+            .as_deref()
+            .map(load_tui_settings)
+            .transpose()?
+            .unwrap_or_default();
+        let (sender, receiver) = agent_tui::bounded_event_channel(tui_settings.channel_capacity);
         return std::thread::scope(|scope| {
             let producer = scope.spawn(|| {
                 run_selected_provider(
@@ -1550,7 +1555,7 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
                     cancellation.clone(),
                 )
             });
-            agent_tui::run_channel(receiver, cancellation.clone())
+            agent_tui::run_channel_with_settings(receiver, cancellation.clone(), tui_settings)
                 .map_err(|error| error.to_string())?;
             producer
                 .join()
@@ -4050,6 +4055,37 @@ fn tui_config_command(args: &[String], path: &Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?
             .as_bytes(),
     )
+}
+
+fn load_tui_settings(path: &Path) -> Result<agent_tui::TuiSettings, String> {
+    let mut settings = agent_tui::TuiSettings::default();
+    if !path.exists() {
+        return Ok(settings);
+    }
+    let document: toml::Value =
+        toml::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+    let Some(table) = document.get("tui").and_then(toml::Value::as_table) else {
+        return Ok(settings);
+    };
+    if let Some(value) = table.get("tick_ms").and_then(toml::Value::as_integer) {
+        settings.tick_ms = value.clamp(10, 1000) as u64;
+    }
+    if let Some(value) = table
+        .get("channel_capacity")
+        .and_then(toml::Value::as_integer)
+    {
+        settings.channel_capacity = value.clamp(1, 4096) as usize;
+    }
+    if let Some(value) = table.get("scroll_step").and_then(toml::Value::as_integer) {
+        settings.scroll_step = value.clamp(1, 100) as usize;
+    }
+    settings.color = match table.get("color").and_then(toml::Value::as_str) {
+        Some("always") => agent_tui::TuiColor::Always,
+        Some("never") => agent_tui::TuiColor::Never,
+        _ => agent_tui::TuiColor::Auto,
+    };
+    Ok(settings)
 }
 
 fn set_enabled_plugin(path: &Path, id: &str, enabled: bool) -> Result<(), String> {

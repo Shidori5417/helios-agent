@@ -6,7 +6,18 @@ Install the Arch development packages from `docs/13_ARCH_LINUX.md`, then run:
 
 ```sh
 cargo build --release --locked
+./target/release/agent-cli self install --prefix ~/.local --name helios --compat-agent-cli
+./target/release/agent-cli doctor
+```
+
+The preferred user-facing path is CLI-controlled: `self install` performs an
+atomic user-local install without sudo, and `completion install` installs an
+explicit shell completion path. The legacy `install -Dm755` command below is
+kept as a manual fallback for minimal systems.
+
+```sh
 install -Dm755 target/release/agent-cli ~/.local/bin/agent-cli
+```
 
 ## Verify a release artifact
 
@@ -28,7 +39,6 @@ The workflows use the official `sigstore/cosign-installer@v4.1.0` and
 invented commit pins; pinning these actions to independently verified commit
 SHAs remains supply-chain debt to resolve before treating releases as fully
 reproducible. No signing key or repository secret is used.
-```
 
 ## Arch package
 
@@ -43,7 +53,14 @@ Source the matching file from `completions/` using the shell's normal completion
 
 ## Uninstall
 
-For a source install, remove the explicitly installed binary:
+For a CLI install, use the exact installed name so the identity marker and
+recoverable trash handling are honored:
+
+```sh
+helios self uninstall --confirm helios
+```
+
+For a manual source install, remove the explicitly installed binary:
 
 ```sh
 rm -f ~/.local/bin/agent-cli
