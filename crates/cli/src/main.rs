@@ -58,6 +58,10 @@ async fn main() -> ExitCode {
             print_help();
             ExitCode::SUCCESS
         }
+        Ok(Command::ContextHelp(path)) => {
+            print_command_help(&path);
+            ExitCode::SUCCESS
+        }
         Ok(Command::Run(options)) => match run_command(options) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
@@ -445,6 +449,7 @@ impl HookRunner for RuntimeHooks {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
+    ContextHelp(Vec<String>),
     Run(RunOptions),
     Sessions {
         command: SessionCommand,
@@ -781,7 +786,11 @@ struct RunOptions {
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
     if args.is_empty() || args[0] == "run" {
         if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-            return Ok(Command::Help);
+            return Ok(if args.is_empty() {
+                Command::Help
+            } else {
+                Command::ContextHelp(vec!["run".into()])
+            });
         }
         return parse_run(if args.first().is_some_and(|arg| arg == "run") {
             &args[1..]
@@ -794,7 +803,12 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         .skip(1)
         .any(|arg| arg == "--help" || arg == "-h")
     {
-        return Ok(Command::Help);
+        let path = args
+            .iter()
+            .take_while(|arg| *arg != "--help" && *arg != "-h")
+            .cloned()
+            .collect::<Vec<_>>();
+        return Ok(Command::ContextHelp(path));
     }
     match args[0].as_str() {
         "--help" | "-h" | "help" => Ok(Command::Help),
@@ -3506,9 +3520,68 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("TUI controls: tui show|set|keys");
-    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export; jobs start|list|status|logs|cancel|wait|reap; eval run|show|baseline; perf run|show|compare; self version|install|update|uninstall; trust list|show|add|disable|enable|revoke|remove; registry status|reset|verify");
-    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
+    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:");
+    for line in [
+        "  init",
+        "  config",
+        "  auth",
+        "  doctor",
+        "  completion",
+        "  providers",
+        "  permissions",
+        "  mcp",
+        "  lsp",
+        "  hooks",
+        "  skills",
+        "  subagents",
+        "  tui",
+        "  status",
+        "  run",
+        "  sessions",
+        "  database",
+        "  audit",
+        "  jobs",
+        "  eval",
+        "  perf",
+        "  self",
+        "  trust",
+        "  registry",
+        "  plugins",
+        "  search",
+        "  context",
+        "  usage",
+        "  memory",
+        "  verify",
+        "  diff",
+    ] {
+        println!("{line}");
+    }
+    println!("\nGlobal options: --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui\nUse `agent-cli COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.");
+}
+
+fn print_command_help(path: &[String]) {
+    let key = path.join(" ");
+    let (usage, body) = match key.as_str() {
+        "run" => ("agent-cli run [OPTIONS] PROMPT".into(), "Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config."),
+        "auth" => ("agent-cli auth status|login|logout PROVIDER [--token-stdin]".into(), "login uses hidden TTY input or explicit non-TTY --token-stdin; token values are never arguments or output."),
+        "auth login" => ("agent-cli auth login PROVIDER [--token-stdin]".into(), "Stores the token in the OS keyring; plaintext fallback is refused."),
+        "self" => ("agent-cli self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
+        "self install" => ("agent-cli self install [--prefix PATH] [--name NAME] [--compat-agent-cli]".into(), "Default prefix is ~/.local; installation is atomic and creates an identity marker."),
+        "self update" => ("agent-cli self update --from PATH --sha256 HEX".into(), "Local update requires an exact SHA-256; release update additionally requires external cosign verification."),
+        "mcp" => ("agent-cli mcp list|add|remove|enable|disable|show|test".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
+        "mcp add" => ("agent-cli mcp add ID (--command CMD | --url HTTPS_URL) [--arg ARG] [--auth-env ENV]".into(), "Only argv and secret environment-name references are accepted; literal secrets and shell strings are rejected."),
+        "permissions" => ("agent-cli permissions show|set-mode|add-network-host|remove-network-host".into(), "Permission changes are atomic and feed the runtime policy."),
+        "permissions env-allow" => ("agent-cli permissions env-allow NAME".into(), "Environment inheritance is allowlisted; secret-like names are rejected."),
+        "subagents" => ("agent-cli subagents config|show|run|test".into(), "Subagents inherit permissions and use bounded scheduler budgets."),
+        "subagents run" => ("agent-cli subagents run --objective TEXT [--provider fake|openai|anthropic|gemini|generic] [--scope PATH] [--session ID|latest] [--context-file PATH] [--memory-query TEXT] [--worktree --ref REF]".into(), "Selected context is bounded; worktree results are never auto-applied to the parent tree."),
+        "jobs" => ("agent-cli jobs start|list|status|logs|cancel|wait|reap".into(), "Jobs use explicit argv, bounded logs, process-group cleanup, and workspace ownership checks."),
+        "jobs start" => ("agent-cli jobs start -- COMMAND ARGS...".into(), "Shell interpolation is not used; secret-like arguments are rejected."),
+        "tui" => ("agent-cli tui show|set|keys".into(), "TUI requires a TTY; tick, channel, scroll, and color settings are bounded."),
+        "perf run" => ("agent-cli perf run [--runs N] [--suite smoke|benchmark-100|PATH] [--output PATH] [--baseline PATH]".into(), "Runs offline startup, RSS, and optional benchmark measurements."),
+        "status" => ("agent-cli status [--json]".into(), "Shows bounded aggregate state without secret values."),
+        _ => (format!("agent-cli {key} --help"), "See the command family help for available actions and required identifiers."),
+    };
+    println!("Usage: {usage}\n\n{body}");
 }
 
 fn workspace_root() -> Result<PathBuf, String> {
