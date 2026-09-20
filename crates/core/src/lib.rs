@@ -24,7 +24,9 @@ pub enum LifecycleEvent {
     PostToolUse,
     AfterTool,
     PreEdit,
+    BeforeEdit,
     PostEdit,
+    AfterEdit,
     PreCompact,
     BeforeCompact,
     AfterCompact,
@@ -498,9 +500,6 @@ where
             for call in response.tool_calls {
                 self.run_hook(LifecycleEvent::BeforeTool, sink)?;
                 self.run_hook(LifecycleEvent::PreToolUse, sink)?;
-                if call.name == "apply_patch" {
-                    self.run_hook(LifecycleEvent::PreEdit, sink)?;
-                }
                 if let Some(name) = call.name.strip_prefix("mcp:") {
                     let event = Event::McpToolDiscovered(name.to_owned());
                     sink.emit(event.clone());
@@ -512,6 +511,10 @@ where
                 let started = Event::ToolStarted(call.name.clone());
                 sink.emit(started.clone());
                 self.session.events.push(started);
+                if call.name == "apply_patch" || call.name == "write" {
+                    self.run_hook(LifecycleEvent::BeforeEdit, sink)?;
+                    self.run_hook(LifecycleEvent::PreEdit, sink)?;
+                }
                 let result = match executor.execute_typed(&call) {
                     Ok(result) => result,
                     Err(error)
@@ -570,6 +573,10 @@ where
                     sink.emit(event.clone());
                     self.session.events.push(event);
                 }
+                if call.name == "apply_patch" || call.name == "write" {
+                    self.run_hook(LifecycleEvent::AfterEdit, sink)?;
+                    self.run_hook(LifecycleEvent::PostEdit, sink)?;
+                }
                 let completed = Event::ToolCompleted(format!("{}: {}", call.name, result.status));
                 sink.emit(completed.clone());
                 self.session.events.push(completed);
@@ -579,9 +586,6 @@ where
                 });
                 self.run_hook(LifecycleEvent::PostToolUse, sink)?;
                 self.run_hook(LifecycleEvent::AfterTool, sink)?;
-                if call.name == "apply_patch" {
-                    self.run_hook(LifecycleEvent::PostEdit, sink)?;
-                }
             }
             self.session
                 .completed_steps
@@ -925,6 +929,23 @@ mod tests {
             agent.run_coding_loop("blocked", &mut executor, 1, &mut sink),
             Err(CoreError::Tool(message)) if message.contains("hook SessionStart failed")
         ));
+    }
+
+    #[test]
+    fn before_edit_failure_prevents_executor_and_after_edit() {
+        let provider = ScriptedProvider {
+            responses: vec![tool_response("apply_patch")],
+        };
+        let mut agent = AgentLoop::new(provider).with_hooks(Box::new(RecordingHooks {
+            events: Vec::new(),
+            fail_on: Some(LifecycleEvent::BeforeEdit),
+        }));
+        let mut executor = RecordingExecutor { calls: 0 };
+        let mut sink = VecEventSink::default();
+        assert!(agent
+            .run_coding_loop("patch", &mut executor, 1, &mut sink)
+            .is_err());
+        assert_eq!(executor.calls, 0);
     }
 
     struct OneMemory;
