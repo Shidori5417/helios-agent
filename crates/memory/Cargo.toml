@@ -1,0 +1,10 @@
+[package]
+name = "agent-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-storage = { path = "../storage" }
+rusqlite.workspace = true
+thiserror.workspace = true

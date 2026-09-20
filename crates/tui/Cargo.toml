@@ -1,0 +1,11 @@
+[package]
+name = "agent-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../protocol" }
+agent-terminal = { path = "../terminal" }
+ratatui.workspace = true
+crossterm.workspace = true

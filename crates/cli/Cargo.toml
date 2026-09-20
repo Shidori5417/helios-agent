@@ -1,0 +1,24 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-context = { path = "../context" }
+agent-core = { path = "../core" }
+agent-memory = { path = "../memory" }
+agent-mcp = { path = "../mcp" }
+agent-plugins = { path = "../plugins" }
+agent-protocol = { path = "../protocol" }
+agent-providers = { path = "../providers" }
+agent-sandbox = { path = "../sandbox" }
+agent-tools = { path = "../tools" }
+agent-storage = { path = "../storage" }
+agent-tui = { path = "../tui" }
+agent-terminal = { path = "../terminal" }
+agent-lsp = { path = "../lsp" }
+serde_json.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+toml.workspace = true

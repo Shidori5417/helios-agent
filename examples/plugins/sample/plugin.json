@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "sample-review-hook",
+  "version": "0.1.0",
+  "capabilities": ["hook"],
+  "hooks": [
+    {
+      "event": "PostEdit",
+      "timeout_ms": 1000,
+      "policy": "FailClosed"
+    }
+  ]
+}

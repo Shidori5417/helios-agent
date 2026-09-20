@@ -1,0 +1,15 @@
+[package]
+name = "agent-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-protocol = { path = "../protocol" }
+agent-providers = { path = "../providers" }
+agent-context = { path = "../context" }
+thiserror.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+agent-providers = { path = "../providers" }

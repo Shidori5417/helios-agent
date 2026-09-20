@@ -1,0 +1,33 @@
+# Rust build output
+/target/
+
+# Agent runtime state and workspace-local configuration
+/.agent/
+**/.agent/
+*.db
+*.sqlite
+*.sqlite3
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.secret
+*credentials*
+*secret*
+*token*
+
+# Local benchmark/performance output
+perf-report*.json
+agent-perf*.json
+*.perf.json
+
+# Editor and OS files
+.DS_Store
+.cache/
+.idea/
+.vscode/

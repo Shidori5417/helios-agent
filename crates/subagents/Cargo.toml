@@ -1,0 +1,10 @@
+[package]
+name = "agent-subagents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-context = { path = "../context" }
+agent-sandbox = { path = "../sandbox" }
+thiserror.workspace = true

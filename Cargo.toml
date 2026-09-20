@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/protocol",
+  "crates/core",
+  "crates/cli",
+  "crates/tui",
+  "crates/providers",
+  "crates/tools",
+  "crates/terminal",
+  "crates/storage",
+  "crates/sandbox",
+  "crates/context",
+  "crates/memory",
+  "crates/evals",
+  "crates/mcp",
+  "crates/skills",
+  "crates/plugins",
+  "crates/subagents",
+  "crates/perf",
+  "crates/lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+thiserror = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui = "0.29"
+crossterm = "0.28"
+libc = "0.2"
+portable-pty = "0.8"
+ed25519-dalek = "2"
+sha2 = "0.10"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
