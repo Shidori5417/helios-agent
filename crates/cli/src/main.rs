@@ -2347,6 +2347,18 @@ fn interactive_command() -> Result<(), String> {
                         return Ok(if items.is_empty() { "queue empty".into() } else { items.into_iter().map(|item| format!("{}: {}", item.id, redact_output(&item.prompt))).collect::<Vec<_>>().join("\n") });
                     }
                     if action == "clear" { db.clear_foreground(session)?; return Ok("queue cleared".into()); }
+                    if let Some(value) = action.strip_prefix("edit ") {
+                        let mut parts = value.splitn(2, ' ');
+                        let id = parts.next().and_then(|text| text.parse::<i64>().ok()).ok_or_else(|| rusqlite::Error::InvalidParameterName("queue id".into()))?;
+                        let text = parts.next().ok_or_else(|| rusqlite::Error::InvalidParameterName("queue prompt".into()))?;
+                        return Ok(if db.edit_foreground(session, id, text)? { "queue item edited".into() } else { "queue item not found".into() });
+                    }
+                    if let Some(value) = action.strip_prefix("move ") {
+                        let mut parts = value.split_whitespace();
+                        let id = parts.next().and_then(|text| text.parse::<i64>().ok()).ok_or_else(|| rusqlite::Error::InvalidParameterName("queue id".into()))?;
+                        let position = parts.next().and_then(|text| text.parse::<i64>().ok()).ok_or_else(|| rusqlite::Error::InvalidParameterName("queue position".into()))?;
+                        return Ok(if db.move_foreground(session, id, position)? { "queue item moved".into() } else { "queue item not found".into() });
+                    }
                     if let Some(text) = action.strip_prefix("remove ") { let id = text.trim().parse::<i64>().map_err(|_| rusqlite::Error::InvalidParameterName("queue id".into()))?; return Ok(if db.remove_foreground(session,id)? { "queue item removed".into() } else { "queue item not found".into() }); }
                     db.enqueue_foreground(session, action).map(|id| format!("queued {id}"))
                 });

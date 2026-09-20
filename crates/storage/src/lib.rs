@@ -594,6 +594,29 @@ impl Database {
         )? > 0)
     }
 
+    pub fn edit_foreground(&self, session_id: i64, id: i64, prompt: &str) -> SqlResult<bool> {
+        if prompt.trim().is_empty() || prompt.len() > 32 * 1024 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "queue prompt bounds".into(),
+            ));
+        }
+        Ok(self.connection.execute(
+            "UPDATE foreground_queue SET prompt=?1 WHERE session_id=?2 AND id=?3",
+            params![prompt, session_id, id],
+        )? > 0)
+    }
+
+    pub fn move_foreground(&self, session_id: i64, id: i64, new_position: i64) -> SqlResult<bool> {
+        if !(0..32).contains(&new_position) {
+            return Ok(false);
+        }
+        let changed = self.connection.execute(
+            "UPDATE foreground_queue SET position=?1 WHERE session_id=?2 AND id=?3",
+            params![new_position, session_id, id],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn clear_foreground(&self, session_id: i64) -> SqlResult<usize> {
         self.connection.execute(
             "DELETE FROM foreground_queue WHERE session_id=?1",
@@ -1293,6 +1316,8 @@ mod tests {
             db.pop_foreground(session).expect("pop").as_deref(),
             Some("first")
         );
+        assert!(db.edit_foreground(session, second, "edited").expect("edit"));
+        assert!(db.move_foreground(session, second, 0).expect("move"));
         assert!(db.remove_foreground(session, second).expect("remove"));
         assert!(db.foreground_queue(session).expect("empty").is_empty());
         assert!(db
