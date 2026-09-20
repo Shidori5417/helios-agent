@@ -825,6 +825,14 @@ impl TuiModel {
                 self.open_permission(parse_permission_prompt(request));
             }
             Event::ContextCompacted(summary) => self.context = Some(summary.clone()),
+            Event::SessionReset(summary) => {
+                self.transcript.clear();
+                self.tool_cards.clear();
+                self.tool = None;
+                self.context = Some(summary.clone());
+                self.status = summary.clone();
+                self.active_turn = false;
+            }
             Event::UsageUpdated(usage) => {
                 self.push_item(TranscriptItem::Activity(format!("usage: {usage}")))
             }

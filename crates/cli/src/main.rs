@@ -1,4 +1,6 @@
-use agent_context::{ContextSegment, LocalCompactor, Priority, SegmentKind, Stability};
+use agent_context::{
+    CompactionRequest, Compactor, ContextSegment, LocalCompactor, Priority, SegmentKind, Stability,
+};
 use agent_core::{
     AgentLoop, EventSink, HookRunner, LifecycleEvent, MemoryRetriever, RetrievedMemory,
     ToolExecution, ToolExecutor, ToolFailure,
@@ -2082,6 +2084,7 @@ fn interactive_command() -> Result<(), String> {
         tui_context,
         move |prompt, events, turn_cancellation| {
             let command = prompt.trim().to_ascii_lowercase();
+            let mut prompt_for_run = prompt.clone();
             if command == "/exit" || command == "/quit" {
                 return true;
             }
@@ -2142,7 +2145,283 @@ fn interactive_command() -> Result<(), String> {
                 });
                 return false;
             }
-            let local_output = if let Some(selector) = command.strip_prefix("/session-resume ") {
+            let local_output = if command == "/new" || command.starts_with("/new ") {
+                let title = prompt.trim().strip_prefix("/new").unwrap_or("").trim();
+                let title = if title.is_empty() {
+                    "New session"
+                } else {
+                    title
+                };
+                match Database::open(&db_path).and_then(|db| {
+                    db.create_session_for_workspace(title, &workspace_path.display().to_string())
+                }) {
+                    Ok(id) => {
+                        if let Ok(mut active) = active_session.lock() {
+                            *active = Some(id);
+                        }
+                        first_turn.store(false, Ordering::Release);
+                        let _ = events.send(agent_protocol::Event::SessionReset(format!(
+                            "new session #{id}"
+                        )));
+                        Some(format!("new session #{id}: {}", redact_output(title)))
+                    }
+                    Err(error) => Some(format!("new session failed: {error}")),
+                }
+            } else if command == "/clear" {
+                let id = active_session
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value)
+                    .or_else(|| {
+                        Database::open(&db_path).ok().and_then(|db| {
+                            db.latest_session(&workspace_path.display().to_string())
+                                .ok()
+                                .flatten()
+                                .map(|s| s.id)
+                        })
+                    });
+                match id.map(|id| {
+                    Database::open(&db_path).and_then(|db| db.create_context_boundary(id, "clear"))
+                }) {
+                    Some(Ok(_)) => {
+                        let _ = events.send(agent_protocol::Event::SessionReset(
+                            "conversation context cleared; durable history retained".into(),
+                        ));
+                        Some("conversation context cleared (history retained)".into())
+                    }
+                    Some(Err(error)) => Some(format!("clear failed: {error}")),
+                    None => Some("no active session".into()),
+                }
+            } else if command == "/title" || command.starts_with("/title ") {
+                let title = prompt.trim().strip_prefix("/title").unwrap_or("").trim();
+                if title.is_empty() {
+                    Some("title requires text".into())
+                } else {
+                    let result = active_session
+                        .lock()
+                        .ok()
+                        .and_then(|value| *value)
+                        .or_else(|| {
+                            Database::open(&db_path).ok().and_then(|db| {
+                                db.latest_session(&workspace_path.display().to_string())
+                                    .ok()
+                                    .flatten()
+                                    .map(|s| s.id)
+                            })
+                        })
+                        .ok_or_else(|| "no active session".to_string())
+                        .and_then(|id| {
+                            Database::open(&db_path)
+                                .map_err(|e| e.to_string())
+                                .and_then(|db| {
+                                    db.set_session_title(
+                                        id,
+                                        &workspace_path.display().to_string(),
+                                        title,
+                                    )
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|changed| {
+                                        if changed {
+                                            Ok(())
+                                        } else {
+                                            Err("session not found in this workspace".into())
+                                        }
+                                    })
+                                })
+                        });
+                    Some(
+                        result
+                            .map(|_| format!("title={}", redact_output(title)))
+                            .unwrap_or_else(|error| format!("title failed: {error}")),
+                    )
+                }
+            } else if command == "/resume"
+                || command.starts_with("/resume ")
+                || command == "/continue"
+                || command.starts_with("/session-resume ")
+            {
+                let selector = prompt
+                    .trim()
+                    .split_once(' ')
+                    .map(|(_, value)| value.trim())
+                    .unwrap_or("");
+                let selected = Database::open(&db_path).ok().and_then(|db| {
+                    let workspace = workspace_path.display().to_string();
+                    let sessions = db.list_session_summaries(&workspace).ok()?;
+                    if selector.is_empty() || selector.eq_ignore_ascii_case("latest") {
+                        return sessions.into_iter().next();
+                    }
+                    if let Ok(id) = selector.parse::<i64>() {
+                        return sessions.into_iter().find(|s| s.id == id);
+                    }
+                    let matches = sessions
+                        .into_iter()
+                        .filter(|s| {
+                            s.title
+                                .as_deref()
+                                .unwrap_or(&s.objective)
+                                .eq_ignore_ascii_case(selector)
+                        })
+                        .collect::<Vec<_>>();
+                    if matches.len() == 1 {
+                        matches.into_iter().next()
+                    } else {
+                        None
+                    }
+                });
+                match selected {
+                    Some(summary) => {
+                        if let Ok(mut active) = active_session.lock() {
+                            *active = Some(summary.id);
+                        }
+                        first_turn.store(false, Ordering::Release);
+                        if let Ok(mut provider) = session_provider.lock() {
+                            *provider = summary.provider.clone();
+                        }
+                        if let Ok(mut model) = session_model.lock() {
+                            *model = summary.model.clone();
+                        }
+                        let _ = events.send(agent_protocol::Event::SessionReset(format!(
+                            "resumed session #{}",
+                            summary.id
+                        )));
+                        Some(format!(
+                            "resumed session #{}: {}",
+                            summary.id,
+                            redact_output(summary.title.as_deref().unwrap_or(&summary.objective))
+                        ))
+                    }
+                    None => {
+                        Some("session not found or title is ambiguous in this workspace".into())
+                    }
+                }
+            } else if command == "/history" || command.starts_with("/history ") {
+                let query = prompt
+                    .trim()
+                    .strip_prefix("/history")
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                let history = active_session
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value)
+                    .or_else(|| {
+                        Database::open(&db_path).ok().and_then(|db| {
+                            db.latest_session(&workspace_path.display().to_string())
+                                .ok()
+                                .flatten()
+                                .map(|s| s.id)
+                        })
+                    })
+                    .and_then(|id| {
+                        Database::open(&db_path)
+                            .ok()
+                            .and_then(|db| db.session_context_messages(id).ok())
+                    })
+                    .unwrap_or_default();
+                let lines = history
+                    .into_iter()
+                    .filter(|(_, content)| {
+                        query.is_empty() || content.to_ascii_lowercase().contains(&query)
+                    })
+                    .rev()
+                    .take(100)
+                    .map(|(role, content)| format!("{role}: {}", redact_output(&content)))
+                    .collect::<Vec<_>>();
+                Some(if lines.is_empty() {
+                    "history=0".into()
+                } else {
+                    format!(
+                        "history={}\n{}",
+                        lines.len(),
+                        lines.into_iter().rev().collect::<Vec<_>>().join("\n")
+                    )
+                })
+            } else if command == "/undo" || command == "/retry" {
+                let id = active_session
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value)
+                    .or_else(|| {
+                        Database::open(&db_path).ok().and_then(|db| {
+                            db.latest_session(&workspace_path.display().to_string())
+                                .ok()
+                                .flatten()
+                                .map(|s| s.id)
+                        })
+                    });
+                let result = id
+                    .and_then(|id| Database::open(&db_path).ok().map(|db| (db, id)))
+                    .map(|(db, id)| {
+                        let previous = db.last_user_message(id).ok().flatten();
+                        let boundary = db.create_boundary_before_last_exchange(
+                            id,
+                            if command == "/retry" { "retry" } else { "undo" },
+                        );
+                        (previous, boundary)
+                    });
+                match result {
+                    Some((previous, Ok(true))) if command == "/retry" => {
+                        prompt_for_run = previous.unwrap_or_default();
+                        Some(String::new())
+                    }
+                    Some((_, Ok(true))) => {
+                        let _ = events.send(agent_protocol::Event::SessionReset(
+                            "last exchange hidden from active context; durable history retained"
+                                .into(),
+                        ));
+                        Some("undid last exchange (filesystem unchanged)".into())
+                    }
+                    Some((_, Ok(false))) => Some("no exchange to undo".into()),
+                    Some((_, Err(error))) => Some(format!("conversation boundary failed: {error}")),
+                    None => Some("no active session".into()),
+                }
+            } else if command == "/compact" || command.starts_with("/compact ") {
+                let focus = prompt.trim().strip_prefix("/compact").unwrap_or("").trim();
+                let objective = active_session
+                    .lock()
+                    .ok()
+                    .and_then(|value| *value)
+                    .and_then(|id| {
+                        Database::open(&db_path)
+                            .ok()
+                            .and_then(|db| db.session(id).ok().flatten().map(|s| s.objective))
+                    })
+                    .unwrap_or_else(|| "interactive session".into());
+                let accepted_constraints = if focus.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![focus.into()]
+                };
+                let request = CompactionRequest {
+                    objective,
+                    accepted_constraints,
+                    decisions: Vec::new(),
+                    unresolved_failures: Vec::new(),
+                    verification_results: Vec::new(),
+                    relevant_memory_ids: Vec::new(),
+                };
+                let mut compactor = LocalCompactor;
+                match compactor.compact(request) {
+                    Ok(result) => {
+                        if let Some(id) = active_session.lock().ok().and_then(|value| *value) {
+                            if let Ok(db) = Database::open(&db_path) {
+                                let _ = db.persist_compaction_checkpoint(
+                                    id,
+                                    "compact",
+                                    &result.summary,
+                                );
+                            }
+                        }
+                        let _ = events.send(agent_protocol::Event::ContextCompacted(
+                            result.summary.clone(),
+                        ));
+                        Some(format!("compacted: {}", redact_output(&result.summary)))
+                    }
+                    Err(error) => Some(format!("compaction failed safely: {error}")),
+                }
+            } else if let Some(selector) = command.strip_prefix("/session-resume ") {
                 match selector.parse::<i64>() {
                     Ok(id) => match Database::open(&db_path)
                         .ok()
@@ -2217,18 +2496,31 @@ fn interactive_command() -> Result<(), String> {
                 slash_command_output(&command)
             };
             if let Some(output) = local_output {
-                let _ = events.send(agent_protocol::Event::TurnStarted);
-                let _ = events.send(agent_protocol::Event::ModelDelta(output));
-                let _ = events.send(agent_protocol::Event::TurnCompleted);
-                return false;
+                if command == "/retry" && prompt_for_run.is_empty() {
+                    return false;
+                }
+                if command == "/retry" {
+                    // Continue into the normal runtime with the restored user prompt.
+                } else {
+                    let _ = events.send(agent_protocol::Event::TurnStarted);
+                    let _ = events.send(agent_protocol::Event::ModelDelta(output));
+                    let _ = events.send(agent_protocol::Event::TurnCompleted);
+                    return false;
+                }
             }
-            let resume = if first_turn.swap(false, Ordering::AcqRel) {
+            let resume = if let Some(id) = active_session.lock().ok().and_then(|value| *value) {
+                Some(id.to_string())
+            } else if first_turn.swap(false, Ordering::AcqRel) {
                 None
             } else {
                 Some("latest".into())
             };
-            let options =
-                default_run_options(prompt, db_path.clone(), resume, Some(events.clone()));
+            let options = default_run_options(
+                prompt_for_run,
+                db_path.clone(),
+                resume,
+                Some(events.clone()),
+            );
             let mut options = options;
             options.approval = Some(approval.clone());
             if let Ok(selected) = session_provider.lock() {
@@ -2297,6 +2589,15 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         ("model", "show the configured model"),
         ("effort", "show provider effort support"),
         ("version", "show Helios version"),
+        ("new", "start a new workspace session"),
+        ("clear", "clear active context and retain durable history"),
+        ("resume", "resume a workspace session"),
+        ("continue", "continue the latest workspace session"),
+        ("history", "browse bounded active conversation history"),
+        ("title", "set the active session title"),
+        ("retry", "retry the last user turn"),
+        ("undo", "hide the last exchange from active context"),
+        ("compact", "compact active context with the local compactor"),
         ("exit", "close the interactive session"),
         ("quit", "close the interactive session"),
     ]
@@ -2653,7 +2954,7 @@ fn run_command_with_cancellation(
             return Err("session belongs to another workspace".into());
         }
         let messages = database
-            .session_messages(record.id)
+            .session_context_messages(record.id)
             .map_err(|error| error.to_string())?
             .into_iter()
             .map(|(role, content)| {
@@ -3176,6 +3477,7 @@ fn event_record(event: &agent_protocol::Event) -> (&'static str, String) {
         Event::VerificationResult(value) => ("verification_result", value.clone()),
         Event::PermissionRequested(value) => ("permission_requested", value.clone()),
         Event::ContextCompacted(value) => ("context_compacted", value.clone()),
+        Event::SessionReset(value) => ("session_reset", value.clone()),
         Event::TurnStarted => ("turn_started", String::new()),
         Event::TurnCompleted => ("turn_completed", String::new()),
     }

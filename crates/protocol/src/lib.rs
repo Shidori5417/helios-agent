@@ -55,6 +55,7 @@ pub enum Event {
     VerificationResult(String),
     PermissionRequested(String),
     ContextCompacted(String),
+    SessionReset(String),
     UsageUpdated(String),
     HookStarted(String),
     HookResult(String),

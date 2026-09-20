@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 6;
+pub const STORAGE_FORMAT_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -43,6 +43,7 @@ pub struct AuditRecord {
 pub struct SessionRecord {
     pub id: i64,
     pub objective: String,
+    pub title: Option<String>,
     pub workspace: String,
     pub archived: bool,
     pub deleted_at: Option<i64>,
@@ -52,6 +53,7 @@ pub struct SessionRecord {
 pub struct SessionSummary {
     pub id: i64,
     pub objective: String,
+    pub title: Option<String>,
     pub workspace: String,
     pub created_at: i64,
     pub last_activity: Option<i64>,
@@ -168,6 +170,14 @@ impl Database {
                  PRAGMA user_version = 6;",
             )?;
         }
+        if version < 7 {
+            self.connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN title TEXT;
+                 CREATE TABLE IF NOT EXISTS context_boundaries (id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id), message_id INTEGER NOT NULL, reason TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 CREATE INDEX IF NOT EXISTS context_boundaries_session ON context_boundaries(session_id, id);
+                 PRAGMA user_version = 7;",
+            )?;
+        }
         Ok(())
     }
 
@@ -190,15 +200,16 @@ impl Database {
     pub fn session(&self, id: i64) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE id = ?1",
+                "SELECT id, objective, title, workspace, archived, deleted_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
-                        workspace: row.get(2)?,
-                        archived: row.get::<_, i64>(3)? != 0,
-                        deleted_at: row.get(4)?,
+                        title: row.get(2)?,
+                        workspace: row.get(3)?,
+                        archived: row.get::<_, i64>(4)? != 0,
+                        deleted_at: row.get(5)?,
                     })
                 },
             )
@@ -208,15 +219,16 @@ impl Database {
     pub fn latest_session(&self, workspace: &str) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+                "SELECT id, objective, title, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
                 params![workspace],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
-                        workspace: row.get(2)?,
-                        archived: row.get::<_, i64>(3)? != 0,
-                        deleted_at: row.get(4)?,
+                        title: row.get(2)?,
+                        workspace: row.get(3)?,
+                        archived: row.get::<_, i64>(4)? != 0,
+                        deleted_at: row.get(5)?,
                     })
                 },
             )
@@ -226,15 +238,16 @@ impl Database {
     pub fn latest_session_any(&self) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
+                "SELECT id, objective, title, workspace, archived, deleted_at FROM sessions WHERE archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
-                        workspace: row.get(2)?,
-                        archived: row.get::<_, i64>(3)? != 0,
-                        deleted_at: row.get(4)?,
+                        title: row.get(2)?,
+                        workspace: row.get(3)?,
+                        archived: row.get::<_, i64>(4)? != 0,
+                        deleted_at: row.get(5)?,
                     })
                 },
             )
@@ -243,15 +256,16 @@ impl Database {
 
     pub fn list_sessions(&self, workspace: &str) -> SqlResult<Vec<SessionRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC",
+            "SELECT id, objective, title, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC",
         )?;
         let rows = statement.query_map(params![workspace], |row| {
             Ok(SessionRecord {
                 id: row.get(0)?,
                 objective: row.get(1)?,
-                workspace: row.get(2)?,
-                archived: row.get::<_, i64>(3)? != 0,
-                deleted_at: row.get(4)?,
+                title: row.get(2)?,
+                workspace: row.get(3)?,
+                archived: row.get::<_, i64>(4)? != 0,
+                deleted_at: row.get(5)?,
             })
         })?;
         rows.collect()
@@ -259,7 +273,7 @@ impl Database {
 
     pub fn list_session_summaries(&self, workspace: &str) -> SqlResult<Vec<SessionSummary>> {
         let mut statement = self.connection.prepare(
-            "SELECT s.id, s.objective, s.workspace, s.created_at, MAX(t.created_at), COUNT(t.id), s.provider, s.model, s.effort, s.git_branch
+            "SELECT s.id, s.objective, s.title, s.workspace, s.created_at, MAX(t.created_at), COUNT(t.id), s.provider, s.model, s.effort, s.git_branch
              FROM sessions s LEFT JOIN turns t ON t.session_id = s.id
              WHERE s.workspace = ?1 AND s.archived = 0 AND s.deleted_at IS NULL
              GROUP BY s.id ORDER BY s.id DESC",
@@ -268,14 +282,15 @@ impl Database {
             Ok(SessionSummary {
                 id: row.get(0)?,
                 objective: row.get(1)?,
-                workspace: row.get(2)?,
-                created_at: row.get(3)?,
-                last_activity: row.get(4)?,
-                turn_count: row.get(5)?,
-                provider: row.get(6)?,
-                model: row.get(7)?,
-                effort: row.get(8)?,
-                git_branch: row.get(9)?,
+                title: row.get(2)?,
+                workspace: row.get(3)?,
+                created_at: row.get(4)?,
+                last_activity: row.get(5)?,
+                turn_count: row.get(6)?,
+                provider: row.get(7)?,
+                model: row.get(8)?,
+                effort: row.get(9)?,
+                git_branch: row.get(10)?,
             })
         })?;
         rows.collect()
@@ -294,6 +309,97 @@ impl Database {
             "UPDATE sessions SET provider = COALESCE(?1, provider), model = COALESCE(?2, model), effort = COALESCE(?3, effort), git_branch = COALESCE(?4, git_branch) WHERE id = ?5 AND workspace = ?6 AND archived = 0 AND deleted_at IS NULL",
             params![provider, model, effort, git_branch, id, workspace],
         )? == 1)
+    }
+
+    pub fn set_session_title(&self, id: i64, workspace: &str, title: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET title = ?1 WHERE id = ?2 AND workspace = ?3 AND archived = 0 AND deleted_at IS NULL",
+            params![title, id, workspace],
+        )? == 1)
+    }
+
+    pub fn create_context_boundary(&self, session_id: i64, reason: &str) -> SqlResult<i64> {
+        let message_id: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO context_boundaries(session_id, message_id, reason, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
+            params![session_id, message_id, reason],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn persist_compaction_checkpoint(
+        &self,
+        session_id: i64,
+        reason: &str,
+        summary: &str,
+    ) -> SqlResult<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let message_id: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO context_boundaries(session_id, message_id, reason, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
+            params![session_id, message_id, reason],
+        )?;
+        transaction.execute(
+            "INSERT INTO messages(session_id, turn_id, role, content, created_at) VALUES (?1, NULL, 'system', ?2, strftime('%s','now'))",
+            params![session_id, summary.chars().take(4096).collect::<String>()],
+        )?;
+        transaction.commit()
+    }
+
+    pub fn session_context_messages(&self, session_id: i64) -> SqlResult<Vec<(String, String)>> {
+        let boundary: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(message_id), 0) FROM context_boundaries WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        let mut statement = self.connection.prepare(
+            "SELECT role, content FROM messages WHERE session_id = ?1 AND id > ?2 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![session_id, boundary], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        rows.collect()
+    }
+
+    pub fn last_user_message(&self, session_id: i64) -> SqlResult<Option<String>> {
+        self.connection.query_row(
+            "SELECT content FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        ).optional()
+    }
+
+    pub fn create_boundary_before_last_exchange(
+        &self,
+        session_id: i64,
+        reason: &str,
+    ) -> SqlResult<bool> {
+        let message_id: Option<i64> = self.connection.query_row(
+            "SELECT id FROM messages WHERE session_id = ?1 AND role = 'user' ORDER BY id DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        ).optional()?;
+        let Some(_message_id) = message_id else {
+            return Ok(false);
+        };
+        let boundary: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO context_boundaries(session_id, message_id, reason, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))",
+            params![session_id, boundary, reason],
+        )?;
+        Ok(true)
     }
 
     pub fn session_override(&self, id: i64, workspace: &str) -> SqlResult<Option<SessionOverride>> {
@@ -750,5 +856,101 @@ mod tests {
             .expect("wrong workspace"));
         assert!(db.delete_session(second, "/workspace").expect("delete"));
         assert!(db.list_sessions("/workspace").expect("list").is_empty());
+    }
+
+    #[test]
+    fn session_title_and_context_boundaries_survive_reopen() {
+        let path = std::env::temp_dir().join(format!("helios-storage-c1-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::open(&path).expect("open");
+        let session = db
+            .create_session_for_workspace("objective", "/workspace")
+            .expect("session");
+        let first_turn = db.append_turn(session, 0).expect("turn");
+        db.append_message(session, first_turn, "user", "old prompt")
+            .expect("old");
+        db.append_message(session, first_turn, "assistant", "old answer")
+            .expect("old answer");
+        assert!(db
+            .set_session_title(session, "/workspace", "named")
+            .expect("title"));
+        assert_eq!(
+            db.session(session)
+                .expect("session")
+                .expect("record")
+                .title
+                .as_deref(),
+            Some("named")
+        );
+        db.create_context_boundary(session, "clear")
+            .expect("boundary");
+        let second_turn = db.append_turn(session, 1).expect("turn");
+        db.append_message(session, second_turn, "user", "new prompt")
+            .expect("new");
+        assert_eq!(
+            db.session_context_messages(session).expect("context").len(),
+            1
+        );
+        drop(db);
+        let reopened = Database::open(&path).expect("reopen");
+        assert_eq!(
+            reopened
+                .session(session)
+                .expect("session")
+                .expect("record")
+                .title
+                .as_deref(),
+            Some("named")
+        );
+        assert_eq!(
+            reopened.session_context_messages(session).expect("context")[0].1,
+            "new prompt"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retry_boundary_keeps_durable_messages_but_hides_last_exchange() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("retry", "/workspace")
+            .expect("session");
+        let turn = db.append_turn(session, 0).expect("turn");
+        db.append_message(session, turn, "user", "try this")
+            .expect("user");
+        db.append_message(session, turn, "assistant", "failed")
+            .expect("assistant");
+        assert!(db
+            .create_boundary_before_last_exchange(session, "retry")
+            .expect("boundary"));
+        assert!(db.session_messages(session).expect("journal").len() == 2);
+        assert!(db
+            .session_context_messages(session)
+            .expect("context")
+            .is_empty());
+        assert_eq!(
+            db.last_user_message(session).expect("last").as_deref(),
+            Some("try this")
+        );
+    }
+
+    #[test]
+    fn compaction_checkpoint_replaces_active_context_without_erasing_journal() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("compact", "/workspace")
+            .expect("session");
+        let turn = db.append_turn(session, 0).expect("turn");
+        db.append_message(session, turn, "user", "old")
+            .expect("user");
+        db.append_message(session, turn, "assistant", "old answer")
+            .expect("assistant");
+        db.persist_compaction_checkpoint(session, "compact", "checkpoint summary")
+            .expect("checkpoint");
+        assert_eq!(db.session_messages(session).expect("journal").len(), 3);
+        assert_eq!(
+            db.session_context_messages(session).expect("context")[0].1,
+            "checkpoint summary"
+        );
     }
 }
