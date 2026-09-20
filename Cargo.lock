@@ -24,6 +24,7 @@ dependencies = [
  "agent-terminal",
  "agent-tools",
  "agent-tui",
+ "crossterm",
  "keyring",
  "libc",
  "reqwest",

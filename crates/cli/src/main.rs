@@ -6624,6 +6624,57 @@ impl EventSink for PrintingSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_worker_to_tui_decision_gates_workspace_effect() {
+        let root = std::env::temp_dir().join(format!(
+            "helios-tui-approval-{}-{}",
+            std::process::id(),
+            std::sync::atomic::AtomicU64::new(0).fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace");
+        let (events, receiver) = std::sync::mpsc::sync_channel(8);
+        let broker = ApprovalBroker::new(events);
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_approval_broker(broker.clone());
+        let cancellation = CancellationToken::default();
+        let worker_root = root.clone();
+        let worker_cancel = cancellation.clone();
+        let worker = std::thread::spawn(move || {
+            registry.execute(
+                "shell",
+                serde_json::json!({
+                    "program": "touch",
+                    "args": ["tui-approved.txt"],
+                    "cwd": worker_root.display().to_string(),
+                    "requires_pty": false
+                }),
+                &worker_cancel,
+            )
+        });
+        let request = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("permission event");
+        let mut model = agent_tui::TuiModel::default();
+        model.reduce(&request);
+        let prompt = model.permission_decision().cloned().expect("modal request");
+        assert_eq!(prompt.id, 1);
+        assert!(!root.join("tui-approved.txt").exists());
+        let action = model.handle_overlay_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            action,
+            agent_tui::OverlayAction::Permission(agent_tui::PermissionDecision::AllowOnce)
+        );
+        assert!(broker.decide(prompt.id, ApprovalDecision::AllowOnce));
+        worker.join().expect("worker join").expect("approved tool");
+        assert!(root.join("tui-approved.txt").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
     #[test]
     fn help_and_verify_parse() {
         assert_eq!(
