@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
-use std::path::Path;
+use sha2::{Digest, Sha256};
+use std::{fs, path::Path};
 
-pub const STORAGE_FORMAT_VERSION: u32 = 11;
+pub const STORAGE_FORMAT_VERSION: u32 = 12;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -108,8 +109,57 @@ pub struct CheckpointRecord {
     pub pinned: bool,
 }
 
+pub const CHECKPOINT_FILE_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct CheckpointFileRecord {
+    pub id: i64,
+    pub checkpoint_id: i64,
+    pub workspace: String,
+    pub relative_path: String,
+    pub existed: bool,
+    pub mode: Option<u32>,
+    pub size: u64,
+    pub pre_hash: String,
+    pub post_hash: Option<String>,
+    pub content: Option<Vec<u8>>,
+    pub available: bool,
+}
+
 pub struct Database {
     connection: Connection,
+}
+
+fn hash_bytes(content: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(content);
+    format!("{:x}", digest.finalize())
+}
+
+fn sensitive_checkpoint_path(path: &str) -> bool {
+    path.split('/').any(|part| {
+        let lower = part.to_ascii_lowercase();
+        lower == ".env"
+            || lower.contains("secret")
+            || lower.contains("token")
+            || lower.contains("password")
+            || lower == "id_rsa"
+    })
+}
+
+fn file_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
 }
 
 impl Database {
@@ -262,6 +312,13 @@ impl Database {
                  PRAGMA user_version = 11;",
             )?;
         }
+        if version < 12 {
+            self.connection.execute_batch(
+                "CREATE TABLE IF NOT EXISTS checkpoint_files (id INTEGER PRIMARY KEY, checkpoint_id INTEGER NOT NULL REFERENCES checkpoints(id) ON DELETE CASCADE, session_id INTEGER NOT NULL REFERENCES sessions(id), workspace TEXT NOT NULL, relative_path TEXT NOT NULL, existed INTEGER NOT NULL, mode INTEGER, size INTEGER NOT NULL, pre_hash TEXT NOT NULL, post_hash TEXT, content BLOB, available INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL, UNIQUE(checkpoint_id, relative_path));
+                 CREATE INDEX IF NOT EXISTS checkpoint_files_checkpoint ON checkpoint_files(checkpoint_id, id);
+                 PRAGMA user_version = 12;",
+            )?;
+        }
         Ok(())
     }
 
@@ -349,7 +406,9 @@ impl Database {
             ));
         }
         self.connection.execute("INSERT INTO checkpoints(session_id,message_id,workspace,label,reason,created_at) VALUES (?1,?2,?3,?4,?5,strftime('%s','now'))", params![session_id,message_id,workspace,label,reason])?;
-        Ok(self.connection.last_insert_rowid())
+        let id = self.connection.last_insert_rowid();
+        self.prune_checkpoints(session_id, workspace, 64)?;
+        Ok(id)
     }
 
     pub fn checkpoints(
@@ -383,6 +442,137 @@ impl Database {
     ) -> SqlResult<Option<CheckpointRecord>> {
         self.checkpoints(session_id, workspace)
             .map(|items| items.into_iter().find(|item| item.id == id))
+    }
+
+    pub fn record_checkpoint_file(
+        &self,
+        checkpoint_id: i64,
+        workspace: &str,
+        path: &Path,
+        existed: bool,
+        content: &[u8],
+    ) -> SqlResult<i64> {
+        let workspace_path = Path::new(workspace)
+            .canonicalize()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let candidate =
+            if path.exists() {
+                path.canonicalize()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+            } else {
+                let parent = path
+                    .parent()
+                    .unwrap_or(&workspace_path)
+                    .canonicalize()
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+                parent.join(path.file_name().ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName("checkpoint path".into())
+                })?)
+            };
+        let relative = candidate.strip_prefix(&workspace_path).map_err(|_| {
+            rusqlite::Error::InvalidParameterName("checkpoint path outside workspace".into())
+        })?;
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_empty() || relative.contains("..") || sensitive_checkpoint_path(&relative) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "checkpoint path rejected".into(),
+            ));
+        }
+        let checkpoint_workspace: String = self.connection.query_row(
+            "SELECT workspace FROM checkpoints WHERE id=?1",
+            params![checkpoint_id],
+            |row| row.get(0),
+        )?;
+        if checkpoint_workspace != workspace {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "checkpoint workspace mismatch".into(),
+            ));
+        }
+        let hash = hash_bytes(content);
+        let available = !existed || (path.is_file() && content.len() <= CHECKPOINT_FILE_MAX_BYTES);
+        let stored = available.then(|| content.to_vec());
+        let mode = file_mode(path);
+        self.connection.execute(
+            "INSERT OR IGNORE INTO checkpoint_files(checkpoint_id,session_id,workspace,relative_path,existed,mode,size,pre_hash,content,available,created_at) SELECT ?1,session_id,workspace,?2,?3,?4,?5,?6,?7,?8,strftime('%s','now') FROM checkpoints WHERE id=?1",
+            params![checkpoint_id, relative, existed, mode.map(i64::from), content.len() as i64, hash, stored, available],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn update_checkpoint_file_after(
+        &self,
+        checkpoint_id: i64,
+        workspace: &str,
+        path: &Path,
+        content: &[u8],
+    ) -> SqlResult<bool> {
+        let workspace_path = Path::new(workspace)
+            .canonicalize()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let relative = candidate
+            .strip_prefix(&workspace_path)
+            .map_err(|_| {
+                rusqlite::Error::InvalidParameterName("checkpoint path outside workspace".into())
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let changed = self.connection.execute(
+            "UPDATE checkpoint_files SET post_hash=?1 WHERE checkpoint_id=?2 AND workspace=?3 AND relative_path=?4",
+            params![hash_bytes(content), checkpoint_id, workspace, relative],
+        )?;
+        Ok(changed != 0)
+    }
+
+    pub fn checkpoint_files(
+        &self,
+        checkpoint_id: i64,
+        workspace: &str,
+    ) -> SqlResult<Vec<CheckpointFileRecord>> {
+        let mut statement = self.connection.prepare("SELECT id,checkpoint_id,workspace,relative_path,existed,mode,size,pre_hash,post_hash,content,available FROM checkpoint_files WHERE checkpoint_id=?1 AND workspace=?2 ORDER BY id LIMIT 256")?;
+        let rows = statement
+            .query_map(params![checkpoint_id, workspace], |row| {
+                Ok(CheckpointFileRecord {
+                    id: row.get(0)?,
+                    checkpoint_id: row.get(1)?,
+                    workspace: row.get(2)?,
+                    relative_path: row.get(3)?,
+                    existed: row.get::<_, i64>(4)? != 0,
+                    mode: row.get::<_, Option<i64>>(5)?.map(|value| value as u32),
+                    size: row.get::<_, i64>(6)? as u64,
+                    pre_hash: row.get(7)?,
+                    post_hash: row.get(8)?,
+                    content: row.get(9)?,
+                    available: row.get::<_, i64>(10)? != 0,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn pin_checkpoint(
+        &self,
+        id: i64,
+        session_id: i64,
+        workspace: &str,
+        pinned: bool,
+    ) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE checkpoints SET pinned=?1 WHERE id=?2 AND session_id=?3 AND workspace=?4",
+            params![pinned, id, session_id, workspace],
+        )? != 0)
+    }
+
+    pub fn prune_checkpoints(
+        &self,
+        session_id: i64,
+        workspace: &str,
+        keep: usize,
+    ) -> SqlResult<usize> {
+        self.connection.execute(
+            "DELETE FROM checkpoints WHERE id IN (SELECT id FROM checkpoints WHERE session_id=?1 AND workspace=?2 AND pinned=0 ORDER BY id DESC LIMIT -1 OFFSET ?3)",
+            params![session_id, workspace, keep as i64],
+        )
     }
 
     pub fn session(&self, id: i64) -> SqlResult<Option<SessionRecord>> {
@@ -1484,5 +1674,60 @@ mod tests {
             .checkpoint(checkpoint, parent, "/other")
             .expect("scope")
             .is_none());
+    }
+
+    #[test]
+    fn checkpoint_files_store_bounded_preimage_and_post_hash() {
+        let root =
+            std::env::temp_dir().join(format!("helios-checkpoint-files-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let file = root.join("file.txt");
+        fs::write(&file, "before").expect("file");
+        let workspace = root
+            .canonicalize()
+            .expect("canonical")
+            .display()
+            .to_string();
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("run", &workspace)
+            .expect("session");
+        let checkpoint = db
+            .create_checkpoint(session, &workspace, "auto", "test")
+            .expect("checkpoint");
+        db.record_checkpoint_file(checkpoint, &workspace, &file, true, b"before")
+            .expect("record");
+        fs::write(&file, "after").expect("mutate");
+        db.update_checkpoint_file_after(checkpoint, &workspace, &file, b"after")
+            .expect("post");
+        let record = &db.checkpoint_files(checkpoint, &workspace).expect("files")[0];
+        assert_eq!(record.content.as_deref(), Some(b"before".as_slice()));
+        let expected_hash = hash_bytes(b"after");
+        assert_eq!(record.post_hash.as_deref(), Some(expected_hash.as_str()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn checkpoint_retention_keeps_pinned_entries() {
+        let db = Database::in_memory().expect("db");
+        let session = db
+            .create_session_for_workspace("run", "/workspace")
+            .expect("session");
+        let pinned = db
+            .create_checkpoint(session, "/workspace", "pinned", "test")
+            .expect("checkpoint");
+        assert!(db
+            .pin_checkpoint(pinned, session, "/workspace", true)
+            .expect("pin"));
+        for index in 0..70 {
+            db.create_checkpoint(session, "/workspace", &format!("cp-{index}"), "test")
+                .expect("checkpoint");
+        }
+        let checkpoints = db.checkpoints(session, "/workspace").expect("list");
+        assert!(checkpoints
+            .iter()
+            .any(|item| item.id == pinned && item.pinned));
+        assert!(checkpoints.len() <= 65);
     }
 }

@@ -21,8 +21,8 @@ use agent_providers::{
     profile_for, AnthropicProvider, FakeProvider, GeminiProvider, ModelProvider,
     OpenAiCompatibleProvider, OpenAiProvider,
 };
-use agent_sandbox::PermissionEngine;
 use agent_sandbox::PermissionMode;
+use agent_sandbox::{PermissionClass, PermissionEngine};
 use agent_skills::SkillCatalog;
 use agent_storage::{ContextRecord, Database, SessionSummary, UsageRecord};
 use agent_subagents::{
@@ -30,7 +30,9 @@ use agent_subagents::{
     TaskResult, TaskSpec, WorktreeManager,
 };
 use agent_terminal::CancellationToken;
-use agent_tools::{ApprovalBroker, ApprovalDecision, ToolRegistry, ToolStatus};
+use agent_tools::{
+    ApprovalBroker, ApprovalDecision, SnapshotEvent, SnapshotHook, ToolRegistry, ToolStatus,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -2301,6 +2303,7 @@ fn interactive_command() -> Result<(), String> {
     let (sender, receiver) = agent_tui::bounded_event_channel(settings.channel_capacity);
     let approval = ApprovalBroker::new(sender.clone());
     let approval_for_ui = approval.clone();
+    let rollback_approval = approval.clone();
     let ui_cancellation = CancellationToken::default();
     let first_turn = Arc::new(AtomicBool::new(true));
     let session_model = Arc::new(Mutex::new(None::<String>));
@@ -2349,9 +2352,21 @@ fn interactive_command() -> Result<(), String> {
                     let session = active_session.lock().ok().and_then(|value| *value)
                         .or_else(|| db.latest_session(&workspace_path.display().to_string()).ok().flatten().map(|s| s.id))
                         .ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
-                    db.create_checkpoint(session, &workspace_path.display().to_string(), if label.is_empty() { "manual" } else { label }, "explicit user checkpoint")
+                    if label == "list" {
+                        return db.checkpoints(session, &workspace_path.display().to_string()).map(|items| items.into_iter().map(|item| format!("{} {}{}", item.id, item.label, if item.pinned { " [pinned]" } else { "" })).collect::<Vec<_>>().join("\n"));
+                    }
+                    if let Some(id) = label.strip_prefix("show ").and_then(|value| value.trim().parse::<i64>().ok()) {
+                        return db.checkpoint(id, session, &workspace_path.display().to_string()).map(|item| item.map(|value| format!("checkpoint={} label={} reason={} pinned={}", value.id, value.label, value.reason, value.pinned)).unwrap_or_else(|| "checkpoint not found".into()));
+                    }
+                    if let Some(id) = label.strip_prefix("pin ").and_then(|value| value.trim().parse::<i64>().ok()) {
+                        return db.pin_checkpoint(id, session, &workspace_path.display().to_string(), true).map(|changed| if changed { "checkpoint pinned".into() } else { "checkpoint not found".into() });
+                    }
+                    if let Some(id) = label.strip_prefix("unpin ").and_then(|value| value.trim().parse::<i64>().ok()) {
+                        return db.pin_checkpoint(id, session, &workspace_path.display().to_string(), false).map(|changed| if changed { "checkpoint unpinned".into() } else { "checkpoint not found".into() });
+                    }
+                    db.create_checkpoint(session, &workspace_path.display().to_string(), if label.is_empty() { "manual" } else { label }, "explicit user checkpoint").map(|id| format!("checkpoint={id}"))
                 });
-                let _ = events.send(agent_protocol::Event::ModelDelta(result.map(|id| format!("checkpoint={id}")).unwrap_or_else(|error| format!("checkpoint error: {error}"))));
+                let _ = events.send(agent_protocol::Event::ModelDelta(result.unwrap_or_else(|error| format!("checkpoint error: {error}"))));
                 return agent_tui::SubmitAction::Continue;
             }
             if command.starts_with("/branch") || command.starts_with("/fork") {
@@ -2370,8 +2385,15 @@ fn interactive_command() -> Result<(), String> {
                 } else { let _ = events.send(agent_protocol::Event::Error(format!("{kind} failed"))); }
                 return agent_tui::SubmitAction::Continue;
             }
-            if command.starts_with("/rewind") {
+            if command.starts_with("/rollback") || command.starts_with("/rewind") {
                 let id = prompt.split_whitespace().nth(1).and_then(|value| value.parse::<i64>().ok());
+                let filesystem = command.starts_with("/rollback") || prompt.split_whitespace().nth(2).is_some_and(|value| matches!(value, "filesystem" | "all"));
+                if filesystem {
+                    let mode = load_runtime_policy(&project_config_path).map(|value| value.mode).unwrap_or(PermissionMode::ReadOnly);
+                    let result = id.ok_or_else(|| "rollback requires checkpoint ID".to_owned()).and_then(|checkpoint| rollback_checkpoint(&db_path, checkpoint, &workspace_path, mode, &rollback_approval, &turn_cancellation));
+                    let _ = events.send(agent_protocol::Event::ModelDelta(result.unwrap_or_else(|error| format!("rollback error: {error}"))));
+                    return agent_tui::SubmitAction::Continue;
+                }
                 let result = Database::open(&db_path).and_then(|db| {
                     let session = active_session.lock().ok().and_then(|value| *value).ok_or_else(|| rusqlite::Error::InvalidParameterName("no active session".into()))?;
                     let checkpoint = id.and_then(|checkpoint_id| db.checkpoint(checkpoint_id, session, &workspace_path.display().to_string()).ok().flatten()).ok_or_else(|| rusqlite::Error::InvalidParameterName("checkpoint not found".into()))?;
@@ -3085,6 +3107,136 @@ fn interactive_command() -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
+fn checkpoint_hash(bytes: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(bytes);
+    format!("{:x}", digest.finalize())
+}
+
+fn rollback_checkpoint(
+    db_path: &Path,
+    checkpoint_id: i64,
+    workspace: &Path,
+    mode: PermissionMode,
+    approval: &ApprovalBroker,
+    cancellation: &CancellationToken,
+) -> Result<String, String> {
+    let engine = PermissionEngine::new(workspace, mode).map_err(|error| error.to_string())?;
+    engine
+        .authorize(PermissionClass::WorkspaceWrite)
+        .map_err(|error| error.to_string())?;
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    let db = Database::open(db_path).map_err(|error| error.to_string())?;
+    let workspace_id = workspace.display().to_string();
+    let records = db
+        .checkpoint_files(checkpoint_id, &workspace_id)
+        .map_err(|error| error.to_string())?;
+    if records.is_empty() {
+        return Err("checkpoint has no filesystem snapshots".into());
+    }
+    let mut prepared = Vec::new();
+    for record in &records {
+        let relative = Path::new(&record.relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err("checkpoint path escapes workspace".into());
+        }
+        let path = workspace.join(relative);
+        if path.exists() {
+            let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+            if !canonical.starts_with(&workspace) {
+                return Err("checkpoint symlink escapes workspace".into());
+            }
+        }
+        let current = path
+            .exists()
+            .then(|| fs::read(&path))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let current_hash = current.as_deref().map(checkpoint_hash);
+        if current_hash.as_deref() == Some(record.pre_hash.as_str()) {
+            continue;
+        }
+        if record.post_hash.as_deref() != current_hash.as_deref() {
+            return Err(format!("rollback conflict: {}", record.relative_path));
+        }
+        if record.existed && !record.available {
+            return Err(format!(
+                "snapshot unavailable (over cap): {}",
+                record.relative_path
+            ));
+        }
+        prepared.push((record, path, current));
+    }
+    if !approval
+        .request_approval(
+            PermissionClass::WorkspaceWrite,
+            format!(
+                "rollback checkpoint {checkpoint_id} ({} files)",
+                prepared.len()
+            ),
+            cancellation,
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Err("rollback denied or timed out".into());
+    }
+    let mut backups = Vec::new();
+    for (_, path, current) in &prepared {
+        backups.push((path.clone(), current.clone()));
+    }
+    for (record, path, _) in &prepared {
+        let result = if record.existed {
+            let content = record
+                .content
+                .as_deref()
+                .ok_or_else(|| "snapshot content unavailable".to_owned())?;
+            let parent = path.parent().ok_or("invalid checkpoint path")?;
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            let temp = parent.join(format!(
+                ".helios-rollback-{}-{}",
+                std::process::id(),
+                record.id
+            ));
+            fs::write(&temp, content)
+                .and_then(|_| fs::rename(&temp, path))
+                .map_err(|error| error.to_string())
+        } else if path.exists() {
+            fs::remove_file(path).map_err(|error| error.to_string())
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            for (backup_path, backup) in &backups {
+                match backup {
+                    Some(bytes) => {
+                        let _ = fs::write(backup_path, bytes);
+                    }
+                    None => {
+                        let _ = fs::remove_file(backup_path);
+                    }
+                }
+            }
+            return Err(format!(
+                "rollback aborted and restored prior state: {error}"
+            ));
+        }
+        if let Some(mode) = record.mode {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+            }
+        }
+    }
+    Ok(format!("rollback restored {} file(s)", prepared.len()))
+}
+
 fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
     let config_path = paths.effective_project_config();
     let config = load_user_config(config_path).ok();
@@ -3122,6 +3274,10 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         ("branch", "create a new session lineage branch"),
         ("fork", "fork a new session from the current lineage"),
         ("rewind", "restore conversation context to a checkpoint"),
+        (
+            "rollback",
+            "restore checkpoint files after explicit approval",
+        ),
         ("exit", "close the interactive session"),
         ("quit", "close the interactive session"),
     ]
@@ -4191,10 +4347,44 @@ fn run_command_with_cancellation(
     }
     let disabled_tools =
         effective_disabled_tool_names_for_session(&runtime_config_path, Some(session_id))?;
+    let checkpoint_id = database
+        .create_checkpoint(
+            session_id,
+            &workspace_id,
+            "auto-before-turn",
+            "automatic pre-mutation checkpoint",
+        )
+        .ok();
+    let snapshot_hook = checkpoint_id.map(|checkpoint_id| {
+        let db_path = options.db_path.clone();
+        let workspace_id = workspace_id.clone();
+        Arc::new(move |event: SnapshotEvent| -> Result<(), String> {
+            let db = Database::open(&db_path).map_err(|error| error.to_string())?;
+            match event {
+                SnapshotEvent::Before {
+                    path,
+                    content,
+                    existed,
+                } => db
+                    .record_checkpoint_file(checkpoint_id, &workspace_id, &path, existed, &content)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+                SnapshotEvent::After { path, content, .. } => db
+                    .update_checkpoint_file_after(checkpoint_id, &workspace_id, &path, &content)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            }
+        }) as SnapshotHook
+    });
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_disabled_tools(disabled_tools)
         .with_cancellation(cancellation.clone());
+    let builtin = if let Some(hook) = snapshot_hook {
+        builtin.with_snapshot_hook(hook)
+    } else {
+        builtin
+    };
     let builtin = if let Some(approval) = options.approval.clone() {
         builtin.with_approval_broker(approval)
     } else {
@@ -8726,6 +8916,81 @@ mod tests {
         assert!(broker.decide(prompt.id, ApprovalDecision::AllowOnce));
         worker.join().expect("worker join").expect("approved tool");
         assert!(root.join("tui-approved.txt").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rollback_restores_checkpoint_after_approval_and_rejects_conflict() {
+        let root = std::env::temp_dir().join(format!("helios-rollback-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("workspace");
+        let db_path = root.join("state.db");
+        let file = root.join("tracked.txt");
+        fs::write(&file, "before").expect("before");
+        let workspace = root.canonicalize().expect("canonical");
+        let db = Database::open(&db_path).expect("db");
+        let session = db
+            .create_session_for_workspace("run", &workspace.display().to_string())
+            .expect("session");
+        let checkpoint = db
+            .create_checkpoint(session, &workspace.display().to_string(), "auto", "test")
+            .expect("checkpoint");
+        db.record_checkpoint_file(
+            checkpoint,
+            &workspace.display().to_string(),
+            &file,
+            true,
+            b"before",
+        )
+        .expect("preimage");
+        fs::write(&file, "after").expect("after");
+        db.update_checkpoint_file_after(
+            checkpoint,
+            &workspace.display().to_string(),
+            &file,
+            b"after",
+        )
+        .expect("postimage");
+        drop(db);
+        let (events, receiver) = std::sync::mpsc::sync_channel(4);
+        let broker = ApprovalBroker::new(events);
+        let worker_broker = broker.clone();
+        let worker_db = db_path.clone();
+        let worker_workspace = workspace.clone();
+        let worker = std::thread::spawn(move || {
+            rollback_checkpoint(
+                &worker_db,
+                checkpoint,
+                &worker_workspace,
+                PermissionMode::WorkspaceWrite,
+                &worker_broker,
+                &CancellationToken::default(),
+            )
+        });
+        let request = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("approval");
+        let id = match request {
+            agent_protocol::Event::PermissionRequested(value) => value
+                .split(';')
+                .find_map(|part| part.strip_prefix("id=")?.parse::<u64>().ok())
+                .expect("approval id"),
+            _ => panic!("unexpected event"),
+        };
+        assert!(broker.decide(id, ApprovalDecision::AllowOnce));
+        worker.join().expect("join").expect("rollback");
+        assert_eq!(fs::read_to_string(&file).expect("restored"), "before");
+        fs::write(&file, "unrelated").expect("conflict");
+        let (events, _receiver) = std::sync::mpsc::sync_channel(1);
+        let conflict = rollback_checkpoint(
+            &db_path,
+            checkpoint,
+            &workspace,
+            PermissionMode::WorkspaceWrite,
+            &ApprovalBroker::new(events),
+            &CancellationToken::default(),
+        );
+        assert!(conflict.is_err());
         let _ = fs::remove_dir_all(root);
     }
     #[test]

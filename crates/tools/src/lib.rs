@@ -110,6 +110,15 @@ impl ApprovalBroker {
         self
     }
 
+    pub fn request_approval(
+        &self,
+        class: PermissionClass,
+        action: impl Into<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, ToolError> {
+        self.approve(class, action.into(), cancellation)
+    }
+
     fn approve(
         &self,
         class: PermissionClass,
@@ -203,6 +212,22 @@ pub struct ToolOutcome {
     pub spill_ref: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug)]
+pub enum SnapshotEvent {
+    Before {
+        path: PathBuf,
+        content: Vec<u8>,
+        existed: bool,
+    },
+    After {
+        path: PathBuf,
+        content: Vec<u8>,
+        existed: bool,
+    },
+}
+
+pub type SnapshotHook = Arc<dyn Fn(SnapshotEvent) -> Result<(), String> + Send + Sync>;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerificationResult {
     pub status: ToolStatus,
@@ -238,6 +263,7 @@ pub struct ToolRegistry {
     cancellation: CancellationToken,
     approval: Option<ApprovalBroker>,
     disabled: BTreeSet<String>,
+    snapshot_hook: Option<SnapshotHook>,
 }
 
 impl agent_core::ToolExecutor for ToolRegistry {
@@ -310,6 +336,7 @@ impl ToolRegistry {
             cancellation: CancellationToken::default(),
             approval: None,
             disabled: BTreeSet::new(),
+            snapshot_hook: None,
         })
     }
 
@@ -329,6 +356,11 @@ impl ToolRegistry {
         S: Into<String>,
     {
         self.disabled = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn with_snapshot_hook(mut self, hook: SnapshotHook) -> Self {
+        self.snapshot_hook = Some(hook);
         self
     }
 
@@ -594,11 +626,37 @@ impl ToolRegistry {
         }
         let input: Input = parse("apply_patch", args)?;
         let path = self.permissions.resolve_path(input.path)?;
-        let current = fs::read_to_string(&path)?;
-        if current != input.expected_content {
+        let current = fs::read(&path).unwrap_or_default();
+        let existed = path.exists();
+        if !existed && !input.expected_content.is_empty() {
+            return Err(ToolError::InvalidArguments {
+                tool: "apply_patch".into(),
+                reason: "missing file requires empty expected_content".into(),
+            });
+        }
+        if let Some(hook) = &self.snapshot_hook {
+            hook(SnapshotEvent::Before {
+                path: path.clone(),
+                content: current.clone(),
+                existed,
+            })
+            .map_err(ToolError::Approval)?;
+        }
+        let current_text = String::from_utf8(current).map_err(|_| ToolError::InvalidArguments {
+            tool: "apply_patch".into(),
+            reason: "apply_patch requires UTF-8; use a binary-safe tool for binary files".into(),
+        })?;
+        if current_text != input.expected_content {
             return Err(ToolError::PatchConflict);
         }
-        fs::write(path, input.replacement)?;
+        fs::write(&path, input.replacement.as_bytes())?;
+        if let Some(hook) = &self.snapshot_hook {
+            let _ = hook(SnapshotEvent::After {
+                path,
+                content: input.replacement.into_bytes(),
+                existed: true,
+            });
+        }
         Ok(bounded(
             ToolStatus::Ok,
             "patch applied",
@@ -985,6 +1043,35 @@ mod tests {
         assert!(
             second.is_err(),
             "different preimage must not inherit approval"
+        );
+    }
+
+    #[test]
+    fn snapshot_hook_captures_preimage_and_postimage_before_write() {
+        let root = root("snapshot-hook");
+        let file = root.join("file.txt");
+        fs::write(&file, "old").expect("write");
+        let events = Arc::new(Mutex::new(Vec::<SnapshotEvent>::new()));
+        let receiver = events.clone();
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_snapshot_hook(Arc::new(move |event| {
+                receiver.lock().expect("events").push(event);
+                Ok(())
+            }));
+        registry
+            .execute(
+                "apply_patch",
+                json!({"path":"file.txt","expected_content":"old","replacement":"new"}),
+                &CancellationToken::default(),
+            )
+            .expect("patch");
+        let events = events.lock().expect("events");
+        assert!(
+            matches!(&events[0], SnapshotEvent::Before { content, existed: true, .. } if content == b"old")
+        );
+        assert!(
+            matches!(&events[1], SnapshotEvent::After { content, existed: true, .. } if content == b"new")
         );
     }
 
