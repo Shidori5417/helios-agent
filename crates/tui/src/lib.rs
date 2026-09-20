@@ -57,6 +57,7 @@ pub struct TuiModel {
     pub usage_summary: Option<String>,
     pub cost_summary: Option<String>,
     pub context_summary: Option<String>,
+    pub mcp: Vec<McpOption>,
 }
 
 impl Default for TuiModel {
@@ -98,6 +99,7 @@ impl Default for TuiModel {
             usage_summary: None,
             cost_summary: None,
             context_summary: None,
+            mcp: Vec::new(),
         }
     }
 }
@@ -156,6 +158,14 @@ pub struct MemoryOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpOption {
+    pub name: String,
+    pub status: String,
+    pub enabled: bool,
+    pub tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlayKind {
     Palette,
     Help,
@@ -169,6 +179,7 @@ pub enum OverlayKind {
     Keybindings,
     Tools,
     Memory,
+    Mcp,
     Usage,
     Cost,
 }
@@ -591,6 +602,22 @@ impl TuiModel {
                     local: true,
                 })
                 .collect()
+        } else if kind == OverlayKind::Mcp {
+            self.mcp
+                .iter()
+                .map(|item| PaletteCommand {
+                    name: item.name.clone(),
+                    description: format!(
+                        "{} · enabled={} · tools={}",
+                        item.status,
+                        item.enabled,
+                        item.tools.len()
+                    ),
+                    category: "MCP".into(),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
         } else if matches!(
             kind,
             OverlayKind::Usage | OverlayKind::Cost | OverlayKind::Context
@@ -646,6 +673,7 @@ impl TuiModel {
             OverlayKind::Keybindings => "Keybindings",
             OverlayKind::Tools => "Tools",
             OverlayKind::Memory => "Memory",
+            OverlayKind::Mcp => "MCP",
             OverlayKind::Usage => "Usage",
             OverlayKind::Cost => "Cost",
         };
@@ -797,6 +825,7 @@ impl TuiModel {
                     let session_overlay = overlay.kind == OverlayKind::Sessions;
                     let tools_overlay = overlay.kind == OverlayKind::Tools;
                     let memory_overlay = overlay.kind == OverlayKind::Memory;
+                    let mcp_overlay = overlay.kind == OverlayKind::Mcp;
                     self.overlay = None;
                     return if command.local {
                         if model_overlay {
@@ -807,6 +836,8 @@ impl TuiModel {
                             OverlayAction::Execute(format!("/tools info {}", command.name))
                         } else if memory_overlay {
                             OverlayAction::Execute(format!("/memory show {}", command.name))
+                        } else if mcp_overlay {
+                            OverlayAction::Execute(format!("/mcp warm {}", command.name))
                         } else {
                             OverlayAction::Execute(format!("/{}", command.name))
                         }
@@ -837,6 +868,7 @@ impl TuiModel {
         self.diff_variants = context.diff_variants;
         self.tools = context.tools;
         self.memory = context.memory;
+        self.mcp = context.mcp;
         self.usage_summary = context.usage_summary;
         self.cost_summary = context.cost_summary;
         self.context_summary = context.context_summary;
@@ -1119,6 +1151,7 @@ pub struct TuiContext {
     pub memory: Vec<MemoryOption>,
     pub usage_summary: Option<String>,
     pub cost_summary: Option<String>,
+    pub mcp: Vec<McpOption>,
     pub context_summary: Option<String>,
 }
 
@@ -1505,6 +1538,7 @@ where
                                 let local_overlay = match command.as_str() {
                                     "/tools" => Some(OverlayKind::Tools),
                                     "/memory" => Some(OverlayKind::Memory),
+                                    "/mcp" => Some(OverlayKind::Mcp),
                                     "/usage" => Some(OverlayKind::Usage),
                                     "/cost" => Some(OverlayKind::Cost),
                                     "/context" => Some(OverlayKind::Context),
@@ -1611,6 +1645,10 @@ where
                             }
                             if prompt.trim() == "/keybindings" {
                                 model.open_overlay(OverlayKind::Keybindings);
+                                continue;
+                            }
+                            if prompt.trim() == "/mcp" {
+                                model.open_overlay(OverlayKind::Mcp);
                                 continue;
                             }
                             model.history.push(prompt.clone());
@@ -1988,5 +2026,17 @@ mod tests {
         assert!(model.overlay_text().contains("input=1"));
         model.open_overlay(OverlayKind::Cost);
         assert!(model.overlay_text().contains("unavailable"));
+        model.mcp = vec![McpOption {
+            name: "local".into(),
+            status: "not-started".into(),
+            enabled: true,
+            tools: vec!["echo".into()],
+        }];
+        model.open_overlay(OverlayKind::Mcp);
+        assert!(model.overlay_text().contains("not-started"));
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/mcp warm local".into())
+        );
     }
 }

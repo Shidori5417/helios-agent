@@ -266,6 +266,7 @@ struct LspRuntime {
 
 struct McpRuntime {
     name: String,
+    enabled: bool,
     advertised: Vec<String>,
     client: McpClient<HostAllowlist<PermissionPolicy>>,
     discovered: bool,
@@ -291,6 +292,7 @@ impl RuntimeExecutor {
             };
             mcp.push(McpRuntime {
                 name: server.config.name.clone(),
+                enabled: server.config.enabled,
                 client: McpClient::new(server.config, policy, 64 * 1024),
                 advertised,
                 discovered: false,
@@ -319,7 +321,7 @@ impl RuntimeExecutor {
 impl RuntimeExecutor {
     fn definitions(&self) -> Vec<agent_protocol::ToolDefinition> {
         let mut definitions = self.builtin.definitions();
-        for server in &self.mcp {
+        for server in self.mcp.iter().filter(|server| server.enabled) {
             for name in &server.advertised {
                 definitions.push(agent_protocol::ToolDefinition {
                     name: format!("mcp:{}:{name}", server.name),
@@ -360,10 +362,11 @@ impl RuntimeExecutor {
                 .client
                 .initialize(&self.cancellation)
                 .map_err(|error| error.to_string())?;
-            server
+            let discovered = server
                 .client
                 .discover_tools(&self.cancellation)
                 .map_err(|error| error.to_string())?;
+            server.advertised = discovered.iter().map(|tool| tool.name.clone()).collect();
             server.discovered = true;
         }
         let output = server
@@ -2668,6 +2671,8 @@ fn interactive_command() -> Result<(), String> {
                     Some("pending") => slash_command_output("/memory"),
                     _ => Some("memory action requires show or pending".into()),
                 }
+            } else if command == "/mcp" || command.starts_with("/mcp ") {
+                Some(mcp_interactive_command(&command, &workspace_path, &project_config_path))
             } else if let Some(custom_prompt) = custom_prompt_command(&command, &project_config_path) {
                 prompt_for_run = custom_prompt;
                 None
@@ -2994,6 +2999,20 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
             (memory, usage, context)
         })
         .unwrap_or_default();
+    let mcp = load_mcp_config(config_path, &paths.workspace)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|server| agent_tui::McpOption {
+            name: server.config.name,
+            status: if server.config.enabled {
+                "not-started".into()
+            } else {
+                "disabled".into()
+            },
+            enabled: server.config.enabled,
+            tools: server.config.tool_include,
+        })
+        .collect();
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -3013,6 +3032,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         diff_variants,
         tools,
         memory,
+        mcp,
         usage_summary,
         cost_summary: Some("cost unavailable (no explicit pricing configured)".into()),
         context_summary,
@@ -3240,6 +3260,127 @@ fn slash_command_output(command: &str) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn mcp_interactive_command(command: &str, workspace: &Path, config_path: &Path) -> String {
+    let action = command.strip_prefix("/mcp").unwrap_or("").trim();
+    let parts = action.split_whitespace().collect::<Vec<_>>();
+    let action = parts.first().copied().unwrap_or("list");
+    let servers = match load_mcp_config(config_path, workspace) {
+        Ok(servers) => servers,
+        Err(error) => return format!("mcp config error: {error}"),
+    };
+    if matches!(action, "enable" | "disable") {
+        let Some(id) = parts.get(1) else {
+            return format!("/mcp {action} requires server id");
+        };
+        return runtime_server_array_command(
+            "mcp",
+            &[action.to_string(), "--id".into(), (*id).into()],
+            config_path,
+        )
+        .map(|_| {
+            format!(
+                "mcp {id} {}d",
+                if action == "enable" {
+                    "enable"
+                } else {
+                    "disable"
+                }
+            )
+        })
+        .unwrap_or_else(|error| error);
+    }
+    if action == "auth" {
+        return servers
+            .into_iter()
+            .map(|server| match server.config.transport {
+                agent_mcp::McpTransport::StreamableHttp { auth_env, .. } => format!(
+                    "{} auth_env={}",
+                    server.config.name,
+                    auth_env.unwrap_or_else(|| "none".into())
+                ),
+                agent_mcp::McpTransport::Stdio => {
+                    format!("{} auth=not-configured", server.config.name)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if matches!(action, "list" | "reload") {
+        return servers
+            .into_iter()
+            .map(|server| {
+                format!(
+                    "{} enabled={} status=not-started",
+                    server.config.name, server.config.enabled
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    if action == "warm" || action == "discover" {
+        let Some(id) = parts.get(1) else {
+            return "/mcp warm requires server id".into();
+        };
+        return mcp_discover_server(id, workspace, config_path)
+            .unwrap_or_else(|error| format!("mcp discovery error: {error}"));
+    }
+    "mcp action requires list, enable, disable, auth, reload, or warm".into()
+}
+
+fn mcp_discover_server(id: &str, workspace: &Path, config_path: &Path) -> Result<String, String> {
+    let server = load_mcp_config(config_path, workspace)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|server| server.config.name == id)
+        .ok_or("MCP server not found")?;
+    let engine = PermissionEngine::new(workspace, PermissionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let policy = HostAllowlist {
+        inner: PermissionPolicy::new(engine),
+        allowed_hosts: server.allowed_hosts.clone(),
+    };
+    let cancellation = CancellationToken::default();
+    let mut client = McpClient::new(server.config, policy, 64 * 1024);
+    client
+        .initialize(&cancellation)
+        .map_err(|error| error.to_string())?;
+    let tools = client
+        .discover_tools(&cancellation)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "mcp={} status=ready tools={}",
+        id,
+        tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .take(128)
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
+fn println_result(result: Result<String, String>) -> Result<(), String> {
+    println!("{}", result?);
+    Ok(())
+}
+
+fn mcp_auth_command(config_path: &Path) -> Result<(), String> {
+    let workspace = workspace_root()?;
+    for server in load_mcp_config(config_path, &workspace).map_err(|error| error.to_string())? {
+        match server.config.transport {
+            agent_mcp::McpTransport::StreamableHttp { auth_env, .. } => println!(
+                "{} auth_env={}",
+                server.config.name,
+                auth_env.unwrap_or_else(|| "none".into())
+            ),
+            agent_mcp::McpTransport::Stdio => {
+                println!("{} auth=not-configured", server.config.name)
+            }
+        }
+    }
+    Ok(())
 }
 
 fn custom_prompt_command(command: &str, config_path: &Path) -> Option<String> {
@@ -6502,6 +6643,15 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
         if action == "test" {
             return configured_server_test(section, &args, &path);
         }
+        if section == "mcp" && matches!(action, "warm" | "discover") {
+            let id = value_after(&args[1..], "--id")?
+                .or_else(|| args.get(1).cloned())
+                .ok_or("mcp warm requires exact --id")?;
+            return println_result(mcp_discover_server(&id, &workspace_root()?, &path));
+        }
+        if section == "mcp" && action == "auth" {
+            return mcp_auth_command(&path);
+        }
         return runtime_server_array_command(section, &args, &path);
     }
     if section == "permissions" {
@@ -6595,6 +6745,14 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
                 }
                 if let Some(command) = command {
                     entry.insert("command".into(), toml::Value::String(command));
+                    let args = args[1..]
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--arg")
+                        .map(|pair| toml::Value::String(pair[1].clone()))
+                        .collect::<Vec<_>>();
+                    if !args.is_empty() {
+                        entry.insert("args".into(), toml::Value::Array(args));
+                    }
                 }
                 if let Some(env_name) = value_after(&args[1..], "--auth-env")? {
                     if !env_name
@@ -7693,6 +7851,14 @@ fn runtime_server_array_command(section: &str, args: &[String], path: &Path) -> 
                 }
                 if let Some(command) = command {
                     entry.insert("command".into(), toml::Value::String(command));
+                    let command_args = args[1..]
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--arg")
+                        .map(|pair| toml::Value::String(pair[1].clone()))
+                        .collect::<Vec<_>>();
+                    if !command_args.is_empty() {
+                        entry.insert("args".into(), toml::Value::Array(command_args));
+                    }
                 }
                 if let Some(auth) = value_after(&args[1..], "--auth-env")? {
                     if !safe_env_name(&auth) {
@@ -8301,6 +8467,8 @@ mod tests {
                 "local".into(),
                 "--command".into(),
                 "printf".into(),
+                "--arg".into(),
+                "ready".into(),
             ],
             &path,
         )
@@ -8322,6 +8490,9 @@ mod tests {
         let value: toml::Value =
             toml::from_str(&fs::read_to_string(&path).expect("read")).expect("toml");
         assert_eq!(value["mcp_server"][0]["name"].as_str(), Some("local"));
+        assert_eq!(value["mcp_server"][0]["args"][0].as_str(), Some("ready"));
+        let loaded = load_mcp_config(&path, &root).expect("loader");
+        assert_eq!(loaded[0].config.args, vec!["ready"]);
         assert_eq!(value["lsp_server"][0]["name"].as_str(), Some("rust"));
         let _ = fs::remove_dir_all(root);
     }
