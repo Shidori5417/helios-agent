@@ -7,7 +7,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::Text,
     widgets::{Block, Borders, Paragraph, Wrap},
@@ -43,6 +43,8 @@ pub struct TuiModel {
     pub permission_mode: Option<String>,
     pub changes_delta: Option<i64>,
     pub background_jobs: Option<usize>,
+    pub palette: Vec<PaletteCommand>,
+    pub overlay: Option<OverlayState>,
 }
 
 impl Default for TuiModel {
@@ -70,6 +72,8 @@ impl Default for TuiModel {
             permission_mode: None,
             changes_delta: None,
             background_jobs: None,
+            palette: Vec::new(),
+            overlay: None,
         }
     }
 }
@@ -77,6 +81,41 @@ impl Default for TuiModel {
 pub const MAX_TRANSCRIPT_ITEMS: usize = 512;
 pub const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
 pub const MAX_STREAM_ITEM_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaletteCommand {
+    pub name: String,
+    pub description: String,
+    pub category: String,
+    pub arguments: String,
+    pub local: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayKind {
+    Palette,
+    Help,
+    Model,
+    Sessions,
+    Context,
+    Status,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayState {
+    pub kind: OverlayKind,
+    pub query: String,
+    pub selected: usize,
+    pub commands: Vec<PaletteCommand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OverlayAction {
+    None,
+    Close,
+    Execute(String),
+    Fill(String),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TranscriptItem {
@@ -230,6 +269,129 @@ impl Composer {
 }
 
 impl TuiModel {
+    pub fn set_palette(&mut self, commands: Vec<PaletteCommand>) {
+        self.palette = commands.clone();
+        self.overlay = Some(OverlayState {
+            kind: OverlayKind::Palette,
+            query: String::new(),
+            selected: 0,
+            commands,
+        });
+    }
+
+    pub fn open_overlay(&mut self, kind: OverlayKind) {
+        self.overlay = Some(OverlayState {
+            kind,
+            query: String::new(),
+            selected: 0,
+            commands: self.palette.clone(),
+        });
+    }
+
+    pub fn filtered_palette(&self) -> Vec<&PaletteCommand> {
+        let Some(overlay) = &self.overlay else {
+            return Vec::new();
+        };
+        let query = overlay.query.to_ascii_lowercase();
+        overlay
+            .commands
+            .iter()
+            .filter(|command| {
+                query.is_empty()
+                    || command.name.to_ascii_lowercase().contains(&query)
+                    || command.description.to_ascii_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    pub fn overlay_text(&self) -> String {
+        let Some(overlay) = &self.overlay else {
+            return String::new();
+        };
+        let title = match overlay.kind {
+            OverlayKind::Palette => "Commands",
+            OverlayKind::Help => "Help",
+            OverlayKind::Model => "Models",
+            OverlayKind::Sessions => "Sessions",
+            OverlayKind::Context => "Context",
+            OverlayKind::Status => "Status",
+        };
+        let mut lines = vec![format!("{title}  /{}  (Esc close)", overlay.query)];
+        let commands = self.filtered_palette();
+        for (index, command) in commands.iter().enumerate() {
+            let marker = if index == overlay.selected { ">" } else { " " };
+            lines.push(format!(
+                "{marker} /{} {} [{}] — {}",
+                command.name, command.arguments, command.category, command.description
+            ));
+        }
+        if commands.is_empty() {
+            lines.push("No matching local command".into());
+        }
+        lines.join("\n")
+    }
+
+    pub fn handle_overlay_key(&mut self, key: KeyEvent) -> OverlayAction {
+        let Some(overlay) = &mut self.overlay else {
+            return OverlayAction::None;
+        };
+        if key.code == KeyCode::Esc {
+            self.overlay = None;
+            return OverlayAction::Close;
+        }
+        match key.code {
+            KeyCode::Up => {
+                overlay.selected = overlay.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                let query = overlay.query.to_ascii_lowercase();
+                let count = overlay
+                    .commands
+                    .iter()
+                    .filter(|command| {
+                        query.is_empty()
+                            || command.name.to_ascii_lowercase().contains(&query)
+                            || command.description.to_ascii_lowercase().contains(&query)
+                    })
+                    .count();
+                if count > 0 {
+                    overlay.selected = (overlay.selected + 1).min(count - 1);
+                }
+            }
+            KeyCode::Backspace => {
+                overlay.query.pop();
+                overlay.selected = 0;
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                overlay.query.push(character);
+                overlay.selected = 0;
+            }
+            KeyCode::Enter => {
+                let query = overlay.query.to_ascii_lowercase();
+                let selected = overlay
+                    .commands
+                    .iter()
+                    .filter(|command| {
+                        query.is_empty()
+                            || command.name.to_ascii_lowercase().contains(&query)
+                            || command.description.to_ascii_lowercase().contains(&query)
+                    })
+                    .nth(overlay.selected)
+                    .cloned();
+                if let Some(command) = selected {
+                    self.overlay = None;
+                    return if command.local {
+                        OverlayAction::Execute(format!("/{}", command.name))
+                    } else {
+                        OverlayAction::Fill(format!("/{} ", command.name))
+                    };
+                }
+            }
+            _ => {}
+        }
+        OverlayAction::None
+    }
+
     pub fn set_runtime_context(&mut self, context: TuiContext) {
         self.workspace = context.workspace;
         self.branch = context.branch;
@@ -238,6 +400,7 @@ impl TuiModel {
         self.effort = context.effort;
         self.permission_mode = context.permission_mode;
         self.background_jobs = context.background_jobs;
+        self.palette = context.palette;
     }
 
     pub fn push_item(&mut self, item: TranscriptItem) {
@@ -442,6 +605,7 @@ pub struct TuiContext {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub background_jobs: Option<usize>,
+    pub palette: Vec<PaletteCommand>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -561,6 +725,22 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
         footer.push_str(&format!(" · jobs:{jobs}"));
     }
     frame.render_widget(Paragraph::new(footer), chunks[3]);
+    if model.overlay.is_some() {
+        let width = area.width.saturating_sub(6).min(100);
+        let height = area.height.saturating_sub(6).min(18);
+        let overlay_area = Rect {
+            x: area.x + area.width.saturating_sub(width) / 2,
+            y: area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        };
+        frame.render_widget(
+            Paragraph::new(model.overlay_text())
+                .block(Block::default().borders(Borders::ALL).title("Overlay"))
+                .wrap(Wrap { trim: false }),
+            overlay_area,
+        );
+    }
 }
 
 struct TerminalGuard {
@@ -754,6 +934,26 @@ where
                     needs_draw = true;
                 }
                 crossterm::event::Event::Key(key) => {
+                    if model.overlay.is_some() {
+                        match model.handle_overlay_key(key) {
+                            OverlayAction::Execute(command) => {
+                                let turn_cancellation =
+                                    agent_terminal::CancellationToken::default();
+                                active_cancellation = Some(turn_cancellation.clone());
+                                model.active_turn = true;
+                                if submit(command, sender.clone(), turn_cancellation) {
+                                    cancellation.cancel();
+                                }
+                            }
+                            OverlayAction::Fill(text) => {
+                                model.composer.text = text;
+                                model.composer.cursor = model.composer.text.len();
+                            }
+                            OverlayAction::Close | OverlayAction::None => {}
+                        }
+                        needs_draw = true;
+                        continue;
+                    }
                     if key.code == KeyCode::Up && !model.active_turn {
                         if let Some(index) = model.history_index {
                             if index > 0 {
@@ -821,7 +1021,14 @@ where
                             terminal.clear()?;
                             needs_draw = true;
                         }
-                        ComposerAction::None => needs_draw = true,
+                        ComposerAction::None => {
+                            if model.composer.text == "/" {
+                                model.composer.text.clear();
+                                model.composer.cursor = 0;
+                                model.open_overlay(OverlayKind::Palette);
+                            }
+                            needs_draw = true;
+                        }
                     }
                 }
                 crossterm::event::Event::Resize(width, height) => {
@@ -1007,5 +1214,40 @@ mod tests {
         });
         assert!(header_text(&model, LayoutMode::Normal).contains("main +2"));
         assert!(model.as_text().contains("tool read: bounded"));
+    }
+
+    #[test]
+    fn palette_filters_locally_and_esc_closes_without_provider() {
+        let mut model = TuiModel::default();
+        model.set_palette(vec![
+            PaletteCommand {
+                name: "commands".into(),
+                description: "list commands".into(),
+                category: "Session".into(),
+                arguments: String::new(),
+                local: true,
+            },
+            PaletteCommand {
+                name: "model".into(),
+                description: "show model".into(),
+                category: "Model".into(),
+                arguments: String::new(),
+                local: true,
+            },
+        ]);
+        assert!(model.overlay.is_some());
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        model.handle_overlay_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(model.filtered_palette().len(), 1);
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Execute("/commands".into())
+        );
+        assert!(model.overlay.is_none());
+        model.open_overlay(OverlayKind::Help);
+        assert_eq!(
+            model.handle_overlay_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            OverlayAction::Close
+        );
     }
 }

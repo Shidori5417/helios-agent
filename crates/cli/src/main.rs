@@ -39,7 +39,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::SyncSender,
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -2063,6 +2063,7 @@ fn interactive_command() -> Result<(), String> {
     let (sender, receiver) = agent_tui::bounded_event_channel(settings.channel_capacity);
     let ui_cancellation = CancellationToken::default();
     let first_turn = Arc::new(AtomicBool::new(true));
+    let session_model = Arc::new(Mutex::new(None::<String>));
     let db_path = paths.db_path;
     agent_tui::run_interactive_with_context(
         receiver,
@@ -2075,7 +2076,20 @@ fn interactive_command() -> Result<(), String> {
             if command == "/exit" || command == "/quit" {
                 return true;
             }
-            let local_output = if command.starts_with('!') {
+            let local_output = if let Some(model) = command.strip_prefix("/model ") {
+                if model.is_empty()
+                    || !model.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "._:-/".contains(character)
+                    })
+                {
+                    Some("model name must be a safe provider/model identifier".into())
+                } else {
+                    if let Ok(mut selected) = session_model.lock() {
+                        *selected = Some(model.to_owned());
+                    }
+                    Some(format!("session model={model}"))
+                }
+            } else if command.starts_with('!') {
                 Some(direct_command_output(prompt.trim(), &turn_cancellation))
             } else if prompt.trim_start().starts_with('@') {
                 Some(path_target_output(prompt.trim()))
@@ -2095,6 +2109,13 @@ fn interactive_command() -> Result<(), String> {
             };
             let options =
                 default_run_options(prompt, db_path.clone(), resume, Some(events.clone()));
+            let mut options = options;
+            if let Ok(selected) = session_model.lock() {
+                if let Some(model) = selected.clone() {
+                    options.model = model;
+                    options.model_explicit = true;
+                }
+            }
             let options = match resolve_runtime_options(options) {
                 Ok((options, _policy, _workspace)) => options,
                 Err(error) => {
@@ -2118,6 +2139,41 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
     let config = load_user_config(config_path).ok();
     let policy = load_runtime_policy(config_path).ok();
     let (branch, dirty_files) = git_state_snapshot(&paths.workspace);
+    let mut palette = [
+        ("help", "show categorized local help"),
+        ("commands", "open the local command palette"),
+        ("status", "show the current local status"),
+        ("context", "inspect current context estimates"),
+        ("permissions", "show effective permissions"),
+        ("sessions", "browse workspace sessions"),
+        ("diff", "show bounded read-only git diff"),
+        ("model", "show the configured model"),
+        ("effort", "show provider effort support"),
+        ("version", "show Helios version"),
+        ("exit", "close the interactive session"),
+        ("quit", "close the interactive session"),
+    ]
+    .into_iter()
+    .map(|(name, description)| agent_tui::PaletteCommand {
+        name: name.into(),
+        description: description.into(),
+        category: "Session".into(),
+        arguments: String::new(),
+        local: true,
+    })
+    .collect::<Vec<_>>();
+    for definition in command_registry() {
+        if palette.iter().any(|item| item.name == definition.name) {
+            continue;
+        }
+        palette.push(agent_tui::PaletteCommand {
+            name: definition.name.to_owned(),
+            description: definition.description.to_owned(),
+            category: definition.category.to_owned(),
+            arguments: definition.arguments.to_owned(),
+            local: definition.local,
+        });
+    }
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -2130,6 +2186,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         dirty_files,
         model: config.as_ref().and_then(|value| value.model.clone()),
         permission_mode: policy.map(|value| format!("{:?}", value.mode)),
+        palette,
         ..agent_tui::TuiContext::default()
     }
 }
@@ -2203,14 +2260,32 @@ fn path_target_output(input: &str) -> String {
 
 fn slash_command_output(command: &str) -> Option<String> {
     match command {
-        "/help" | "/commands" => Some(
-            command_registry()
-                .iter()
-                .map(|definition| format!("/{} — {}", definition.name, definition.description))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        "/help" | "/commands" => {
+            let mut definitions = command_registry();
+            definitions.sort_by_key(|definition| (definition.category, definition.name));
+            let mut lines = Vec::new();
+            let mut category = "";
+            for definition in definitions {
+                if definition.category != category {
+                    category = definition.category;
+                    lines.push(format!("[{category}]"));
+                }
+                lines.push(format!(
+                    "/{} {} — {}",
+                    definition.name, definition.arguments, definition.description
+                ));
+            }
+            Some(lines.join("\n"))
+        }
         "/version" => Some(format!("helios {}", env!("CARGO_PKG_VERSION"))),
+        "/model" => app_paths().ok().map(|paths| {
+            load_user_config(paths.effective_project_config())
+                .ok()
+                .and_then(|config| config.model)
+                .map(|model| format!("model={model}"))
+                .unwrap_or_else(|| "model=unavailable".into())
+        }),
+        "/effort" => Some("effort=provider-default (no session override)".into()),
         "/status" => app_paths().ok().map(|paths| {
             format!(
                 "workspace={}\nconfig={}\ndb_present={}",
@@ -2231,9 +2306,33 @@ fn slash_command_output(command: &str) -> Option<String> {
                     db.list_sessions(&paths.workspace.display().to_string())
                         .ok()
                 })
-                .map(|sessions| format!("sessions={}", sessions.len()))
+                .map(|sessions| {
+                    if sessions.is_empty() {
+                        return "sessions=0".into();
+                    }
+                    let mut lines = vec![format!("sessions={}", sessions.len())];
+                    lines.extend(sessions.into_iter().map(|session| {
+                        format!("#{} {}", session.id, redact_output(&session.objective))
+                    }));
+                    lines.join("\n")
+                })
         }),
-        "/context" => Some("context plan is shown for the active turn in the event stream".into()),
+        "/context" => app_paths().ok().and_then(|paths| {
+            let db = Database::open(&paths.db_path).ok()?;
+            let session = db
+                .latest_session(&paths.workspace.display().to_string())
+                .ok()??;
+            let plans = db.context_for_session(session.id).ok()?;
+            let plan = plans.last()?;
+            Some(format!(
+                "context estimated={} budget={} selected={} dropped={} truncated={} (estimated)",
+                plan.estimated_tokens,
+                plan.budget,
+                plan.selected_count,
+                plan.dropped_count,
+                plan.truncated_count
+            ))
+        }),
         "/diff" => {
             let workspace = workspace_root().ok()?;
             let registry = ToolRegistry::new(workspace, PermissionMode::ReadOnly).ok()?;
