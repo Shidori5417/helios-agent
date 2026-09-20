@@ -377,15 +377,15 @@
   },
   {
     "path": "crates/perf/src/main.rs",
-    "bytes": 13591
+    "bytes": 14480
   },
   {
     "path": "crates/perf/src/lib.rs",
-    "bytes": 1855
+    "bytes": 8406
   },
   {
     "path": "docs/PERFORMANCE.md",
-    "bytes": 1834
+    "bytes": 2321
   },
   {
     "path": "scripts/run-perf.sh",

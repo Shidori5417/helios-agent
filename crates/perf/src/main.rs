@@ -36,6 +36,10 @@ struct StartupMetrics {
     samples_ms: Vec<u128>,
     p50_ms: u128,
     p95_ms: u128,
+    #[serde(default)]
+    version_p50_ms: u128,
+    #[serde(default)]
+    version_p95_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -233,13 +237,30 @@ fn measure_startup(binary: &Path, runs: usize) -> Result<StartupMetrics, PerfErr
         }
         samples.push(started.elapsed().as_millis());
     }
+    let mut version_samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let started = Instant::now();
+        let status = Command::new(binary)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(PerfError::Child("helios --version failed".into()));
+        }
+        version_samples.push(started.elapsed().as_millis());
+    }
     let p50 = percentile(&samples, 1, 2);
     let p95 = percentile(&samples, 19, 20);
+    let version_p50 = percentile(&version_samples, 1, 2);
+    let version_p95 = percentile(&version_samples, 19, 20);
     Ok(StartupMetrics {
         runs,
         samples_ms: samples,
         p50_ms: p50,
         p95_ms: p95,
+        version_p50_ms: version_p50,
+        version_p95_ms: version_p95,
     })
 }
 
@@ -406,6 +427,8 @@ mod tests {
                 samples_ms: vec![100],
                 p50_ms: 100,
                 p95_ms: 100,
+                version_p50_ms: 1,
+                version_p95_ms: 1,
             },
             short_session: SessionMetrics {
                 wall_time_ms: 1,
@@ -420,6 +443,8 @@ mod tests {
                 samples_ms: vec![110],
                 p50_ms: 110,
                 p95_ms: 110,
+                version_p50_ms: 1,
+                version_p95_ms: 1,
             },
             ..baseline.clone()
         };

@@ -31,6 +31,10 @@ pub struct StartupMetrics {
     pub samples_ms: Vec<u128>,
     pub p50_ms: u128,
     pub p95_ms: u128,
+    #[serde(default)]
+    pub version_p50_ms: u128,
+    #[serde(default)]
+    pub version_p95_ms: u128,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SessionMetrics {
@@ -90,11 +94,27 @@ pub fn run_full_report(
         }
         samples.push(started.elapsed().as_millis());
     }
+    let mut version_samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let started = Instant::now();
+        let status = Command::new(binary)
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| PerfError::Command(e.to_string()))?;
+        if !status.success() {
+            return Err(PerfError::Command("helios --version failed".into()));
+        }
+        version_samples.push(started.elapsed().as_millis());
+    }
     let startup = StartupMetrics {
         runs,
         p50_ms: percentile(&samples, 1, 2),
         p95_ms: percentile(&samples, 19, 20),
         samples_ms: samples,
+        version_p50_ms: percentile(&version_samples, 1, 2),
+        version_p95_ms: percentile(&version_samples, 19, 20),
     };
     if max_cold_start_ms.is_some_and(|max| startup.p95_ms > max) {
         return Err(PerfError::Threshold(format!(
