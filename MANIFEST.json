@@ -9,7 +9,11 @@
   },
   {
     "path": "README.md",
-    "bytes": 13074
+    "bytes": 13386
+  },
+  {
+    "path": ".gitignore",
+    "bytes": 399
   },
   {
     "path": "docs/00_PRODUCT_SPEC.md",
@@ -157,11 +161,11 @@
   },
   {
     "path": "crates/cli/Cargo.toml",
-    "bytes": 711
+    "bytes": 734
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 56811
+    "bytes": 72439
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -253,7 +257,7 @@
   },
   {
     "path": "Cargo.lock",
-    "bytes": 59458
+    "bytes": 59468
   },
   {
     "path": "crates/mcp/Cargo.toml",
@@ -301,15 +305,15 @@
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 540
+    "bytes": 597
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 572
+    "bytes": 675
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 736
+    "bytes": 771
   },
   {
     "path": "docs/INSTALL.md",
@@ -337,7 +341,7 @@
   },
   {
     "path": "crates/evals/fixtures/benchmark-100.json",
-    "bytes": 81363
+    "bytes": 81362
   },
   {
     "path": "crates/evals/fixtures/workspaces/escape/README.txt",
@@ -394,5 +398,9 @@
   {
     "path": "docs/LSP.md",
     "bytes": 942
+  },
+  {
+    "path": "docs/CLI_CONTROL_PLANE.md",
+    "bytes": 1162
   }
 ]

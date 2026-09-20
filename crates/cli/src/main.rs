@@ -21,10 +21,11 @@ use agent_sandbox::PermissionMode;
 use agent_storage::{ContextRecord, Database, UsageRecord};
 use agent_terminal::CancellationToken;
 use agent_tools::{ToolRegistry, ToolStatus};
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
-    io::IsTerminal,
-    path::PathBuf,
+    io::{self, IsTerminal, Read},
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -81,6 +82,26 @@ async fn main() -> ExitCode {
             Err(error) => fail(error),
         },
         Ok(Command::Diff) => match diff_command() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Init { force }) => match init_command(force) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Config(command)) => match config_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Auth(command)) => match auth_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Doctor) => match doctor_command() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Completion(command)) => match completion_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -394,6 +415,48 @@ enum Command {
         argv: Vec<String>,
     },
     Diff,
+    Init {
+        force: bool,
+    },
+    Config(ConfigCommand),
+    Auth(AuthCommand),
+    Doctor,
+    Completion(CompletionCommand),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum ConfigCommand {
+    List,
+    Get { key: String },
+    Set { key: String, value: String },
+    Unset { key: String },
+    Path,
+    Validate,
+}
+#[derive(Debug, PartialEq, Eq)]
+enum AuthCommand {
+    Status { provider: String },
+    Login { provider: String, token_stdin: bool },
+    Logout { provider: String },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum CompletionCommand {
+    Generate {
+        shell: String,
+    },
+    Install {
+        shell: String,
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct UserConfig {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
 }
 #[derive(Debug, PartialEq, Eq)]
 enum MemoryCommand {
@@ -490,7 +553,80 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
             Ok(Command::Verify { argv })
         }
         "diff" => Ok(Command::Diff),
+        "init" => Ok(Command::Init {
+            force: args.iter().any(|arg| arg == "--force"),
+        }),
+        "config" => parse_config_command(&args[1..]),
+        "auth" => parse_auth_command(&args[1..]),
+        "doctor" => Ok(Command::Doctor),
+        "completion" => parse_completion_command(&args[1..]),
         _ => parse_run(&args),
+    }
+}
+
+fn parse_config_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let command = match action {
+        "list" => ConfigCommand::List,
+        "get" => ConfigCommand::Get {
+            key: value_after(&args[1..], "--key")?
+                .or_else(|| args.get(1).cloned())
+                .ok_or("config get requires key")?,
+        },
+        "set" => ConfigCommand::Set {
+            key: value_after(&args[1..], "--key")?
+                .or_else(|| args.get(1).cloned())
+                .ok_or("config set requires key")?,
+            value: value_after(&args[1..], "--value")?
+                .or_else(|| args.get(2).cloned())
+                .ok_or("config set requires value")?,
+        },
+        "unset" => ConfigCommand::Unset {
+            key: value_after(&args[1..], "--key")?
+                .or_else(|| args.get(1).cloned())
+                .ok_or("config unset requires key")?,
+        },
+        "path" => ConfigCommand::Path,
+        "validate" => ConfigCommand::Validate,
+        other => return Err(format!("unknown config command: {other}")),
+    };
+    Ok(Command::Config(command))
+}
+
+fn parse_auth_command(args: &[String]) -> Result<Command, String> {
+    let action = args
+        .first()
+        .map(String::as_str)
+        .ok_or("auth requires status, login, or logout")?;
+    let provider = args.get(1).cloned().ok_or("auth requires provider")?;
+    if !valid_provider(&provider) {
+        return Err("unknown provider".into());
+    }
+    let command = match action {
+        "status" => AuthCommand::Status { provider },
+        "login" => AuthCommand::Login {
+            provider,
+            token_stdin: args.iter().any(|arg| arg == "--token-stdin"),
+        },
+        "logout" => AuthCommand::Logout { provider },
+        other => return Err(format!("unknown auth command: {other}")),
+    };
+    Ok(Command::Auth(command))
+}
+
+fn parse_completion_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().map(String::as_str).unwrap_or("generate");
+    let shell = args.get(1).cloned().ok_or("completion requires shell")?;
+    if !matches!(shell.as_str(), "bash" | "zsh" | "fish") {
+        return Err("shell must be bash, zsh, or fish".into());
+    }
+    match action {
+        "generate" => Ok(Command::Completion(CompletionCommand::Generate { shell })),
+        "install" => Ok(Command::Completion(CompletionCommand::Install {
+            shell,
+            path: value_after(&args[2..], "--path")?.map(PathBuf::from),
+        })),
+        other => Err(format!("unknown completion command: {other}")),
     }
 }
 
@@ -1460,7 +1596,238 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
-    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n                       Show durable context-plan summaries\n  usage [--session ID|latest] [--json]\n                       Show normalized durable token usage\n  memory list|search|add|supersede|delete\n                       Manage bounded workspace memory (delete needs exact --id)\n  plugins list|verify|install|update|uninstall\n                       Manage explicitly trusted signed plugins\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
+    println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n                       Manage typed workspace configuration\n  auth status|login|logout PROVIDER\n                       Manage provider credentials without printing secrets\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n                       Generate or install shell completion\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n                       Show durable context-plan summaries\n  usage [--session ID|latest] [--json]\n                       Show normalized durable token usage\n  memory list|search|add|supersede|delete\n                       Manage bounded workspace memory (delete needs exact --id)\n  plugins list|verify|install|update|uninstall\n                       Manage explicitly trusted signed plugins\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
+}
+
+fn workspace_root() -> Result<PathBuf, String> {
+    env::current_dir()
+        .map_err(|error| error.to_string())?
+        .canonicalize()
+        .map_err(|error| error.to_string())
+}
+
+fn config_path() -> Result<PathBuf, String> {
+    Ok(workspace_root()?.join(".agent/config.toml"))
+}
+
+fn init_command(force: bool) -> Result<(), String> {
+    let path = config_path()?;
+    fs::create_dir_all(path.parent().ok_or("invalid config path")?).map_err(|e| e.to_string())?;
+    if path.exists() && !force {
+        return Err(".agent/config.toml already exists; use --force to overwrite".into());
+    }
+    atomic_write(&path, b"# Helios Agent workspace configuration\n")?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn valid_config_key(key: &str) -> bool {
+    matches!(key, "provider" | "model" | "base_url")
+}
+
+fn load_user_config(path: &Path) -> Result<UserConfig, String> {
+    if !path.exists() {
+        return Ok(UserConfig::default());
+    }
+    toml::from_str(&fs::read_to_string(path).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("invalid config: {e}"))
+}
+
+fn config_command(command: ConfigCommand) -> Result<(), String> {
+    let path = config_path()?;
+    match command {
+        ConfigCommand::Path => println!("{}", path.display()),
+        ConfigCommand::Validate => {
+            let _ = load_user_config(&path)?;
+            println!("valid");
+        }
+        ConfigCommand::List => {
+            let config = load_user_config(&path)?;
+            println!(
+                "{}",
+                toml::to_string_pretty(&config).map_err(|e| e.to_string())?
+            );
+        }
+        ConfigCommand::Get { key } => {
+            if !valid_config_key(&key) {
+                return Err(format!("unknown config key: {key}"));
+            }
+            let config = load_user_config(&path)?;
+            let value = match key.as_str() {
+                "provider" => config.provider,
+                "model" => config.model,
+                "base_url" => config.base_url,
+                _ => None,
+            };
+            if let Some(value) = value {
+                println!("{value}");
+            }
+        }
+        ConfigCommand::Set { key, value } => {
+            if !valid_config_key(&key) {
+                return Err(format!("unknown config key: {key}"));
+            }
+            if key == "provider" && !valid_provider(&value) {
+                return Err("unknown provider".into());
+            }
+            let mut config = load_user_config(&path)?;
+            match key.as_str() {
+                "provider" => config.provider = Some(value),
+                "model" => config.model = Some(value),
+                "base_url" => config.base_url = Some(value),
+                _ => unreachable!(),
+            }
+            let bytes = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
+            atomic_write(&path, bytes.as_bytes())?;
+        }
+        ConfigCommand::Unset { key } => {
+            if !valid_config_key(&key) {
+                return Err(format!("unknown config key: {key}"));
+            }
+            let mut config = load_user_config(&path)?;
+            match key.as_str() {
+                "provider" => config.provider = None,
+                "model" => config.model = None,
+                "base_url" => config.base_url = None,
+                _ => unreachable!(),
+            }
+            let bytes = toml::to_string_pretty(&config).map_err(|e| e.to_string())?;
+            atomic_write(&path, bytes.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or("invalid target path")?;
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let temp = parent.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    fs::write(&temp, bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o600));
+    }
+    fs::rename(&temp, path).map_err(|e| {
+        let _ = fs::remove_file(&temp);
+        e.to_string()
+    })
+}
+
+fn provider_env(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "OPENAI_API_KEY",
+        "anthropic" => "ANTHROPIC_API_KEY",
+        "gemini" => "GEMINI_API_KEY",
+        _ => "GENERIC_API_KEY",
+    }
+}
+fn valid_provider(provider: &str) -> bool {
+    matches!(provider, "openai" | "anthropic" | "gemini" | "generic")
+}
+
+trait SecretStore {
+    fn set(&self, provider: &str, token: &str) -> Result<(), String>;
+    fn delete(&self, provider: &str) -> Result<(), String>;
+}
+struct UnavailableSecretStore;
+impl SecretStore for UnavailableSecretStore {
+    fn set(&self, _provider: &str, _token: &str) -> Result<(), String> {
+        Err("Secret Service/keyring is unavailable; refusing plaintext fallback".into())
+    }
+    fn delete(&self, _provider: &str) -> Result<(), String> {
+        Err("Secret Service/keyring is unavailable".into())
+    }
+}
+
+fn auth_command(command: AuthCommand) -> Result<(), String> {
+    let store = UnavailableSecretStore;
+    match command {
+        AuthCommand::Status { provider } => {
+            let env_name = provider_env(&provider);
+            println!(
+                "provider={provider} credential_source=keyring-or-env env_present={}",
+                env::var_os(env_name).is_some()
+            );
+            Ok(())
+        }
+        AuthCommand::Login {
+            provider,
+            token_stdin,
+        } => {
+            if !token_stdin || io::stdin().is_terminal() {
+                return Err(
+                    "login requires non-TTY --token-stdin; token arguments are forbidden".into(),
+                );
+            }
+            let mut token = String::new();
+            io::stdin()
+                .read_to_string(&mut token)
+                .map_err(|e| e.to_string())?;
+            let token = token.trim();
+            if token.is_empty() {
+                return Err("empty token".into());
+            }
+            store.set(&provider, token)
+        }
+        AuthCommand::Logout { provider } => store.delete(&provider),
+    }
+}
+
+fn doctor_command() -> Result<(), String> {
+    let workspace = workspace_root()?;
+    println!("binary=agent-cli version=0.1.0");
+    println!("workspace={}", workspace.display());
+    println!("config={}", config_path()?.display());
+    println!("config_valid={}", load_user_config(&config_path()?).is_ok());
+    println!("db_present={}", workspace.join(".agent/state.db").is_file());
+    for command in ["git", "rg"] {
+        println!("{command}_available={}", command_available(command));
+    }
+    for provider in ["openai", "anthropic", "gemini", "generic"] {
+        println!(
+            "{provider}_credential_present={}",
+            env::var_os(provider_env(provider)).is_some()
+        );
+    }
+    Ok(())
+}
+fn command_available(name: &str) -> bool {
+    env::var_os("PATH")
+        .map(|path| env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+        .unwrap_or(false)
+}
+
+fn completion_command(command: CompletionCommand) -> Result<(), String> {
+    let (shell, source) = match &command {
+        CompletionCommand::Generate { shell } | CompletionCommand::Install { shell, .. } => {
+            (shell.clone(), completion_source(shell)?)
+        }
+    };
+    match command {
+        CompletionCommand::Generate { .. } => print!("{source}"),
+        CompletionCommand::Install { path, .. } => {
+            let target = path.unwrap_or_else(|| match shell.as_str() {
+                "bash" => PathBuf::from("~/.local/share/bash-completion/completions/agent-cli"),
+                "zsh" => PathBuf::from("~/.zfunc/_agent-cli"),
+                _ => PathBuf::from("~/.config/fish/completions/agent-cli.fish"),
+            });
+            if target.to_string_lossy().starts_with("~") {
+                return Err("completion install requires an explicit absolute --path".into());
+            }
+            atomic_write(&target, source.as_bytes())?;
+            println!("{}", target.display());
+        }
+    }
+    Ok(())
+}
+fn completion_source(shell: &str) -> Result<String, String> {
+    let path = workspace_root()?.join(format!("completions/agent-cli.{shell}"));
+    fs::read_to_string(path).map_err(|e| e.to_string())
 }
 
 struct PrintingSink {
@@ -1623,5 +1990,61 @@ mod tests {
             .expect("context"),
             Command::Context { json: false, .. }
         ));
+    }
+
+    #[test]
+    fn control_plane_commands_parse_and_reject_unknown_config() {
+        assert_eq!(
+            parse_args(vec!["init".into(), "--force".into()]),
+            Ok(Command::Init { force: true })
+        );
+        assert_eq!(
+            parse_args(vec!["config".into(), "path".into()]),
+            Ok(Command::Config(ConfigCommand::Path))
+        );
+        assert_eq!(
+            parse_args(vec!["auth".into(), "status".into(), "openai".into()]),
+            Ok(Command::Auth(AuthCommand::Status {
+                provider: "openai".into()
+            }))
+        );
+        assert_eq!(
+            parse_args(vec!["completion".into(), "generate".into(), "bash".into()]),
+            Ok(Command::Completion(CompletionCommand::Generate {
+                shell: "bash".into()
+            }))
+        );
+        assert!(parse_args(vec!["auth".into(), "login".into(), "openai".into()]).is_ok());
+    }
+
+    #[test]
+    fn secret_store_never_falls_back_to_plaintext() {
+        let store = UnavailableSecretStore;
+        assert!(store.set("openai", "not-persisted").is_err());
+        assert!(store.delete("openai").is_err());
+    }
+
+    #[test]
+    fn config_roundtrip_is_toml_and_atomic() {
+        let root = std::env::temp_dir().join(format!("helios-cli-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let path = root.join(".agent/config.toml");
+        let config = UserConfig {
+            provider: Some("fake".into()),
+            model: Some("test".into()),
+            base_url: None,
+        };
+        let encoded = toml::to_string_pretty(&config).expect("toml");
+        atomic_write(&path, encoded.as_bytes()).expect("atomic write");
+        assert_eq!(load_user_config(&path).expect("load"), config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(root);
     }
 }
