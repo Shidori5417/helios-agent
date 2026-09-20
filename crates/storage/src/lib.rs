@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use std::path::Path;
 
-pub const STORAGE_FORMAT_VERSION: u32 = 4;
+pub const STORAGE_FORMAT_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
@@ -30,11 +30,22 @@ pub struct EventRecord {
     pub payload: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct AuditRecord {
+    pub id: i64,
+    pub session_id: i64,
+    pub turn_id: i64,
+    pub kind: String,
+    pub payload: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionRecord {
     pub id: i64,
     pub objective: String,
     pub workspace: String,
+    pub archived: bool,
+    pub deleted_at: Option<i64>,
 }
 
 pub struct Database {
@@ -112,6 +123,13 @@ impl Database {
                  PRAGMA user_version = 4;"
             )?;
         }
+        if version < 5 {
+            self.connection.execute_batch(
+                "ALTER TABLE sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE sessions ADD COLUMN deleted_at INTEGER;
+                 PRAGMA user_version = 5;",
+            )?;
+        }
         Ok(())
     }
 
@@ -134,13 +152,15 @@ impl Database {
     pub fn session(&self, id: i64) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace FROM sessions WHERE id = ?1",
+                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
                         workspace: row.get(2)?,
+                        archived: row.get::<_, i64>(3)? != 0,
+                        deleted_at: row.get(4)?,
                     })
                 },
             )
@@ -150,13 +170,15 @@ impl Database {
     pub fn latest_session(&self, workspace: &str) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace FROM sessions WHERE workspace = ?1 ORDER BY id DESC LIMIT 1",
+                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
                 params![workspace],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
                         workspace: row.get(2)?,
+                        archived: row.get::<_, i64>(3)? != 0,
+                        deleted_at: row.get(4)?,
                     })
                 },
             )
@@ -166,13 +188,15 @@ impl Database {
     pub fn latest_session_any(&self) -> SqlResult<Option<SessionRecord>> {
         self.connection
             .query_row(
-                "SELECT id, objective, workspace FROM sessions ORDER BY id DESC LIMIT 1",
+                "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE archived = 0 AND deleted_at IS NULL ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(SessionRecord {
                         id: row.get(0)?,
                         objective: row.get(1)?,
                         workspace: row.get(2)?,
+                        archived: row.get::<_, i64>(3)? != 0,
+                        deleted_at: row.get(4)?,
                     })
                 },
             )
@@ -181,16 +205,32 @@ impl Database {
 
     pub fn list_sessions(&self, workspace: &str) -> SqlResult<Vec<SessionRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, objective, workspace FROM sessions WHERE workspace = ?1 ORDER BY id DESC",
+            "SELECT id, objective, workspace, archived, deleted_at FROM sessions WHERE workspace = ?1 AND archived = 0 AND deleted_at IS NULL ORDER BY id DESC",
         )?;
         let rows = statement.query_map(params![workspace], |row| {
             Ok(SessionRecord {
                 id: row.get(0)?,
                 objective: row.get(1)?,
                 workspace: row.get(2)?,
+                archived: row.get::<_, i64>(3)? != 0,
+                deleted_at: row.get(4)?,
             })
         })?;
         rows.collect()
+    }
+
+    pub fn archive_session(&self, id: i64, workspace: &str, archived: bool) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET archived = ?1 WHERE id = ?2 AND workspace = ?3 AND deleted_at IS NULL",
+            params![archived as i64, id, workspace],
+        )? == 1)
+    }
+
+    pub fn delete_session(&self, id: i64, workspace: &str) -> SqlResult<bool> {
+        Ok(self.connection.execute(
+            "UPDATE sessions SET deleted_at = strftime('%s','now') WHERE id = ?1 AND workspace = ?2 AND deleted_at IS NULL",
+            params![id, workspace],
+        )? == 1)
     }
 
     pub fn session_messages(&self, session_id: i64) -> SqlResult<Vec<(String, String)>> {
@@ -387,6 +427,30 @@ impl Database {
         rows.collect()
     }
 
+    pub fn audit_records(
+        &self,
+        session_id: Option<i64>,
+        kind: Option<&str>,
+        limit: usize,
+    ) -> SqlResult<Vec<AuditRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, session_id, turn_id, kind, payload FROM lifecycle_events
+             WHERE (?1 IS NULL OR session_id = ?1) AND (?2 IS NULL OR kind = ?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows =
+            statement.query_map(params![session_id, kind, limit.min(10_000) as i64], |row| {
+                Ok(AuditRecord {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    turn_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload: row.get(4)?,
+                })
+            })?;
+        rows.collect()
+    }
+
     pub fn active_memory_id(&self, scope: &str, kind: &str, key: &str) -> SqlResult<Option<i64>> {
         self.connection.query_row("SELECT id FROM memory WHERE scope = ?1 AND kind = ?2 AND key = ?3 AND status = 'active' ORDER BY id DESC LIMIT 1", params![scope, kind, key], |row| row.get(0)).optional()
     }
@@ -534,5 +598,29 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&events[1].payload).expect("json")["text"],
             "[redacted]"
         );
+    }
+
+    #[test]
+    fn sessions_archive_and_delete_are_workspace_scoped_and_hidden_from_list() {
+        let db = Database::in_memory().expect("db");
+        let first = db
+            .create_session_for_workspace("first", "/workspace")
+            .expect("first");
+        let second = db
+            .create_session_for_workspace("second", "/workspace")
+            .expect("second");
+        assert!(db
+            .archive_session(first, "/workspace", true)
+            .expect("archive"));
+        assert!(db
+            .list_sessions("/workspace")
+            .expect("list")
+            .iter()
+            .all(|item| item.id != first));
+        assert!(!db
+            .archive_session(second, "/other", true)
+            .expect("wrong workspace"));
+        assert!(db.delete_session(second, "/workspace").expect("delete"));
+        assert!(db.list_sessions("/workspace").expect("list").is_empty());
     }
 }

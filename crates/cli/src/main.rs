@@ -48,11 +48,19 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
-        Ok(Command::Sessions { db_path }) => match list_sessions(db_path) {
+        Ok(Command::Sessions { command, db_path }) => match sessions_command(command, db_path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
         Ok(Command::Search { db_path, query }) => match search_sessions(db_path, &query) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Database(command)) => match database_command(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Audit(command)) => match audit_command(command) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
@@ -401,8 +409,11 @@ enum Command {
     Help,
     Run(RunOptions),
     Sessions {
+        command: SessionCommand,
         db_path: PathBuf,
     },
+    Database(DatabaseCommand),
+    Audit(AuditCommand),
     Search {
         db_path: PathBuf,
         query: String,
@@ -431,6 +442,39 @@ enum Command {
     Doctor,
     Completion(CompletionCommand),
     Runtime(RuntimeCommand),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum SessionCommand {
+    List,
+    Show(i64),
+    Archive(i64, bool),
+    Delete(i64),
+    Export(i64, PathBuf),
+    Import(PathBuf),
+}
+#[derive(Debug, PartialEq, Eq)]
+enum DatabaseCommand {
+    Backup { input: PathBuf, output: PathBuf },
+    Restore { input: PathBuf, workspace: PathBuf },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum AuditCommand {
+    List {
+        db_path: PathBuf,
+        session: Option<i64>,
+        event: Option<String>,
+        limit: usize,
+    },
+    Show {
+        db_path: PathBuf,
+        id: i64,
+    },
+    Export {
+        db_path: PathBuf,
+        output: PathBuf,
+        session: Option<i64>,
+        limit: usize,
+    },
 }
 #[derive(Debug, PartialEq, Eq)]
 enum RuntimeCommand {
@@ -581,9 +625,9 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
     }
     match args[0].as_str() {
         "--help" | "-h" | "help" => Ok(Command::Help),
-        "sessions" => Ok(Command::Sessions {
-            db_path: path_option(&args[1..], "--db-path")?,
-        }),
+        "sessions" => parse_sessions_command(&args[1..]),
+        "database" => parse_database_command(&args[1..]),
+        "audit" => parse_audit_command(&args[1..]),
         "search" => {
             let db_path = path_option(&args[1..], "--db-path")?;
             let query = value_after(&args[1..], "--query")?.ok_or("search requires --query")?;
@@ -678,6 +722,102 @@ fn parse_auth_command(args: &[String]) -> Result<Command, String> {
         other => return Err(format!("unknown auth command: {other}")),
     };
     Ok(Command::Auth(command))
+}
+
+fn exact_id(args: &[String], action: &str) -> Result<i64, String> {
+    args.get(1)
+        .filter(|value| !value.starts_with('-'))
+        .cloned()
+        .or(value_after(args, "--id")?)
+        .ok_or_else(|| format!("sessions {action} requires exact id"))?
+        .parse()
+        .map_err(|_| "id must be an integer".into())
+}
+
+fn parse_sessions_command(args: &[String]) -> Result<Command, String> {
+    let db_path = path_option(args, "--db-path")?;
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let command = match action {
+        "list" => SessionCommand::List,
+        "show" => SessionCommand::Show(exact_id(args, action)?),
+        "archive" => SessionCommand::Archive(exact_id(args, action)?, true),
+        "unarchive" => SessionCommand::Archive(exact_id(args, action)?, false),
+        "delete" => {
+            let id = exact_id(args, action)?;
+            let confirm = value_after(args, "--confirm")?.ok_or("delete requires --confirm ID")?;
+            if confirm.parse::<i64>().ok() != Some(id) {
+                return Err("--confirm must exactly match session id".into());
+            }
+            SessionCommand::Delete(id)
+        }
+        "export" => SessionCommand::Export(
+            exact_id(args, action)?,
+            value_after(args, "--output")?
+                .map(PathBuf::from)
+                .ok_or("export requires --output PATH")?,
+        ),
+        "import" => SessionCommand::Import(
+            value_after(args, "--input")?
+                .map(PathBuf::from)
+                .ok_or("import requires --input PATH")?,
+        ),
+        other => return Err(format!("unknown sessions command: {other}")),
+    };
+    Ok(Command::Sessions { command, db_path })
+}
+
+fn parse_database_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().ok_or("database requires backup or restore")?;
+    match action.as_str() {
+        "backup" => Ok(Command::Database(DatabaseCommand::Backup {
+            input: path_option(args, "--db-path")?,
+            output: value_after(&args[1..], "--output")?
+                .map(PathBuf::from)
+                .ok_or("backup requires --output PATH")?,
+        })),
+        "restore" => Ok(Command::Database(DatabaseCommand::Restore {
+            input: value_after(&args[1..], "--input")?
+                .map(PathBuf::from)
+                .ok_or("restore requires --input PATH")?,
+            workspace: value_after(&args[1..], "--confirm-workspace")?
+                .map(PathBuf::from)
+                .ok_or("restore requires --confirm-workspace PATH")?,
+        })),
+        other => Err(format!("unknown database command: {other}")),
+    }
+}
+
+fn parse_audit_command(args: &[String]) -> Result<Command, String> {
+    let action = args.first().ok_or("audit requires list, show, or export")?;
+    let db_path = path_option(&args[1..], "--db-path")?;
+    match action.as_str() {
+        "list" => Ok(Command::Audit(AuditCommand::List {
+            db_path,
+            session: value_after(&args[1..], "--session")?.and_then(|v| v.parse().ok()),
+            event: value_after(&args[1..], "--event")?,
+            limit: value_after(&args[1..], "--limit")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
+        })),
+        "show" => Ok(Command::Audit(AuditCommand::Show {
+            db_path,
+            id: value_after(&args[1..], "--id")?
+                .ok_or("audit show requires --id")?
+                .parse()
+                .map_err(|_| "invalid audit id")?,
+        })),
+        "export" => Ok(Command::Audit(AuditCommand::Export {
+            db_path,
+            output: value_after(&args[1..], "--output")?
+                .map(PathBuf::from)
+                .ok_or("audit export requires --output PATH")?,
+            session: value_after(&args[1..], "--session")?.and_then(|v| v.parse().ok()),
+            limit: value_after(&args[1..], "--limit")?
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
+        })),
+        other => Err(format!("unknown audit command: {other}")),
+    }
 }
 
 fn parse_completion_command(args: &[String]) -> Result<Command, String> {
@@ -1337,11 +1477,177 @@ fn add_usage(total: &mut UsageRecord, value: &str) {
     }
 }
 
-fn list_sessions(db_path: PathBuf) -> Result<(), String> {
-    let workspace = env::current_dir()
+fn sessions_command(command: SessionCommand, db_path: PathBuf) -> Result<(), String> {
+    match command {
+        SessionCommand::List => list_sessions(db_path),
+        SessionCommand::Show(id) => session_show(db_path, id),
+        SessionCommand::Archive(id, archived) => session_archive(db_path, id, archived),
+        SessionCommand::Delete(id) => session_delete(db_path, id),
+        SessionCommand::Export(id, output) => session_export(db_path, id, output),
+        SessionCommand::Import(input) => session_import(db_path, input),
+    }
+}
+
+fn current_workspace() -> Result<PathBuf, String> {
+    env::current_dir()
         .map_err(|error| error.to_string())?
         .canonicalize()
+        .map_err(|error| error.to_string())
+}
+
+fn session_show(db_path: PathBuf, id: i64) -> Result<(), String> {
+    let db = open_database(&db_path)?;
+    let session = db
+        .session(id)
+        .map_err(|error| error.to_string())?
+        .ok_or("session not found")?;
+    if session.workspace != current_workspace()?.display().to_string() {
+        return Err("session belongs to another workspace".into());
+    }
+    let messages = db.session_messages(id).map_err(|error| error.to_string())?;
+    println!(
+        "session={} archived={} deleted={}",
+        id,
+        session.archived,
+        session.deleted_at.is_some()
+    );
+    println!("objective={}", redact_export_text(&session.objective));
+    for (role, content) in messages {
+        println!("{role}\t{}", redact_export_text(&content));
+    }
+    Ok(())
+}
+
+fn session_archive(db_path: PathBuf, id: i64, archived: bool) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    let db = open_database(&db_path)?;
+    if !db
+        .archive_session(id, &workspace.display().to_string(), archived)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("session not found or already deleted".into());
+    }
+    println!("session={} archived={archived}", id);
+    Ok(())
+}
+
+fn session_delete(db_path: PathBuf, id: i64) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    let db = open_database(&db_path)?;
+    if !db
+        .delete_session(id, &workspace.display().to_string())
+        .map_err(|error| error.to_string())?
+    {
+        return Err("session not found or already deleted".into());
+    }
+    println!("session={id} deleted=true");
+    Ok(())
+}
+
+fn session_export(db_path: PathBuf, id: i64, output: PathBuf) -> Result<(), String> {
+    let db = open_database(&db_path)?;
+    let session = db
+        .session(id)
+        .map_err(|error| error.to_string())?
+        .ok_or("session not found")?;
+    if session.workspace != current_workspace()?.display().to_string() {
+        return Err("session belongs to another workspace".into());
+    }
+    let messages = db
+        .session_messages(id)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .map(|(role, content)| serde_json::json!({"role": role, "content": redact_export_text(&content)}))
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "workspace": session.workspace,
+        "objective": redact_export_text(&session.objective),
+        "messages": messages,
+    });
+    atomic_write(
+        &output,
+        serde_json::to_vec_pretty(&document)
+            .map_err(|error| error.to_string())?
+            .as_slice(),
+    )
+}
+
+fn session_import(db_path: PathBuf, input: PathBuf) -> Result<(), String> {
+    let workspace = current_workspace()?;
+    let bytes = fs::read(&input).map_err(|error| error.to_string())?;
+    let document: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid session export: {error}"))?;
+    if document
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || document
+            .get("workspace")
+            .and_then(serde_json::Value::as_str)
+            != Some(&workspace.display().to_string())
+    {
+        return Err("session export schema or workspace mismatch".into());
+    }
+    let objective = document
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("export objective missing")?;
+    let messages = document
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("export messages missing")?;
+    for message in messages {
+        if message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+            || message
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .is_none()
+        {
+            return Err("invalid message in session export".into());
+        }
+    }
+    let db = open_database(&db_path)?;
+    let session_id = db
+        .create_session_for_workspace(objective, &workspace.display().to_string())
         .map_err(|error| error.to_string())?;
+    let tx = db
+        .connection()
+        .unchecked_transaction()
+        .map_err(|error| error.to_string())?;
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("invalid message role")?;
+        let content = message
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("invalid message content")?;
+        tx.execute("INSERT INTO messages(session_id, role, content, created_at) VALUES (?1, ?2, ?3, strftime('%s','now'))", rusqlite::params![session_id, role, content]).map_err(|error| error.to_string())?;
+    }
+    tx.commit().map_err(|error| error.to_string())?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn redact_export_text(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if ["api_key", "authorization", "bearer ", "secret", "token="]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        "[redacted]".into()
+    } else {
+        value.chars().take(8192).collect()
+    }
+}
+
+fn list_sessions(db_path: PathBuf) -> Result<(), String> {
+    let workspace = current_workspace()?;
     let db = open_database(&db_path)?;
     for session in db
         .list_sessions(&workspace.display().to_string())
@@ -1362,6 +1668,110 @@ fn search_sessions(db_path: PathBuf, query: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())?
     {
         println!("{id}\t{role}\t{content}");
+    }
+    Ok(())
+}
+
+fn database_command(command: DatabaseCommand) -> Result<(), String> {
+    match command {
+        DatabaseCommand::Backup { input, output } => {
+            if output.exists() {
+                return Err("backup output already exists".into());
+            }
+            let db = open_database(&input)?;
+            let output = output.canonicalize().unwrap_or(output);
+            db.connection()
+                .execute(
+                    "VACUUM INTO ?1",
+                    rusqlite::params![output.display().to_string()],
+                )
+                .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&output, fs::Permissions::from_mode(0o600));
+            }
+            println!("{}", output.display());
+            Ok(())
+        }
+        DatabaseCommand::Restore { input, workspace } => {
+            let workspace = workspace
+                .canonicalize()
+                .map_err(|error| error.to_string())?;
+            if workspace != current_workspace()? {
+                return Err("--confirm-workspace must match current workspace".into());
+            }
+            let source = Database::open(&input)
+                .map_err(|error| format!("invalid source database: {error}"))?;
+            let integrity: String = source
+                .connection()
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|error| error.to_string())?;
+            if integrity != "ok"
+                || source.user_version().map_err(|error| error.to_string())?
+                    < agent_storage::STORAGE_FORMAT_VERSION
+            {
+                return Err("source database failed integrity/schema validation".into());
+            }
+            let target = current_workspace()?.join(".agent/state.db");
+            if input.canonicalize().ok() == target.canonicalize().ok() {
+                return Err("restore input must differ from active database".into());
+            }
+            let backup = target.with_extension("db.restore-backup");
+            if target.exists() {
+                fs::rename(&target, &backup).map_err(|error| error.to_string())?;
+            }
+            if let Err(error) = fs::copy(&input, &target) {
+                if backup.exists() {
+                    let _ = fs::rename(&backup, &target);
+                }
+                return Err(error.to_string());
+            }
+            let _ = fs::remove_file(backup);
+            println!("{}", target.display());
+            Ok(())
+        }
+    }
+}
+
+fn audit_command(command: AuditCommand) -> Result<(), String> {
+    let (db_path, session, event, limit, output) = match command {
+        AuditCommand::List {
+            db_path,
+            session,
+            event,
+            limit,
+        } => (db_path, session, event, limit, None),
+        AuditCommand::Show { db_path, id } => {
+            let db = open_database(&db_path)?;
+            let record = db
+                .audit_records(None, None, 10_000)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|record| record.id == id)
+                .ok_or("audit record not found")?;
+            println!(
+                "{}",
+                serde_json::to_string(&record).map_err(|error| error.to_string())?
+            );
+            return Ok(());
+        }
+        AuditCommand::Export {
+            db_path,
+            output,
+            session,
+            limit,
+        } => (db_path, session, None, limit, Some(output)),
+    };
+    let db = open_database(&db_path)?;
+    let records = db
+        .audit_records(session, event.as_deref(), limit)
+        .map_err(|error| error.to_string())?;
+    let encoded = serde_json::to_vec_pretty(&records).map_err(|error| error.to_string())?;
+    if let Some(output) = output {
+        atomic_write(&output, &encoded)?;
+    } else {
+        println!("{}", String::from_utf8_lossy(&encoded));
     }
     Ok(())
 }
@@ -1739,6 +2149,7 @@ fn role_name(role: &Role) -> &'static str {
 }
 
 fn print_help() {
+    println!("Session/database controls: sessions list|show|archive|unarchive|delete|export|import; database backup|restore; audit list|show|export");
     println!("agent-cli [run] [OPTIONS] [PROMPT]\n\nCommands:\n  init [--force]       Initialize workspace control files\n  config list|get|set|unset|path|validate\n  auth status|login|logout PROVIDER\n  doctor               Show local configuration/tool/provider diagnostics\n  completion generate|install SHELL\n  providers list|set-default|show\n  permissions show|set-mode|add-network-host|remove-network-host\n  mcp list|add|remove|enable|disable|show|test\n  lsp list|add|remove|enable|disable|show|test\n  hooks list|enable|disable|test   skills list|show|validate\n  subagents config|show            status\n  run                  Run one agent turn (default)\n  sessions             List sessions for this workspace\n  search --query TEXT Search persisted messages\n  context [--session ID|latest] [--json]\n  usage [--session ID|latest] [--json]\n  memory list|search|add|supersede|delete\n  plugins list|verify|install|update|uninstall\n  verify -- PROGRAM    Run explicit verification argv\n  diff                 Show bounded read-only git diff\n\nOptions:\n  --provider NAME      fake, openai, anthropic, gemini, generic\n  --model NAME         Provider model\n  --base-url URL       Provider endpoint override\n  --db-path PATH       SQLite session database\n  --resume ID|latest   Resume a workspace session\n  --registry PATH|URL  Signed plugin registry source\n  --trust-store PATH   Trusted public-key JSON store for plugins\n  --tui                Use the interactive TTY UI (TTY only)\n  -h, --help           Show this help");
 }
 
@@ -2659,6 +3070,42 @@ mod tests {
                 .expect("keyring"),
             "keyring-value"
         );
+    }
+
+    #[test]
+    fn session_database_and_audit_commands_parse_exact_targets() {
+        assert_eq!(
+            parse_args(vec![
+                "sessions".into(),
+                "delete".into(),
+                "--id".into(),
+                "7".into(),
+                "--confirm".into(),
+                "7".into()
+            ])
+            .expect("delete"),
+            Command::Sessions {
+                command: SessionCommand::Delete(7),
+                db_path: default_db_path().expect("db")
+            }
+        );
+        assert!(parse_args(vec![
+            "sessions".into(),
+            "delete".into(),
+            "--id".into(),
+            "7".into(),
+            "--confirm".into(),
+            "8".into()
+        ])
+        .is_err());
+        assert!(matches!(
+            parse_args(vec!["database".into(), "backup".into(), "--output".into(), "/tmp/backup.db".into()]).expect("backup"),
+            Command::Database(DatabaseCommand::Backup { output, .. }) if output == Path::new("/tmp/backup.db")
+        ));
+        assert!(matches!(
+            parse_args(vec!["audit".into(), "list".into(), "--event".into(), "tool_completed".into()]).expect("audit"),
+            Command::Audit(AuditCommand::List { event: Some(event), .. }) if event == "tool_completed"
+        ));
     }
 
     #[test]
