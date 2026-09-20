@@ -97,7 +97,7 @@ pub fn load_config(
                 || server
                     .env_allowlist
                     .iter()
-                    .any(|name| !valid_env_name(name))
+                    .any(|name| !valid_env_name(name) || secret_env_name(name))
                 || server
                     .auth_env
                     .as_deref()
@@ -136,6 +136,11 @@ pub fn load_config(
                     )))
                 }
             };
+            let allowed_hosts = server
+                .allowed_hosts
+                .iter()
+                .map(|host| normalize_host(host))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(LoadedMcpServer {
                 config: McpServerConfig {
                     name: server.name,
@@ -151,7 +156,7 @@ pub fn load_config(
                     permission_class: PermissionClass::ReadOnly,
                     transport,
                 },
-                allowed_hosts: server.allowed_hosts,
+                allowed_hosts,
             })
         })
         .collect()
@@ -164,6 +169,37 @@ fn valid_env_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
+fn secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"]
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+pub fn normalize_host(host: &str) -> Result<String, McpError> {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() || host.contains('/') || host.contains(':') || host.contains('*') {
+        return Err(McpError::Protocol(
+            "allowed host must be an exact DNS name or IP".into(),
+        ));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok()
+        || (host.split('.').all(|part| {
+            !part.is_empty()
+                && part.len() <= 63
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+        }))
+    {
+        Ok(host)
+    } else {
+        Err(McpError::Protocol("invalid allowed host".into()))
+    }
+}
+
 pub struct HostAllowlist<P> {
     pub inner: P,
     pub allowed_hosts: Vec<String>,
@@ -173,10 +209,11 @@ impl<P: McpPolicy> McpPolicy for HostAllowlist<P> {
         self.inner.authorize(class, tool)
     }
     fn authorize_network(&self, host: &str) -> Result<(), McpError> {
-        if self.allowed_hosts.iter().any(|allowed| allowed == host) {
+        let host = normalize_host(host)?;
+        if self.allowed_hosts.iter().any(|allowed| allowed == &host) {
             Ok(())
         } else {
-            Err(McpError::NetworkDenied(host.into()))
+            Err(McpError::NetworkDenied(host))
         }
     }
 }
@@ -691,7 +728,7 @@ mod tests {
             if host == "127.0.0.1" {
                 Ok(())
             } else {
-                Err(McpError::NetworkDenied(host.into()))
+                Err(McpError::NetworkDenied(host.to_string()))
             }
         }
     }
@@ -824,12 +861,22 @@ mod tests {
         let config = root.join(".agent/config.toml");
         std::fs::write(
             &config,
-            "[[mcp_server]]\nname='local'\ncommand='mock'\nenabled=true\ntransport='stdio'\nenv_allowlist=['MCP_TOKEN']\ntool_include=['echo']\n",
+            "[[mcp_server]]\nname='local'\ncommand='mock'\nenabled=true\ntransport='stdio'\nenv_allowlist=['MCP_MODE']\ntool_include=['echo']\n",
         )
         .expect("config");
         let loaded = load_config(&config, &root).expect("load");
         assert_eq!(loaded[0].config.name, "local");
         assert_eq!(loaded[0].config.tool_include, vec!["echo"]);
+        assert!(load_config(&config, &root).is_ok());
+        std::fs::write(
+            &config,
+            "[[mcp_server]]\nname='bad'\ncommand='mock'\nenv_allowlist=['API_TOKEN']\n",
+        )
+        .expect("secret config");
+        assert!(load_config(&config, &root).is_err());
+        assert!(normalize_host("Example.COM").is_ok());
+        assert!(normalize_host("https://example.com").is_err());
+        assert!(normalize_host("*.example.com").is_err());
         let outside = std::env::temp_dir().join("agent-mcp-outside.toml");
         std::fs::write(&outside, "").expect("outside");
         assert!(load_config(&outside, &root).is_err());

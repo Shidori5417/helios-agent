@@ -100,12 +100,20 @@ fn validate_config(server: &mut LspServerConfig, workspace: &Path) -> Result<(),
             || !name
                 .bytes()
                 .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+            || secret_env_name(name)
     }) {
         return Err(LspError::Protocol(
             "invalid LSP environment allowlist".into(),
         ));
     }
     Ok(())
+}
+
+fn secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"]
+        .iter()
+        .any(|marker| upper.contains(marker))
 }
 
 pub trait LspTransport {

@@ -165,7 +165,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 89701
+    "bytes": 94991
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -237,7 +237,7 @@
   },
   {
     "path": "crates/terminal/src/lib.rs",
-    "bytes": 16559
+    "bytes": 16852
   },
   {
     "path": "crates/tools/Cargo.toml",
@@ -265,7 +265,7 @@
   },
   {
     "path": "crates/mcp/src/lib.rs",
-    "bytes": 29630
+    "bytes": 31360
   },
   {
     "path": "crates/plugins/Cargo.toml",
@@ -273,7 +273,7 @@
   },
   {
     "path": "crates/plugins/src/lib.rs",
-    "bytes": 42610
+    "bytes": 43048
   },
   {
     "path": "crates/skills/Cargo.toml",
@@ -393,7 +393,7 @@
   },
   {
     "path": "crates/lsp/src/lib.rs",
-    "bytes": 19897
+    "bytes": 20145
   },
   {
     "path": "docs/LSP.md",

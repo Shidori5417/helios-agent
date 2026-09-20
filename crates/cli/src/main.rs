@@ -4,7 +4,9 @@ use agent_core::{
     ToolExecution, ToolExecutor, ToolFailure,
 };
 use agent_lsp::{load_config as load_lsp_config, LspClient, LspServerConfig, StdioTransport};
-use agent_mcp::{load_config as load_mcp_config, HostAllowlist, McpClient, PermissionPolicy};
+use agent_mcp::{
+    load_config as load_mcp_config, normalize_host, HostAllowlist, McpClient, PermissionPolicy,
+};
 use agent_memory::{MemoryEntry, MemoryStore, SqliteMemoryStore};
 use agent_plugins::{
     fetch_registry_manifest, install_from_registry, load_signed_registry, load_trust_store,
@@ -475,6 +477,35 @@ struct UserConfig {
     #[serde(default)]
     base_url: Option<String>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RuntimePolicy {
+    mode: PermissionMode,
+    allowed_network_hosts: Vec<String>,
+    env_allow: Vec<String>,
+    env_deny: Vec<String>,
+}
+
+impl Default for RuntimePolicy {
+    fn default() -> Self {
+        Self {
+            mode: PermissionMode::WorkspaceWrite,
+            allowed_network_hosts: Vec::new(),
+            env_allow: Vec::new(),
+            env_deny: Vec::new(),
+        }
+    }
+}
+
+impl RuntimePolicy {
+    fn filter_env(&self, names: &mut Vec<String>) {
+        names.retain(|name| {
+            !self.env_deny.iter().any(|denied| denied == name)
+                && (self.env_allow.is_empty()
+                    || self.env_allow.iter().any(|allowed| allowed == name))
+        });
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 enum MemoryCommand {
     List {
@@ -862,7 +893,8 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         .clone()
         .unwrap_or_else(|| workspace.join(".agent/config.toml"));
     let configured = load_user_config(&config_path)?;
-    let permission_mode = load_permission_mode(&config_path)?;
+    let runtime_policy = load_runtime_policy(&config_path)?;
+    let permission_mode = runtime_policy.mode;
     if !options.provider_explicit {
         if let Some(provider) = configured.provider {
             options.provider = provider;
@@ -918,18 +950,32 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         )
     };
     let config_path = config_path.is_file().then_some(config_path);
-    let servers = config_path
+    let mut servers = config_path
         .as_ref()
         .map(|path| load_mcp_config(path, &workspace))
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
-    let lsp_servers = config_path
+    for server in &mut servers {
+        runtime_policy.filter_env(&mut server.config.env_allowlist);
+        if !runtime_policy.allowed_network_hosts.is_empty() {
+            server.allowed_hosts.retain(|host| {
+                runtime_policy
+                    .allowed_network_hosts
+                    .iter()
+                    .any(|allowed| allowed == host)
+            });
+        }
+    }
+    let mut lsp_servers = config_path
         .as_ref()
         .map(|path| load_lsp_config(path, &workspace))
         .transpose()
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    for server in &mut lsp_servers {
+        runtime_policy.filter_env(&mut server.env_allowlist);
+    }
     let cancellation = CancellationToken::default();
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
@@ -947,6 +993,8 @@ fn run_command(mut options: RunOptions) -> Result<(), String> {
         config_path.as_deref(),
         cancellation.clone(),
         permission_mode,
+        &runtime_policy.env_allow,
+        &runtime_policy.env_deny,
     )?;
     let startup_memory = load_startup_memory(&options.db_path, &workspace_id, &options.prompt)?;
     if options.tui {
@@ -1558,6 +1606,8 @@ fn load_runtime_hooks(
     config_path: Option<&std::path::Path>,
     cancellation: CancellationToken,
     permission_mode: PermissionMode,
+    env_allow: &[String],
+    env_deny: &[String],
 ) -> Result<Option<Box<dyn HookRunner>>, String> {
     let plugins_root = workspace.join(".agent/plugins");
     if !plugins_root.is_dir() {
@@ -1585,6 +1635,7 @@ fn load_runtime_hooks(
     for name in enabled {
         registry.enable(&name).map_err(|error| error.to_string())?;
     }
+    registry.restrict_environment(env_allow, env_deny);
     if !registry.plugins().iter().any(|plugin| plugin.enabled) {
         return Ok(None);
     }
@@ -1700,23 +1751,57 @@ fn load_user_config(path: &Path) -> Result<UserConfig, String> {
         .map_err(|e| format!("invalid config: {e}"))
 }
 
-fn load_permission_mode(path: &Path) -> Result<PermissionMode, String> {
+fn load_runtime_policy(path: &Path) -> Result<RuntimePolicy, String> {
     if !path.exists() {
-        return Ok(PermissionMode::WorkspaceWrite);
+        return Ok(RuntimePolicy::default());
     }
     let document: toml::Value =
         toml::from_str(&fs::read_to_string(path).map_err(|error| error.to_string())?)
             .map_err(|error| format!("invalid config: {error}"))?;
-    let mode = document
-        .get("permissions")
+    let permissions = document.get("permissions");
+    let mode = permissions
         .and_then(|value| value.get("mode"))
         .and_then(toml::Value::as_str)
         .unwrap_or("workspace-write");
-    match mode {
+    let mode = match mode {
         "read-only" | "readonly" => Ok(PermissionMode::ReadOnly),
         "workspace-write" | "workspace_write" => Ok(PermissionMode::WorkspaceWrite),
         other => Err(format!("invalid permissions.mode: {other}")),
+    }?;
+    let strings = |key: &str| -> Result<Vec<String>, String> {
+        permissions
+            .and_then(|value| value.get(key))
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| format!("permissions.{key} must contain strings"))
+                    .map(str::to_owned)
+            })
+            .collect()
+    };
+    let mut allowed_network_hosts = strings("allowed_network_hosts")?;
+    for host in &mut allowed_network_hosts {
+        *host = normalize_host(host).map_err(|error| error.to_string())?;
     }
+    let env_allow = strings("env_allow")?;
+    let env_deny = strings("env_deny")?;
+    for name in env_allow.iter().chain(env_deny.iter()) {
+        if !safe_env_name(name) || secret_env_name(name) {
+            return Err(format!(
+                "secret-like or invalid environment name is not allowed: {name}"
+            ));
+        }
+    }
+    Ok(RuntimePolicy {
+        mode,
+        allowed_network_hosts,
+        env_allow,
+        env_deny,
+    })
 }
 
 fn config_command(command: ConfigCommand) -> Result<(), String> {
@@ -2096,7 +2181,41 @@ fn runtime_permissions_command(args: &[String], path: &Path) -> Result<(), Strin
         let bytes = toml::to_string_pretty(&document).map_err(|error| error.to_string())?;
         return atomic_write(path, bytes.as_bytes());
     }
-    Err(format!("unsupported permissions action: {action}"))
+    let (key, remove) = match action {
+        "add-network-host" => ("allowed_network_hosts", false),
+        "remove-network-host" => ("allowed_network_hosts", true),
+        "env-allow" => ("env_allow", false),
+        "env-deny" => ("env_deny", false),
+        _ => return Err(format!("unsupported permissions action: {action}")),
+    };
+    let value = value_after(&args[1..], "--value")?
+        .or_else(|| args.get(1).cloned())
+        .ok_or("permission mutation requires a value")?;
+    let value = if key == "allowed_network_hosts" {
+        normalize_host(&value).map_err(|error| error.to_string())?
+    } else {
+        if !safe_env_name(&value) || secret_env_name(&value) {
+            return Err("invalid or secret-like environment name".into());
+        }
+        value
+    };
+    let permissions = table
+        .entry("permissions")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or("permissions config must be a table")?;
+    let values = permissions
+        .entry(key)
+        .or_insert_with(|| toml::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or("permission list must be an array")?;
+    if remove {
+        values.retain(|item| item.as_str() != Some(&value));
+    } else if !values.iter().any(|item| item.as_str() == Some(&value)) {
+        values.push(toml::Value::String(value));
+    }
+    let bytes = toml::to_string_pretty(&document).map_err(|error| error.to_string())?;
+    atomic_write(path, bytes.as_bytes())
 }
 
 fn safe_control_id(id: &str) -> bool {
@@ -2216,6 +2335,13 @@ fn safe_env_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn secret_env_name(value: &str) -> bool {
+    let upper = value.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"]
+        .iter()
+        .any(|marker| upper.contains(marker))
 }
 
 struct PrintingSink {
@@ -2486,11 +2612,30 @@ mod tests {
         runtime_permissions_command(&["set-mode".into(), "read-only".into()], &path)
             .expect("set mode");
         assert_eq!(
-            load_permission_mode(&path).expect("load mode"),
+            load_runtime_policy(&path).expect("load mode").mode,
             PermissionMode::ReadOnly
         );
         assert!(
             runtime_permissions_command(&["set-mode".into(), "unsafe".into()], &path,).is_err()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_policy_normalizes_hosts_and_rejects_secret_env_names() {
+        let root =
+            std::env::temp_dir().join(format!("helios-policy-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("config.toml");
+        runtime_permissions_command(&["add-network-host".into(), "Example.COM".into()], &path)
+            .expect("host");
+        runtime_permissions_command(&["env-allow".into(), "CI".into()], &path).expect("env");
+        let policy = load_runtime_policy(&path).expect("policy");
+        assert_eq!(policy.allowed_network_hosts, vec!["example.com"]);
+        assert_eq!(policy.env_allow, vec!["CI"]);
+        assert!(
+            runtime_permissions_command(&["env-allow".into(), "API_TOKEN".into()], &path,).is_err()
         );
         let _ = fs::remove_dir_all(root);
     }

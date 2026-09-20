@@ -317,12 +317,22 @@ fn status_of(result: &CommandResult) -> BackgroundStatus {
 fn safe_environment(allowlist: &[String]) -> Vec<(String, String)> {
     std::env::vars()
         .filter(|(key, _)| {
+            if secret_env_name(key) {
+                return false;
+            }
             (allowlist.is_empty()
                 && matches!(key.as_str(), "PATH" | "HOME" | "TERM" | "LANG" | "SHELL"))
                 || allowlist.iter().any(|allowed| allowed == key)
                 || key.starts_with("LC_")
         })
         .collect()
+}
+
+fn secret_env_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    ["TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY"]
+        .iter()
+        .any(|marker| upper.contains(marker))
 }
 
 fn collect<R: Read>(

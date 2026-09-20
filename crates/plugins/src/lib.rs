@@ -644,6 +644,17 @@ impl PluginRegistry {
     pub fn plugins(&self) -> &[Plugin] {
         &self.plugins
     }
+
+    pub fn restrict_environment(&mut self, allow: &[String], deny: &[String]) {
+        for plugin in &mut self.plugins {
+            for hook in &mut plugin.manifest.hooks {
+                hook.env_allowlist.retain(|name| {
+                    !deny.iter().any(|blocked| blocked == name)
+                        && (allow.is_empty() || allow.iter().any(|permitted| permitted == name))
+                });
+            }
+        }
+    }
     pub fn enable(&mut self, name: &str) -> Result<(), PluginError> {
         let plugin = self
             .plugins
