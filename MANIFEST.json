@@ -245,7 +245,7 @@
   },
   {
     "path": "crates/tools/src/lib.rs",
-    "bytes": 35477
+    "bytes": 36041
   },
   {
     "path": "crates/tui/Cargo.toml",

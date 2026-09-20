@@ -643,11 +643,23 @@ impl ToolRegistry {
 }
 
 fn tool_output_cache_dir(root: &Path) -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| root.join(".agent"));
-    base.join("helios/tool-output")
+    let _ = root;
+    resolve_tool_output_dir(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    )
+}
+
+fn resolve_tool_output_dir(
+    xdg_cache: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+) -> PathBuf {
+    xdg_cache
+        .or_else(|| home.map(|path| path.join(".cache")))
+        .unwrap_or(temp)
+        .join("helios/tool-output")
 }
 
 fn safe_action(name: &str, args: &Value) -> String {
@@ -710,11 +722,11 @@ fn bounded(status: ToolStatus, summary: &str, data: String, limit: usize) -> Too
 }
 
 fn bounded_spill(data: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("helios/tool-output");
+    let base = resolve_tool_output_dir(
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    );
     fs::create_dir_all(&base).ok()?;
     #[cfg(unix)]
     {
@@ -815,6 +827,18 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn cache_resolver_never_uses_workspace_without_xdg_or_home() {
+        let fallback = PathBuf::from("/tmp/helios-safe-temp");
+        assert_eq!(
+            resolve_tool_output_dir(None, None, fallback.clone()),
+            fallback.join("helios/tool-output")
+        );
+        assert!(!resolve_tool_output_dir(None, None, fallback)
+            .to_string_lossy()
+            .contains(".agent"));
     }
 
     #[test]
