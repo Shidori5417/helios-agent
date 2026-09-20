@@ -552,6 +552,54 @@ pub struct PluginManifest {
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub hooks: Vec<HookSpec>,
+    #[serde(default)]
+    pub commands: Vec<PluginCommandSpec>,
+    #[serde(default)]
+    pub tools: Vec<PluginToolSpec>,
+    #[serde(default)]
+    pub skills: Vec<PluginSkillSpec>,
+}
+
+/// A declarative command.  Plugins never load arbitrary Rust or dynamic code;
+/// process execution is opt-in through the manifest capability and the shared
+/// permission/terminal boundary.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct PluginCommandSpec {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default = "default_plugin_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct PluginToolSpec {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default = "default_plugin_timeout")]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub env_allowlist: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct PluginSkillSpec {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+}
+
+fn default_plugin_timeout() -> u64 {
+    10_000
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -570,11 +618,18 @@ pub struct HookSpec {
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub enum HookEvent {
     SessionStart,
+    SessionEnd,
+    BeforePrompt,
     UserPromptSubmit,
+    BeforeTool,
     PreToolUse,
+    AfterTool,
     PostToolUse,
     PreEdit,
     PostEdit,
+    BeforeCompact,
+    AfterCompact,
+    AgentFinished,
     PermissionRequest,
     PreCompact,
     Stop,
@@ -625,6 +680,8 @@ pub enum PluginError {
     Permission(String),
     #[error("hook blocked by fail-closed policy: {0}")]
     HookFailedClosed(String),
+    #[error("plugin process capability is not declared")]
+    MissingPluginProcessCapability,
 }
 
 pub struct PluginRegistry {
@@ -823,6 +880,176 @@ impl PluginRegistry {
         }
         Ok(outputs)
     }
+
+    pub fn declarative_tools(&self) -> impl Iterator<Item = (&Plugin, &PluginToolSpec)> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.enabled)
+            .flat_map(|plugin| plugin.manifest.tools.iter().map(move |tool| (plugin, tool)))
+    }
+
+    pub fn declarative_commands(&self) -> impl Iterator<Item = (&Plugin, &PluginCommandSpec)> {
+        self.plugins
+            .iter()
+            .filter(|plugin| plugin.enabled)
+            .flat_map(|plugin| {
+                plugin
+                    .manifest
+                    .commands
+                    .iter()
+                    .map(move |command| (plugin, command))
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tool(
+        &self,
+        plugin_name: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+        workspace: &Path,
+        permissions: &PermissionEngine,
+        cancellation: &CancellationToken,
+        output_limit: usize,
+    ) -> Result<HookOutput, PluginError> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.manifest.name == plugin_name)
+            .ok_or_else(|| PluginError::UnknownPlugin(plugin_name.into()))?;
+        if !plugin.enabled {
+            return Ok(HookOutput {
+                status: HookStatus::SkippedDisabled,
+                output: String::new(),
+                truncated: false,
+            });
+        }
+        if !plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|cap| cap == "tool_process")
+        {
+            return Err(PluginError::MissingPluginProcessCapability);
+        }
+        let spec = plugin
+            .manifest
+            .tools
+            .iter()
+            .find(|tool| tool.name == tool_name)
+            .ok_or_else(|| PluginError::InvalidManifest("tool not declared".into()))?;
+        permissions
+            .authorize(PermissionClass::Process)
+            .map_err(|error| PluginError::Permission(error.to_string()))?;
+        let root = workspace.canonicalize()?;
+        let cwd = plugin.path.canonicalize()?;
+        if !cwd.starts_with(&root) || !cwd.starts_with(permissions.root()) {
+            return Err(PluginError::OutsideWorkspace);
+        }
+        let mut args = spec.args.clone();
+        args.push(
+            serde_json::to_string(input)
+                .map_err(|e| PluginError::InvalidManifest(e.to_string()))?,
+        );
+        let result = run(
+            CommandSpec {
+                program: spec.command.clone(),
+                args,
+                cwd,
+                timeout: Duration::from_millis(spec.timeout_ms),
+                output_limit,
+                spill_dir: root.join(".agent/plugin-spill"),
+                requires_pty: false,
+                env_allowlist: spec.env_allowlist.clone(),
+            },
+            cancellation,
+        );
+        match result {
+            Ok(result) if matches!(result.status, CommandStatus::Exited(0)) => Ok(HookOutput {
+                status: HookStatus::Succeeded,
+                output: format!("{}{}", result.stdout.text, result.stderr.text),
+                truncated: result.stdout.truncated || result.stderr.truncated,
+            }),
+            Ok(result) => Err(PluginError::HookFailedClosed(format!(
+                "{}{}",
+                result.stdout.text, result.stderr.text
+            ))),
+            Err(error) => Err(PluginError::HookFailedClosed(error.to_string())),
+        }
+    }
+
+    pub fn execute_command(
+        &self,
+        plugin_name: &str,
+        command_name: &str,
+        workspace: &Path,
+        permissions: &PermissionEngine,
+        cancellation: &CancellationToken,
+        output_limit: usize,
+    ) -> Result<HookOutput, PluginError> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.manifest.name == plugin_name)
+            .ok_or_else(|| PluginError::UnknownPlugin(plugin_name.into()))?;
+        if !plugin.enabled {
+            return Ok(HookOutput {
+                status: HookStatus::SkippedDisabled,
+                output: String::new(),
+                truncated: false,
+            });
+        }
+        if !plugin
+            .manifest
+            .capabilities
+            .iter()
+            .any(|cap| cap == "command_process")
+        {
+            return Err(PluginError::MissingPluginProcessCapability);
+        }
+        let spec = plugin
+            .manifest
+            .commands
+            .iter()
+            .find(|command| command.name == command_name)
+            .ok_or_else(|| PluginError::InvalidManifest("command not declared".into()))?;
+        let (program, args) = spec.argv.split_first().ok_or_else(|| {
+            PluginError::InvalidManifest("command argv is required for execution".into())
+        })?;
+        permissions
+            .authorize(PermissionClass::Process)
+            .map_err(|error| PluginError::Permission(error.to_string()))?;
+        let root = workspace.canonicalize()?;
+        let cwd = plugin.path.canonicalize()?;
+        if !cwd.starts_with(&root) || !cwd.starts_with(permissions.root()) {
+            return Err(PluginError::OutsideWorkspace);
+        }
+        let result = run(
+            CommandSpec {
+                program: program.clone(),
+                args: args.to_vec(),
+                cwd,
+                timeout: Duration::from_millis(spec.timeout_ms),
+                output_limit,
+                spill_dir: root.join(".agent/plugin-spill"),
+                requires_pty: false,
+                env_allowlist: spec.env_allowlist.clone(),
+            },
+            cancellation,
+        );
+        match result {
+            Ok(result) if matches!(result.status, CommandStatus::Exited(0)) => Ok(HookOutput {
+                status: HookStatus::Succeeded,
+                output: format!("{}{}", result.stdout.text, result.stderr.text),
+                truncated: result.stdout.truncated || result.stderr.truncated,
+            }),
+            Ok(result) => Err(PluginError::HookFailedClosed(format!(
+                "{}{}",
+                result.stdout.text, result.stderr.text
+            ))),
+            Err(error) => Err(PluginError::HookFailedClosed(error.to_string())),
+        }
+    }
 }
 
 fn validate(manifest: &PluginManifest) -> Result<(), PluginError> {
@@ -841,6 +1068,11 @@ fn validate(manifest: &PluginManifest) -> Result<(), PluginError> {
         "hook_process",
         "mcp",
         "provider",
+        "command",
+        "command_process",
+        "tool",
+        "tool_process",
+        "renderer",
     ];
     if manifest
         .capabilities
@@ -848,6 +1080,68 @@ fn validate(manifest: &PluginManifest) -> Result<(), PluginError> {
         .any(|capability| !allowed.contains(&capability.as_str()))
     {
         return Err(PluginError::InvalidManifest("unknown capability".into()));
+    }
+    if manifest
+        .capabilities
+        .iter()
+        .any(|cap| cap == "provider" || cap == "renderer")
+    {
+        return Err(PluginError::InvalidManifest(
+            "provider/renderer capabilities are unsupported".into(),
+        ));
+    }
+    if !manifest.commands.is_empty()
+        && !manifest
+            .capabilities
+            .iter()
+            .any(|cap| cap == "command" || cap == "command_process")
+    {
+        return Err(PluginError::InvalidManifest(
+            "command capability is not declared".into(),
+        ));
+    }
+    if !manifest.tools.is_empty()
+        && !manifest
+            .capabilities
+            .iter()
+            .any(|cap| cap == "tool" || cap == "tool_process")
+    {
+        return Err(PluginError::InvalidManifest(
+            "tool capability is not declared".into(),
+        ));
+    }
+    for command in &manifest.commands {
+        if !safe_id(&command.name)
+            || command.timeout_ms == 0
+            || command.timeout_ms > 60_000
+            || (command.argv.is_empty() && command.prompt.is_none())
+        {
+            return Err(PluginError::InvalidManifest(
+                "invalid command declaration".into(),
+            ));
+        }
+    }
+    for tool in &manifest.tools {
+        if !safe_id(&tool.name)
+            || tool.command.is_empty()
+            || tool.timeout_ms == 0
+            || tool.timeout_ms > 60_000
+        {
+            return Err(PluginError::InvalidManifest(
+                "invalid tool declaration".into(),
+            ));
+        }
+    }
+    for skill in &manifest.skills {
+        if !safe_id(&skill.name)
+            || skill.path.is_empty()
+            || Path::new(&skill.path).is_absolute()
+            || skill.path.split('/').any(|part| part == "..")
+        {
+            return Err(PluginError::InvalidManifest(
+                "invalid skill declaration".into(),
+            ));
+        }
     }
     if manifest
         .hooks
@@ -978,6 +1272,52 @@ mod tests {
             ),
             Err(PluginError::HookFailedClosed(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn declarative_tools_are_bounded_and_use_the_process_boundary() {
+        let root = root();
+        fs::create_dir_all(root.join("declared")).expect("dir");
+        fs::write(
+            root.join("declared/plugin.json"),
+            r#"{"schema_version":1,"name":"declared","version":"1","capabilities":["tool","tool_process"],"tools":[{"name":"echo","description":"echo input","input_schema":{"type":"object"},"command":"printf","args":["tool:"],"timeout_ms":500}]}"#,
+        )
+        .expect("manifest");
+        let mut registry = PluginRegistry::discover(&root).expect("registry");
+        registry.enable("declared").expect("enable");
+        assert_eq!(registry.declarative_tools().count(), 1);
+        let permissions =
+            PermissionEngine::new(&root, PermissionMode::WorkspaceWrite).expect("permissions");
+        let output = registry
+            .execute_tool(
+                "declared",
+                "echo",
+                &serde_json::json!({"ok":true}),
+                &root,
+                &permissions,
+                &CancellationToken::default(),
+                256,
+            )
+            .expect("tool");
+        assert_eq!(output.status, HookStatus::Succeeded);
+        assert!(output.output.starts_with("tool:"));
+        assert!(output.output.contains("\"ok\":true"));
+    }
+
+    #[test]
+    fn declarative_provider_and_renderer_capabilities_are_rejected() {
+        let root = root();
+        for (name, capability) in [("provider", "provider"), ("renderer", "renderer")] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).expect("dir");
+            fs::write(
+                dir.join("plugin.json"),
+                format!(r#"{{"schema_version":1,"name":"{name}","version":"1","capabilities":["{capability}"]}}"#),
+            ).expect("manifest");
+            assert!(PluginRegistry::discover(&root).is_err());
+            fs::remove_file(dir.join("plugin.json")).expect("cleanup");
+        }
     }
 
     #[test]

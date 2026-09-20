@@ -252,6 +252,7 @@ fn redact_output(value: &str) -> String {
 
 struct RuntimeExecutor {
     builtin: ToolRegistry,
+    plugins: PluginRegistry,
     mcp: Vec<McpRuntime>,
     workspace: PathBuf,
     config_path: Option<PathBuf>,
@@ -319,8 +320,32 @@ impl RuntimeExecutor {
             .collect();
         let permissions =
             PermissionEngine::new(workspace, permission_mode).map_err(|error| error.to_string())?;
+        let mut plugins =
+            PluginRegistry::discover(plugin_root(workspace)).map_err(|error| error.to_string())?;
+        let enabled_plugins = config_path
+            .as_deref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .and_then(|content| content.parse::<toml::Value>().ok())
+            .and_then(|value| {
+                value
+                    .get("plugins")
+                    .and_then(|p| p.get("enabled"))
+                    .and_then(toml::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(toml::Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .unwrap_or_default();
+        for name in enabled_plugins {
+            plugins.enable(&name).map_err(|error| error.to_string())?;
+        }
         Ok(Self {
             builtin,
+            plugins,
             mcp,
             workspace: workspace.to_path_buf(),
             config_path,
@@ -363,12 +388,62 @@ impl RuntimeExecutor {
                 });
             }
         }
+        for (plugin, tool) in self.plugins.declarative_tools() {
+            definitions.push(agent_protocol::ToolDefinition {
+                name: format!("plugin.{}.{}", plugin.manifest.name, tool.name),
+                description: format!("{} (plugin {})", tool.description, plugin.manifest.name),
+                input_schema: tool.input_schema.clone(),
+            });
+        }
+        for (plugin, command) in self.plugins.declarative_commands() {
+            definitions.push(agent_protocol::ToolDefinition {
+                name: format!("plugin.{}.{}", plugin.manifest.name, command.name),
+                description: format!(
+                    "{} (plugin command {})",
+                    command.description, plugin.manifest.name
+                ),
+                input_schema: serde_json::json!({"type":"object"}),
+            });
+        }
         definitions
     }
 
     fn execute(&mut self, call: &agent_protocol::ToolCall) -> Result<ToolExecution, String> {
         if call.name.starts_with("lsp:") {
             return self.execute_lsp(call);
+        }
+        if let Some(rest) = call.name.strip_prefix("plugin.") {
+            let (plugin_name, tool_name) = rest
+                .split_once('.')
+                .ok_or_else(|| "invalid plugin tool name".to_owned())?;
+            let is_tool = self.plugins.declarative_tools().any(|(plugin, tool)| {
+                plugin.manifest.name == plugin_name && tool.name == tool_name
+            });
+            let output = if is_tool {
+                self.plugins.execute_tool(
+                    plugin_name,
+                    tool_name,
+                    &call.arguments,
+                    &self.workspace,
+                    &self.permissions,
+                    &self.cancellation,
+                    64 * 1024,
+                )
+            } else {
+                self.plugins.execute_command(
+                    plugin_name,
+                    tool_name,
+                    &self.workspace,
+                    &self.permissions,
+                    &self.cancellation,
+                    64 * 1024,
+                )
+            }
+            .map_err(|error| error.to_string())?;
+            return Ok(ToolExecution {
+                status: format!("{:?}", output.status),
+                output: output.output,
+            });
         }
         let (server_name, tool_name) = if let Some(rest) = call.name.strip_prefix("mcp.") {
             rest.split_once('.')
@@ -571,11 +646,18 @@ impl HookRunner for RuntimeHooks {
     fn run(&mut self, event: LifecycleEvent) -> Result<String, String> {
         let event = match event {
             LifecycleEvent::SessionStart => HookEvent::SessionStart,
+            LifecycleEvent::SessionEnd => HookEvent::SessionEnd,
+            LifecycleEvent::BeforePrompt => HookEvent::BeforePrompt,
             LifecycleEvent::PreToolUse => HookEvent::PreToolUse,
+            LifecycleEvent::BeforeTool => HookEvent::BeforeTool,
             LifecycleEvent::PostToolUse => HookEvent::PostToolUse,
+            LifecycleEvent::AfterTool => HookEvent::AfterTool,
             LifecycleEvent::PreEdit => HookEvent::PreEdit,
             LifecycleEvent::PostEdit => HookEvent::PostEdit,
             LifecycleEvent::PreCompact => HookEvent::PreCompact,
+            LifecycleEvent::BeforeCompact => HookEvent::BeforeCompact,
+            LifecycleEvent::AfterCompact => HookEvent::AfterCompact,
+            LifecycleEvent::AgentFinished => HookEvent::AgentFinished,
             LifecycleEvent::Stop => HookEvent::Stop,
         };
         let outputs = self
@@ -3109,6 +3191,75 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
             tools: server.config.tool_include,
         })
         .collect();
+    let (plugins, hooks) = PluginRegistry::discover(plugin_root(&paths.workspace))
+        .ok()
+        .map(|registry| {
+            let plugins = registry
+                .plugins()
+                .iter()
+                .map(|plugin| agent_tui::ExtensionOption {
+                    name: plugin.manifest.name.clone(),
+                    description: format!(
+                        "v{}; {} declarative tool(s)",
+                        plugin.manifest.version,
+                        plugin.manifest.tools.len()
+                    ),
+                    status: if plugin.enabled {
+                        "enabled"
+                    } else {
+                        "installed"
+                    }
+                    .into(),
+                    source: "signed plugin manifest".into(),
+                })
+                .collect::<Vec<_>>();
+            let hooks = registry
+                .plugins()
+                .iter()
+                .flat_map(|plugin| {
+                    plugin
+                        .manifest
+                        .hooks
+                        .iter()
+                        .map(move |hook| agent_tui::ExtensionOption {
+                            name: format!("{}:{:?}", plugin.manifest.name, hook.event),
+                            description: "lifecycle hook".into(),
+                            status: if plugin.enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            }
+                            .into(),
+                            source: "plugin manifest".into(),
+                        })
+                })
+                .collect::<Vec<_>>();
+            (plugins, hooks)
+        })
+        .unwrap_or_default();
+    let skills = PermissionEngine::new(&paths.workspace, PermissionMode::ReadOnly)
+        .ok()
+        .and_then(|permissions| {
+            SkillCatalog::discover(paths.workspace.join("skills"), permissions).ok()
+        })
+        .map(|catalog| {
+            catalog
+                .metadata()
+                .iter()
+                .map(|skill| agent_tui::ExtensionOption {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    status: if skill.auto_invoke {
+                        "auto"
+                    } else {
+                        "available"
+                    }
+                    .into(),
+                    source: catalog.root().display().to_string(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     agent_tui::TuiContext {
         workspace: Some(
             paths
@@ -3129,6 +3280,9 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         tools,
         memory,
         mcp,
+        plugins,
+        skills,
+        hooks,
         usage_summary,
         cost_summary: Some("cost unavailable (no explicit pricing configured)".into()),
         context_summary,
@@ -3283,6 +3437,63 @@ fn slash_command_output(command: &str) -> Option<String> {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )
+        }),
+        "/plugins" => app_paths().ok().map(|paths| {
+            PluginRegistry::discover(plugin_root(&paths.workspace))
+                .ok()
+                .map(|registry| {
+                    registry
+                        .plugins()
+                        .iter()
+                        .map(|plugin| {
+                            format!(
+                                "{} {}",
+                                plugin.manifest.name,
+                                if plugin.enabled {
+                                    "enabled"
+                                } else {
+                                    "installed"
+                                }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| "plugins=0".into())
+        }),
+        "/skills" => app_paths().ok().map(|paths| {
+            let Ok(permissions) = PermissionEngine::new(&paths.workspace, PermissionMode::ReadOnly)
+            else {
+                return "skills=0".into();
+            };
+            SkillCatalog::discover(paths.workspace.join("skills"), permissions)
+                .ok()
+                .map(|catalog| {
+                    catalog
+                        .metadata()
+                        .iter()
+                        .map(|skill| format!("{} — {}", skill.name, skill.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| "skills=0".into())
+        }),
+        "/hooks" => app_paths().ok().map(|paths| {
+            PluginRegistry::discover(plugin_root(&paths.workspace))
+                .ok()
+                .map(|registry| {
+                    registry
+                        .plugins()
+                        .iter()
+                        .flat_map(|plugin| {
+                            plugin.manifest.hooks.iter().map(move |hook| {
+                                format!("{}:{:?}", plugin.manifest.name, hook.event)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_else(|| "hooks=0".into())
         }),
         "/memory" | "/memory list" => app_paths().ok().and_then(|paths| {
             let store = SqliteMemoryStore::open(&paths.db_path, 128, 16 * 1024).ok()?;
@@ -7313,13 +7524,20 @@ fn set_enabled_plugin(path: &Path, id: &str, enabled: bool) -> Result<(), String
 fn parse_hook_event(name: &str) -> Result<HookEvent, String> {
     match name.to_ascii_lowercase().as_str() {
         "sessionstart" | "session_start" => Ok(HookEvent::SessionStart),
+        "sessionend" | "session_end" => Ok(HookEvent::SessionEnd),
+        "beforeprompt" | "before_prompt" => Ok(HookEvent::BeforePrompt),
         "userpromptsubmit" | "user_prompt_submit" => Ok(HookEvent::UserPromptSubmit),
+        "beforetool" | "before_tool" => Ok(HookEvent::BeforeTool),
         "pretooluse" | "pre_tool_use" => Ok(HookEvent::PreToolUse),
+        "aftertool" | "after_tool" => Ok(HookEvent::AfterTool),
         "posttooluse" | "post_tool_use" => Ok(HookEvent::PostToolUse),
         "preedit" | "pre_edit" => Ok(HookEvent::PreEdit),
         "postedit" | "post_edit" => Ok(HookEvent::PostEdit),
         "permissionrequest" | "permission_request" => Ok(HookEvent::PermissionRequest),
         "precompact" | "pre_compact" => Ok(HookEvent::PreCompact),
+        "beforecompact" | "before_compact" => Ok(HookEvent::BeforeCompact),
+        "aftercompact" | "after_compact" => Ok(HookEvent::AfterCompact),
+        "agentfinished" | "agent_finished" => Ok(HookEvent::AgentFinished),
         "stop" => Ok(HookEvent::Stop),
         _ => Err(format!("unknown hook event: {name}")),
     }

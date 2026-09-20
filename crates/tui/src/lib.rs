@@ -58,6 +58,9 @@ pub struct TuiModel {
     pub cost_summary: Option<String>,
     pub context_summary: Option<String>,
     pub mcp: Vec<McpOption>,
+    pub plugins: Vec<ExtensionOption>,
+    pub skills: Vec<ExtensionOption>,
+    pub hooks: Vec<ExtensionOption>,
 }
 
 impl Default for TuiModel {
@@ -100,6 +103,9 @@ impl Default for TuiModel {
             cost_summary: None,
             context_summary: None,
             mcp: Vec::new(),
+            plugins: Vec::new(),
+            skills: Vec::new(),
+            hooks: Vec::new(),
         }
     }
 }
@@ -166,6 +172,14 @@ pub struct McpOption {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionOption {
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OverlayKind {
     Palette,
     Help,
@@ -182,6 +196,9 @@ pub enum OverlayKind {
     Mcp,
     Usage,
     Cost,
+    Plugins,
+    Skills,
+    Hooks,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -620,6 +637,29 @@ impl TuiModel {
                 .collect()
         } else if matches!(
             kind,
+            OverlayKind::Plugins | OverlayKind::Skills | OverlayKind::Hooks
+        ) {
+            let items = match kind {
+                OverlayKind::Plugins => &self.plugins,
+                OverlayKind::Skills => &self.skills,
+                OverlayKind::Hooks => &self.hooks,
+                _ => unreachable!(),
+            };
+            items
+                .iter()
+                .map(|item| PaletteCommand {
+                    name: item.name.clone(),
+                    description: format!(
+                        "{} · {} · source={}",
+                        item.status, item.description, item.source
+                    ),
+                    category: format!("{kind:?}"),
+                    arguments: String::new(),
+                    local: true,
+                })
+                .collect()
+        } else if matches!(
+            kind,
             OverlayKind::Usage | OverlayKind::Cost | OverlayKind::Context
         ) {
             vec![PaletteCommand {
@@ -676,6 +716,9 @@ impl TuiModel {
             OverlayKind::Mcp => "MCP",
             OverlayKind::Usage => "Usage",
             OverlayKind::Cost => "Cost",
+            OverlayKind::Plugins => "Plugins",
+            OverlayKind::Skills => "Skills",
+            OverlayKind::Hooks => "Hooks",
         };
         if overlay.kind == OverlayKind::Permission {
             if let Some(request) = &self.permission_request {
@@ -810,12 +853,21 @@ impl TuiModel {
                     .cloned();
                 if let Some(command) = selected {
                     if overlay.kind == OverlayKind::Palette
-                        && matches!(command.name.as_str(), "model" | "sessions")
+                        && matches!(
+                            command.name.as_str(),
+                            "model" | "sessions" | "plugins" | "skills" | "hooks"
+                        )
                     {
                         let target = if command.name == "model" {
                             OverlayKind::Model
-                        } else {
+                        } else if command.name == "sessions" {
                             OverlayKind::Sessions
+                        } else if command.name == "plugins" {
+                            OverlayKind::Plugins
+                        } else if command.name == "skills" {
+                            OverlayKind::Skills
+                        } else {
+                            OverlayKind::Hooks
                         };
                         self.overlay = None;
                         self.open_overlay(target.clone());
@@ -869,6 +921,9 @@ impl TuiModel {
         self.tools = context.tools;
         self.memory = context.memory;
         self.mcp = context.mcp;
+        self.plugins = context.plugins;
+        self.skills = context.skills;
+        self.hooks = context.hooks;
         self.usage_summary = context.usage_summary;
         self.cost_summary = context.cost_summary;
         self.context_summary = context.context_summary;
@@ -1152,6 +1207,9 @@ pub struct TuiContext {
     pub usage_summary: Option<String>,
     pub cost_summary: Option<String>,
     pub mcp: Vec<McpOption>,
+    pub plugins: Vec<ExtensionOption>,
+    pub skills: Vec<ExtensionOption>,
+    pub hooks: Vec<ExtensionOption>,
     pub context_summary: Option<String>,
 }
 

@@ -17,11 +17,18 @@ pub enum CoreError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleEvent {
     SessionStart,
+    SessionEnd,
+    BeforePrompt,
     PreToolUse,
+    BeforeTool,
     PostToolUse,
+    AfterTool,
     PreEdit,
     PostEdit,
     PreCompact,
+    BeforeCompact,
+    AfterCompact,
+    AgentFinished,
     Stop,
 }
 
@@ -278,6 +285,7 @@ where
         sink.emit(start.clone());
         self.session.events.push(start);
         self.run_hook(LifecycleEvent::SessionStart, sink)?;
+        self.run_hook(LifecycleEvent::BeforePrompt, sink)?;
         let request = ModelRequest {
             messages: self.session.messages.clone(),
             tools: vec![],
@@ -288,6 +296,8 @@ where
         };
         let response = self.provider.complete_streaming(request, &mut forwarder)?;
         self.run_hook(LifecycleEvent::Stop, sink)?;
+        self.run_hook(LifecycleEvent::AgentFinished, sink)?;
+        self.run_hook(LifecycleEvent::SessionEnd, sink)?;
         let completed = Event::TurnCompleted;
         sink.emit(completed.clone());
         self.session.events.push(completed);
@@ -319,6 +329,7 @@ where
         sink.emit(start.clone());
         self.session.events.push(start);
         self.run_hook(LifecycleEvent::SessionStart, sink)?;
+        self.run_hook(LifecycleEvent::BeforePrompt, sink)?;
         let startup_memory = if let (Some(retriever), Some(scope)) =
             (self.memory_retriever.as_ref(), self.memory_scope.as_deref())
         {
@@ -422,6 +433,7 @@ where
                         .collect(),
                 };
                 if self.compactor.is_some() {
+                    self.run_hook(LifecycleEvent::BeforeCompact, sink)?;
                     self.run_hook(LifecycleEvent::PreCompact, sink)?;
                 }
                 if let Some(compactor) = self.compactor.as_mut() {
@@ -446,6 +458,7 @@ where
                             ));
                             sink.emit(event.clone());
                             self.session.events.push(event);
+                            self.run_hook(LifecycleEvent::AfterCompact, sink)?;
                         }
                         Err(error) => {
                             let event = Event::Error(format!("compaction failed safely: {error}"));
@@ -475,12 +488,15 @@ where
             self.session.messages.push(response.message.clone());
             if response.tool_calls.is_empty() {
                 self.run_hook(LifecycleEvent::Stop, sink)?;
+                self.run_hook(LifecycleEvent::AgentFinished, sink)?;
+                self.run_hook(LifecycleEvent::SessionEnd, sink)?;
                 let completed = Event::TurnCompleted;
                 sink.emit(completed.clone());
                 self.session.events.push(completed);
                 return Ok(response.message.content);
             }
             for call in response.tool_calls {
+                self.run_hook(LifecycleEvent::BeforeTool, sink)?;
                 self.run_hook(LifecycleEvent::PreToolUse, sink)?;
                 if call.name == "apply_patch" {
                     self.run_hook(LifecycleEvent::PreEdit, sink)?;
@@ -562,6 +578,7 @@ where
                     content: result.output,
                 });
                 self.run_hook(LifecycleEvent::PostToolUse, sink)?;
+                self.run_hook(LifecycleEvent::AfterTool, sink)?;
                 if call.name == "apply_patch" {
                     self.run_hook(LifecycleEvent::PostEdit, sink)?;
                 }

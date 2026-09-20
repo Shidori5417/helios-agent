@@ -91,7 +91,7 @@ Performance evidence is collected offline with `scripts/run-perf.sh` (release st
 
 The LSP extension is a lazy stdio JSON-RPC boundary configured by `[[lsp_server]]` entries in `.helios/config.toml`. It exposes bounded provider-neutral symbol/definition/reference/diagnostic metadata without always-on indexing; direct argv, workspace-canonical cwd and environment allowlists are enforced.
 
-Phase 4 adds isolated extension boundaries: lazy MCP stdio and streamable-HTTP JSON-RPC clients with bounded responses and permission policies, metadata-first/lazy-body skill discovery, and deterministic plugin manifests with explicit lifecycle and typed hook policies. Plugin execution remains limited to declared hook argv through the shared permission/process boundary; arbitrary in-process plugin code is not enabled.
+Phase 4 adds isolated extension boundaries: lazy MCP stdio and streamable-HTTP JSON-RPC clients with bounded responses and permission policies, metadata-first/lazy-body skill discovery, and deterministic signed plugin manifests with declarative process-backed commands/tools, explicit lifecycle and typed hook policies. Plugin providers/renderers and arbitrary in-process code remain unsupported; all process execution crosses the shared permission/process boundary.
 
 Phase 5 adds isolated subagent scheduling. `subagents run` uses the selected fake or configured provider with bounded iteration/token/tool-call/wall-clock budgets, inherited permission mode, selected context, cancellation, and stable results. `--worktree` creates a manager-owned detached Git worktree from an explicit ref (default `HEAD`), re-roots scopes, and cleans it up unless `--keep-worktree` is requested; results are never auto-applied to the parent tree.
 
