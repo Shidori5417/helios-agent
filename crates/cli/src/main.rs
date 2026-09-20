@@ -253,6 +253,9 @@ fn redact_output(value: &str) -> String {
 struct RuntimeExecutor {
     builtin: ToolRegistry,
     mcp: Vec<McpRuntime>,
+    workspace: PathBuf,
+    config_path: Option<PathBuf>,
+    permission_mode: PermissionMode,
     cancellation: CancellationToken,
     lsp: Vec<LspRuntime>,
     permissions: PermissionEngine,
@@ -267,7 +270,10 @@ struct LspRuntime {
 struct McpRuntime {
     name: String,
     enabled: bool,
+    config: agent_mcp::McpServerConfig,
+    allowed_hosts: Vec<String>,
     advertised: Vec<String>,
+    discovered_tools: Vec<agent_mcp::McpTool>,
     client: McpClient<HostAllowlist<PermissionPolicy>>,
     discovered: bool,
 }
@@ -279,6 +285,7 @@ impl RuntimeExecutor {
         workspace: &std::path::Path,
         cancellation: CancellationToken,
         lsp: Vec<LspServerConfig>,
+        config_path: Option<PathBuf>,
         permission_mode: PermissionMode,
     ) -> Result<Self, String> {
         let mut mcp = Vec::new();
@@ -286,6 +293,7 @@ impl RuntimeExecutor {
             let engine = PermissionEngine::new(workspace, permission_mode)
                 .map_err(|error| error.to_string())?;
             let advertised = server.config.tool_include.clone();
+            let allowed_hosts = server.allowed_hosts.clone();
             let policy = HostAllowlist {
                 inner: PermissionPolicy::new(engine),
                 allowed_hosts: server.allowed_hosts,
@@ -293,8 +301,11 @@ impl RuntimeExecutor {
             mcp.push(McpRuntime {
                 name: server.config.name.clone(),
                 enabled: server.config.enabled,
+                config: server.config.clone(),
+                allowed_hosts,
                 client: McpClient::new(server.config, policy, 64 * 1024),
                 advertised,
+                discovered_tools: Vec::new(),
                 discovered: false,
             });
         }
@@ -311,6 +322,9 @@ impl RuntimeExecutor {
         Ok(Self {
             builtin,
             mcp,
+            workspace: workspace.to_path_buf(),
+            config_path,
+            permission_mode,
             cancellation,
             lsp,
             permissions,
@@ -322,12 +336,22 @@ impl RuntimeExecutor {
     fn definitions(&self) -> Vec<agent_protocol::ToolDefinition> {
         let mut definitions = self.builtin.definitions();
         for server in self.mcp.iter().filter(|server| server.enabled) {
-            for name in &server.advertised {
-                definitions.push(agent_protocol::ToolDefinition {
-                    name: format!("mcp:{}:{name}", server.name),
-                    description: format!("MCP tool {name} from {}", server.name),
-                    input_schema: serde_json::json!({"type":"object"}),
-                });
+            if server.discovered_tools.is_empty() {
+                for name in &server.advertised {
+                    definitions.push(agent_protocol::ToolDefinition {
+                        name: format!("mcp.{}.{}", server.name, name),
+                        description: format!("MCP tool {name} from {}", server.name),
+                        input_schema: serde_json::json!({"type":"object"}),
+                    });
+                }
+            } else {
+                for tool in &server.discovered_tools {
+                    definitions.push(agent_protocol::ToolDefinition {
+                        name: format!("mcp.{}.{}", server.name, tool.name),
+                        description: tool.description.clone(),
+                        input_schema: tool.input_schema.clone(),
+                    });
+                }
             }
         }
         for server in self.lsp.iter().filter(|server| server.config.enabled) {
@@ -346,29 +370,29 @@ impl RuntimeExecutor {
         if call.name.starts_with("lsp:") {
             return self.execute_lsp(call);
         }
-        let Some(rest) = call.name.strip_prefix("mcp:") else {
+        let (server_name, tool_name) = if let Some(rest) = call.name.strip_prefix("mcp.") {
+            rest.split_once('.')
+                .ok_or_else(|| "invalid MCP tool name".to_owned())?
+        } else if let Some(rest) = call.name.strip_prefix("mcp:") {
+            rest.split_once(':')
+                .ok_or_else(|| "invalid MCP tool name".to_owned())?
+        } else {
             return <ToolRegistry as ToolExecutor>::execute(&mut self.builtin, call);
         };
-        let (server_name, tool_name) = rest
-            .split_once(':')
-            .ok_or_else(|| "invalid MCP tool name".to_owned())?;
+        let needs_discovery = !self
+            .mcp
+            .iter()
+            .find(|server| server.name == server_name)
+            .ok_or_else(|| "MCP server is not configured".to_owned())?
+            .discovered;
+        if needs_discovery {
+            self.reload_mcp(server_name)?;
+        }
         let server = self
             .mcp
             .iter_mut()
             .find(|server| server.name == server_name)
             .ok_or_else(|| "MCP server is not configured".to_owned())?;
-        if !server.discovered {
-            server
-                .client
-                .initialize(&self.cancellation)
-                .map_err(|error| error.to_string())?;
-            let discovered = server
-                .client
-                .discover_tools(&self.cancellation)
-                .map_err(|error| error.to_string())?;
-            server.advertised = discovered.iter().map(|tool| tool.name.clone()).collect();
-            server.discovered = true;
-        }
         let output = server
             .client
             .call_tool(tool_name, call.arguments.clone(), &self.cancellation)
@@ -377,6 +401,54 @@ impl RuntimeExecutor {
             status: "ok".into(),
             output: output.to_string(),
         })
+    }
+
+    fn reload_mcp(&mut self, id: &str) -> Result<Vec<String>, String> {
+        let replacement = self
+            .config_path
+            .as_deref()
+            .map(|path| load_mcp_config(path, &self.workspace))
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .and_then(|servers| servers.into_iter().find(|server| server.config.name == id));
+        let server = self
+            .mcp
+            .iter_mut()
+            .find(|server| server.name == id)
+            .ok_or_else(|| "MCP server is not configured".to_owned())?;
+        if let Some(replacement) = replacement {
+            server.name = replacement.config.name.clone();
+            server.enabled = replacement.config.enabled;
+            server.config = replacement.config;
+            server.allowed_hosts = replacement.allowed_hosts;
+        }
+        let policy = HostAllowlist {
+            inner: PermissionPolicy::new(
+                PermissionEngine::new(&self.workspace, self.permission_mode)
+                    .map_err(|error| error.to_string())?,
+            ),
+            allowed_hosts: server.allowed_hosts.clone(),
+        };
+        server.client = McpClient::new(server.config.clone(), policy, 64 * 1024);
+        server.discovered = false;
+        server.advertised.clear();
+        server.discovered_tools.clear();
+        if !server.enabled {
+            return Err("MCP server is disabled".into());
+        }
+        server
+            .client
+            .initialize(&self.cancellation)
+            .map_err(|error| error.to_string())?;
+        let tools = server
+            .client
+            .discover_tools(&self.cancellation)
+            .map_err(|error| error.to_string())?;
+        let names = tools.iter().map(|tool| tool.name.clone()).collect();
+        server.advertised = tools.iter().map(|tool| tool.name.clone()).collect();
+        server.discovered_tools = tools;
+        server.discovered = true;
+        Ok(names)
     }
 }
 
@@ -3307,7 +3379,15 @@ fn mcp_interactive_command(command: &str, workspace: &Path, config_path: &Path) 
             .collect::<Vec<_>>()
             .join("\n");
     }
-    if matches!(action, "list" | "reload") {
+    if action == "reload" {
+        let Some(id) = parts.get(1) else {
+            return "/mcp reload requires server id".into();
+        };
+        return mcp_discover_server(id, workspace, config_path)
+            .map(|result| format!("{result} reloaded"))
+            .unwrap_or_else(|error| format!("mcp reload error: {error}"));
+    }
+    if action == "list" {
         return servers
             .into_iter()
             .map(|server| {
@@ -3731,6 +3811,7 @@ fn run_command_with_cancellation(
         &workspace,
         cancellation.clone(),
         lsp_servers,
+        config_path.clone(),
         permission_mode,
     )?;
     let hooks = load_runtime_hooks(
@@ -6643,11 +6724,16 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
         if action == "test" {
             return configured_server_test(section, &args, &path);
         }
-        if section == "mcp" && matches!(action, "warm" | "discover") {
+        if section == "mcp" && matches!(action, "warm" | "discover" | "reload") {
             let id = value_after(&args[1..], "--id")?
                 .or_else(|| args.get(1).cloned())
-                .ok_or("mcp warm requires exact --id")?;
-            return println_result(mcp_discover_server(&id, &workspace_root()?, &path));
+                .ok_or("mcp reload/warm requires exact --id")?;
+            let result = mcp_discover_server(&id, &workspace_root()?, &path)?;
+            return println_result(if action == "reload" {
+                Ok(format!("{result} reloaded"))
+            } else {
+                Ok(result)
+            });
         }
         if section == "mcp" && action == "auth" {
             return mcp_auth_command(&path);
@@ -7505,6 +7591,7 @@ fn execute_subagent_provider<P: ModelProvider>(
         &root,
         terminal_cancel,
         Vec::new(),
+        None,
         task.permission_mode,
     ) {
         Ok(tools) => tools,
@@ -8494,6 +8581,49 @@ mod tests {
         let loaded = load_mcp_config(&path, &root).expect("loader");
         assert_eq!(loaded[0].config.args, vec!["ready"]);
         assert_eq!(value["lsp_server"][0]["name"].as_str(), Some("rust"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_catalog_uses_qualified_names_and_excludes_disabled_servers() {
+        let root = std::env::temp_dir().join(format!("helios-mcp-catalog-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let builtin = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("tools");
+        let make_server = |name: &str, enabled: bool| agent_mcp::LoadedMcpServer {
+            config: agent_mcp::McpServerConfig {
+                name: name.into(),
+                command: "mock".into(),
+                args: Vec::new(),
+                cwd: None,
+                env_allowlist: Vec::new(),
+                enabled,
+                tool_include: vec!["echo".into()],
+                tool_exclude: Vec::new(),
+                startup_timeout: std::time::Duration::from_millis(100),
+                tool_timeout: std::time::Duration::from_millis(100),
+                permission_class: agent_sandbox::PermissionClass::ReadOnly,
+                transport: agent_mcp::McpTransport::Stdio,
+            },
+            allowed_hosts: Vec::new(),
+        };
+        let executor = RuntimeExecutor::new(
+            builtin,
+            vec![make_server("local", true), make_server("off", false)],
+            &root,
+            CancellationToken::default(),
+            Vec::new(),
+            None,
+            PermissionMode::ReadOnly,
+        )
+        .expect("runtime");
+        let names = executor
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"mcp.local.echo".into()));
+        assert!(!names.contains(&"mcp.off.echo".into()));
         let _ = fs::remove_dir_all(root);
     }
 

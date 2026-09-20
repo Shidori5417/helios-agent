@@ -545,8 +545,9 @@ impl<P: McpPolicy> McpClient<P> {
 
 impl<P> Drop for McpClient<P> {
     fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
