@@ -358,6 +358,18 @@ mod tests {
     }
 
     #[test]
+    fn settings_control_scroll_step_and_bounds() {
+        let mut model = TuiModel {
+            scroll_step: 3,
+            ..TuiModel::default()
+        };
+        model.reduce_input(&InputEvent::ScrollDown);
+        assert_eq!(model.scroll, 3);
+        assert_eq!(TuiSettings::default().tick_ms, 50);
+        assert_eq!(TuiSettings::default().channel_capacity, 128);
+    }
+
+    #[test]
     fn headless_disconnected_channel_exits_without_busy_wait() {
         let (sender, receiver) = bounded_event_channel(1);
         drop(sender);

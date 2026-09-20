@@ -559,8 +559,12 @@ enum EvalCommand {
 enum PerfCommand {
     Run {
         runs: usize,
+        suite: Option<PathBuf>,
+        fixtures: Option<PathBuf>,
         output: Option<PathBuf>,
         baseline: Option<PathBuf>,
+        max_cold_start_ms: Option<u128>,
+        max_peak_rss_bytes: Option<u64>,
         max_regressions: usize,
     },
     Show(PathBuf),
@@ -1083,8 +1087,22 @@ fn parse_perf_command(args: &[String]) -> Result<Command, String> {
             runs: value_after(&args[1..], "--runs")?
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
+            suite: value_after(&args[1..], "--suite")?.map(|value| {
+                if value == "smoke" {
+                    PathBuf::from("crates/evals/fixtures/tasks.json")
+                } else if value == "benchmark-100" {
+                    PathBuf::from("crates/evals/fixtures/benchmark-100.json")
+                } else {
+                    PathBuf::from(value)
+                }
+            }),
+            fixtures: value_after(&args[1..], "--fixtures")?.map(PathBuf::from),
             output: value_after(&args[1..], "--output")?.map(PathBuf::from),
             baseline: value_after(&args[1..], "--baseline")?.map(PathBuf::from),
+            max_cold_start_ms: value_after(&args[1..], "--max-cold-start-ms")?
+                .and_then(|v| v.parse().ok()),
+            max_peak_rss_bytes: value_after(&args[1..], "--max-peak-rss-bytes")?
+                .and_then(|v| v.parse().ok()),
             max_regressions: value_after(&args[1..], "--max-regressions")?
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -2584,52 +2602,93 @@ fn perf_command(command: PerfCommand) -> Result<(), String> {
     match command {
         PerfCommand::Run {
             runs,
+            suite,
+            fixtures,
             output,
             baseline,
+            max_cold_start_ms,
+            max_peak_rss_bytes,
             max_regressions,
         } => {
             let binary = env::current_exe().map_err(|error| error.to_string())?;
-            let report =
-                agent_perf::run_report(&binary, runs).map_err(|error| error.to_string())?;
+            let report = agent_perf::run_full_report(
+                &binary,
+                runs,
+                suite.as_deref(),
+                fixtures.as_deref(),
+                max_cold_start_ms,
+                max_peak_rss_bytes,
+            )
+            .map_err(|error| error.to_string())?;
             let path = report_path(&workspace, "perf", output)?;
             atomic_write(
                 &path,
                 &serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?,
             )?;
             if let Some(baseline) = baseline {
-                let old: agent_perf::PerfReport =
+                let old: agent_perf::FullPerfReport =
                     serde_json::from_slice(&fs::read(baseline).map_err(|error| error.to_string())?)
                         .map_err(|error| error.to_string())?;
-                agent_perf::compare(&report, &old, max_regressions)
-                    .map_err(|error| error.to_string())?;
+                let regressions = usize::from(report.startup.p95_ms > old.startup.p95_ms)
+                    + usize::from(
+                        report
+                            .short_session
+                            .peak_rss_bytes
+                            .zip(old.short_session.peak_rss_bytes)
+                            .is_some_and(|(now, previous)| now > previous),
+                    );
+                if regressions > max_regressions {
+                    return Err(format!(
+                        "{regressions} performance regressions exceed {max_regressions}"
+                    ));
+                }
             }
             println!(
-                "runs={} p50_ms={} p95_ms={} report={}",
-                report.runs,
-                report.p50_ms,
-                report.p95_ms,
+                "runs={} p50_ms={} p95_ms={} peak_rss_bytes={:?} benchmark_tasks={:?} report={}",
+                report.startup.runs,
+                report.startup.p50_ms,
+                report.startup.p95_ms,
+                report.short_session.peak_rss_bytes,
+                report
+                    .benchmark
+                    .as_ref()
+                    .map(|benchmark| benchmark.task_count),
                 path.display()
             );
             Ok(())
         }
         PerfCommand::Show(path) => {
-            let report: agent_perf::PerfReport =
-                serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
-                    .map_err(|error| error.to_string())?;
+            let bytes = fs::read(path).map_err(|error| error.to_string())?;
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+                serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?
             );
             Ok(())
         }
         PerfCommand::Compare { current, baseline } => {
-            let current: agent_perf::PerfReport =
+            let current: serde_json::Value =
                 serde_json::from_slice(&fs::read(current).map_err(|error| error.to_string())?)
                     .map_err(|error| error.to_string())?;
-            let baseline: agent_perf::PerfReport =
+            let baseline: serde_json::Value =
                 serde_json::from_slice(&fs::read(baseline).map_err(|error| error.to_string())?)
                     .map_err(|error| error.to_string())?;
-            agent_perf::compare(&current, &baseline, 0).map_err(|error| error.to_string())?;
+            let current_p95 = current
+                .pointer("/startup/p95_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| current.get("p95_ms").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            let baseline_p95 = baseline
+                .pointer("/startup/p95_ms")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| baseline.get("p95_ms").and_then(serde_json::Value::as_u64))
+                .unwrap_or(0);
+            if current_p95 > baseline_p95 {
+                return Err(format!(
+                    "p95 {current_p95}ms exceeds baseline {baseline_p95}ms"
+                ));
+            }
             println!("performance baseline passed");
             Ok(())
         }
@@ -3817,19 +3876,92 @@ fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
     if let RuntimeCommand::Status(args) = &command {
         let workspace = workspace_root()?;
         let config = config_path()?;
+        let document = load_user_config(&config).ok();
+        let config_value = config
+            .exists()
+            .then(|| fs::read_to_string(&config).ok())
+            .flatten()
+            .and_then(|text| toml::from_str::<toml::Value>(&text).ok());
+        let db_path = workspace.join(".agent/state.db");
+        let sessions = if db_path.is_file() {
+            agent_storage::Database::open(&db_path)
+                .ok()
+                .and_then(|db| db.list_sessions(&workspace.display().to_string()).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let count_dirs = |path: &Path| {
+            fs::read_dir(path)
+                .map(|entries| entries.filter_map(Result::ok).count())
+                .unwrap_or(0)
+        };
+        let mcp_count = config_value
+            .as_ref()
+            .and_then(|value| value.get("mcp_server"))
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len);
+        let lsp_count = config_value
+            .as_ref()
+            .and_then(|value| value.get("lsp_server"))
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len);
+        let enabled_plugins = config_value
+            .as_ref()
+            .and_then(|value| value.get("plugins"))
+            .and_then(|value| value.get("enabled"))
+            .and_then(toml::Value::as_array)
+            .map_or(0, Vec::len);
+        let provider = document.as_ref().and_then(|value| value.provider.clone());
+        let provider_env = provider
+            .as_deref()
+            .and_then(|name| match name {
+                "openai" => Some("OPENAI_API_KEY"),
+                "anthropic" => Some("ANTHROPIC_API_KEY"),
+                "gemini" => Some("GEMINI_API_KEY"),
+                "generic" => Some("OPENAI_API_KEY"),
+                _ => None,
+            })
+            .map(|name| std::env::var_os(name).is_some())
+            .unwrap_or(false);
+        let reports = workspace.join(".agent/reports");
+        let latest_report = fs::read_dir(&reports)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_file())
+                    .max_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok())
+            })
+            .map(|entry| entry.path().display().to_string());
         let payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "workspace": workspace.display().to_string(),
             "config": config.display().to_string(),
             "config_valid": load_user_config(&config).is_ok(),
             "db_present": workspace.join(".agent/state.db").is_file(),
-            "provider_default": load_user_config(&config).ok().and_then(|value| value.provider),
+            "provider_default": provider,
+            "provider_model": config_value.as_ref().and_then(|value| value.get("model")).and_then(toml::Value::as_str),
+            "auth_source": if provider_env { "env" } else { "absent" },
+            "permissions": config_value.as_ref().and_then(|value| value.get("permissions")).and_then(|value| value.get("mode")).and_then(toml::Value::as_str).unwrap_or("read-only"),
+            "network_hosts": config_value.as_ref().and_then(|value| value.get("permissions")).and_then(|value| value.get("allowed_network_hosts")).and_then(toml::Value::as_array).map_or(0, Vec::len),
             "secret_values_included": false,
+            "sessions": {"active": sessions.iter().filter(|session| !session.archived && session.deleted_at.is_none()).count(), "archived": sessions.iter().filter(|session| session.archived).count(), "total": sessions.len()},
+            "jobs": {"entries": count_dirs(&workspace.join(".agent/jobs"))},
+            "mcp": {"configured": mcp_count, "enabled": mcp_count},
+            "lsp": {"configured": lsp_count, "enabled": lsp_count},
+            "plugins": {"installed": count_dirs(&workspace.join(".agent/plugins")), "enabled": enabled_plugins},
+            "skills": {"workspace": count_dirs(&workspace.join("skills")) + count_dirs(&workspace.join(".agent/skills"))},
+            "trust": {"store_present": workspace.join(".agent/trust-store.json").is_file(), "registry_state_present": workspace.join(".agent/registry-state.json").is_file()},
+            "latest_report": latest_report,
         });
         if args.iter().any(|arg| arg == "--json") {
             println!("{}", payload);
         } else {
-            println!("workspace={}\nconfig={}\nconfig_valid={}\ndb_present={}\nprovider_default={}\nsecret_values_included=false", payload["workspace"], payload["config"], payload["config_valid"], payload["db_present"], payload["provider_default"].as_str().unwrap_or("unset"));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&payload).map_err(|error| error.to_string())?
+            );
         }
         return Ok(());
     }

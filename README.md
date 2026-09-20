@@ -77,7 +77,7 @@ Performance evidence is collected offline with `scripts/run-perf.sh` (release st
 
 The LSP extension is a lazy stdio JSON-RPC boundary configured by `[[lsp_server]]` entries in `.agent/config.toml`. It exposes bounded provider-neutral symbol/definition/reference/diagnostic metadata without always-on indexing; direct argv, workspace-canonical cwd and environment allowlists are enforced.
 
-Phase 4 adds isolated extension boundaries: lazy MCP stdio JSON-RPC clients with bounded responses and permission policies, metadata-first/lazy-body skill discovery, and deterministic plugin manifests with explicit lifecycle and typed hook policies. Plugin code execution is intentionally not enabled yet.
+Phase 4 adds isolated extension boundaries: lazy MCP stdio and streamable-HTTP JSON-RPC clients with bounded responses and permission policies, metadata-first/lazy-body skill discovery, and deterministic plugin manifests with explicit lifecycle and typed hook policies. Plugin execution remains limited to declared hook argv through the shared permission/process boundary; arbitrary in-process plugin code is not enabled.
 
 Phase 5 adds deterministic isolated subagent scheduling. `TaskSpec` accepts only a selected context-plan subset, explicit workspace scopes, inherited permission mode, and hard iteration/token/tool-call/wall-clock budgets. The scheduler propagates cancellation, caps concurrency, serializes overlapping scopes, and returns results in stable task order; it does not spawn arbitrary model processes or mutate Git worktrees.
 
