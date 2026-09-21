@@ -9,7 +9,11 @@
   },
   {
     "path": "README.md",
-    "bytes": 18493
+    "bytes": 18703
+  },
+  {
+    "path": "CHANGELOG.md",
+    "bytes": 542
   },
   {
     "path": ".gitignore",
@@ -301,23 +305,31 @@
   },
   {
     "path": "LICENSE",
-    "bytes": 1079
+    "bytes": 1082
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 1230
+    "bytes": 1243
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 2899
+    "bytes": 2925
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 1808
+    "bytes": 1821
   },
   {
     "path": "docs/INSTALL.md",
-    "bytes": 3396
+    "bytes": 3645
+  },
+  {
+    "path": "docs/SUPPORT.md",
+    "bytes": 594
+  },
+  {
+    "path": "docs/helios.1",
+    "bytes": 731
   },
   {
     "path": "examples/plugins/sample/plugin.json",
@@ -325,7 +337,7 @@
   },
   {
     "path": "packaging/arch/PKGBUILD",
-    "bytes": 745
+    "bytes": 1188
   },
   {
     "path": "scripts/check-completions.sh",

@@ -56,9 +56,13 @@ reproducible. No signing key or repository secret is used.
 
 ## Arch package
 
-Copy `packaging/arch/PKGBUILD` to a clean build directory, replace its release URL and
-`REPLACE_WITH_RELEASE_SHA256` value, then run `makepkg -si`. The template never pipes
-network content into a shell and uses Cargo's locked dependency set.
+Copy `packaging/arch/PKGBUILD` to a clean build directory and run `makepkg -si`.
+The current private-repository package uses a Git source with Arch's explicit
+`SKIP` VCS checksum convention; configure Git credentials before building. For
+a future tagged archive, replace the source with the downloaded release tarball
+and record its independently verified SHA-256 before distributing the package.
+The template never pipes network content into a shell and uses Cargo's locked
+dependency set.
 
 ## Shell completion
 

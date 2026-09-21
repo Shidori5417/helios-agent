@@ -1,0 +1,30 @@
+.TH HELIOS 1 "2026-09-21" "Helios Agent 0.1.0" "User Commands"
+.SH NAME
+helios \- bounded provider-neutral coding agent
+.SH SYNOPSIS
+.B helios
+[OPTIONS] [PROMPT]
+.br
+.B helios exec
+[OPTIONS] PROMPT
+.SH DESCRIPTION
+Bare
+.B helios
+opens the interactive TTY session. Use
+.B exec
+for non-interactive automation. Provider credentials are resolved from the
+OS keyring or the provider-specific environment fallback; values are never
+printed.
+.SH OPTIONS
+.TP
+.B --workspace PATH
+Use the canonical workspace PATH.
+.TP
+.B --provider NAME
+Select fake, OpenAI, Anthropic, Gemini, or a generic OpenAI-compatible provider.
+.TP
+.B --output-format FORMAT
+For exec, select text, json, or stream-json.
+.SH SEE ALSO
+.BR helios (1),
+.BR agent-cli (1)

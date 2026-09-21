@@ -1,4 +1,3 @@
-# Maintainer template: replace pkgver and sha256sums after publishing a release.
 pkgname=helios-agent
 pkgver=0.1.0
 pkgrel=1
@@ -6,19 +5,25 @@ pkgdesc='Bounded, provider-neutral Helios coding agent'
 arch=('x86_64')
 url='https://github.com/Shidori5417/helios-agent'
 license=('MIT')
-depends=()
-source=("helios-agent-${pkgver}.tar.gz::https://github.com/Shidori5417/helios-agent/archive/v${pkgver}.tar.gz")
-# Generate with: sha256sum helios-agent-${pkgver}.tar.gz
-sha256sums=('REPLACE_WITH_RELEASE_SHA256')
+provides=('agent-cli')
+makedepends=('cargo' 'git')
+source=('helios-agent::git+https://github.com/Shidori5417/helios-agent.git#branch=main')
+# VCS sources are content-addressed by git. For a tagged archive release,
+# replace this source with the release tarball and a verified SHA-256.
+sha256sums=('SKIP')
 
 build() {
-  cd "${srcdir}/helios-agent-${pkgver}"
-  cargo build --release --locked --offline
+  cd "${srcdir}/helios-agent"
+  cargo build --release --locked
 }
 
 package() {
-  cd "${srcdir}/helios-agent-${pkgver}"
+  cd "${srcdir}/helios-agent"
   install -Dm755 target/release/helios "${pkgdir}/usr/bin/helios"
   install -Dm755 target/release/agent-cli "${pkgdir}/usr/bin/agent-cli"
   install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 docs/helios.1 "${pkgdir}/usr/share/man/man1/helios.1"
+  install -Dm644 completions/agent-cli.bash "${pkgdir}/usr/share/bash-completion/completions/helios"
+  install -Dm644 completions/agent-cli.zsh "${pkgdir}/usr/share/zsh/site-functions/_helios"
+  install -Dm644 completions/agent-cli.fish "${pkgdir}/usr/share/fish/vendor_completions.d/helios.fish"
 }

@@ -53,6 +53,7 @@ Read in this order:
 The workspace now includes a bounded coding loop with fake, OpenAI Responses, Anthropic Messages, Gemini, and generic OpenAI-compatible provider selection, permission-checked native tools, exact-preimage patches, safe direct-argv verification, bounded terminal output with spill files, Unix process-group cleanup, bounded background jobs, and read-only git diff display. Direct argv execution is the default; PTY allocation is explicit (`requires_pty`) and is never inferred from a command string.
 
 ```bash
+cargo install --path crates/cli --locked  # installs both helios and legacy agent-cli
 cargo run -p agent-cli --bin helios -- "inspect this repository"
 cargo run -p agent-cli --bin helios -- --provider openai --model gpt-5 "fix the failing test"
 ```
@@ -95,7 +96,7 @@ Phase 4 adds isolated extension boundaries: lazy MCP stdio and streamable-HTTP J
 
 Phase 5 adds isolated subagent scheduling. `subagents run` uses the selected fake or configured provider with bounded iteration/token/tool-call/wall-clock budgets, inherited permission mode, selected context, cancellation, and stable results. `--worktree` creates a manager-owned detached Git worktree from an explicit ref (default `HEAD`), re-roots scopes, and cleans it up unless `--keep-worktree` is requested; results are never auto-applied to the parent tree.
 
-Phase 6 adds Linux distribution scaffolding: a checksum-explicit Arch `PKGBUILD`, measured Cargo release profile, Bash/Zsh/Fish completions, Linux CI, an x86_64 artifact/SHA256 release workflow, SPDX JSON SBOM generation, keyless Sigstore signing/self-verification, installation/uninstallation guidance, and a validated example plugin manifest. No release is published by this repository; action commit pinning remains documented supply-chain debt.
+Phase 6 adds Linux distribution scaffolding: a Git-source Arch `PKGBUILD` for the private checkout, measured Cargo release profile, Bash/Zsh/Fish completions, Linux CI, an x86_64 artifact/SHA256 release workflow, SPDX JSON SBOM generation, keyless Sigstore signing/self-verification, installation/uninstallation guidance, and a validated example plugin manifest. No release is published by this repository; action commit pinning remains documented supply-chain debt. See `CHANGELOG.md`, `docs/INSTALL.md`, and `docs/SUPPORT.md` for the current private-repository boundary.
 
 The V1 eval boundary has a fast deterministic offline smoke suite (inspect/no-change, exact patch plus argv validation, and unsafe path refusal):
 
