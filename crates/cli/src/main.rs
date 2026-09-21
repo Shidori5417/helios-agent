@@ -56,6 +56,7 @@ thread_local! {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    install_broken_pipe_hook();
     let program_name = env::args()
         .next()
         .and_then(|path| {
@@ -222,6 +223,22 @@ async fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn install_broken_pipe_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let message = panic
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or_default();
+        if message.contains("failed printing to stdout") && message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(panic);
+    }));
 }
 fn fail(error: String) -> ExitCode {
     eprintln!("helios error: {error}");
