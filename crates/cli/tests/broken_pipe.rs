@@ -41,9 +41,13 @@ fn stream_exec_pipe_closure_is_clean() {
     ));
     std::fs::create_dir(&workspace).expect("create workspace");
     let workspace_arg = workspace.to_string_lossy().into_owned();
+    let db_path = workspace.join("sessions.db");
+    let db_path_arg = db_path.to_string_lossy().into_owned();
     let args = [
         "--workspace",
         workspace_arg.as_str(),
+        "--db-path",
+        db_path_arg.as_str(),
         "exec",
         "--provider",
         "fake",

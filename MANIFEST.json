@@ -173,7 +173,7 @@
   },
   {
     "path": "crates/cli/tests/broken_pipe.rs",
-    "bytes": 1771
+    "bytes": 1933
   },
   {
     "path": "crates/context/Cargo.toml",
