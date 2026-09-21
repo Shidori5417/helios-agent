@@ -113,6 +113,7 @@ version = "0.1.0"
 dependencies = [
  "agent-evals",
  "agent-storage",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

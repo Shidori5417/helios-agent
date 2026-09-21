@@ -1383,6 +1383,11 @@ mod tests {
         assert_eq!(summaries[0].id, session);
         assert_eq!(summaries[0].turn_count, 1);
         assert_eq!(summaries[0].git_branch.as_deref(), Some("main"));
+        let page = db
+            .list_session_summaries_page("/workspace", 1, 0)
+            .expect("bounded page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, session);
     }
 
     #[test]

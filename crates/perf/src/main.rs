@@ -309,7 +309,11 @@ fn measure_pty(binary: &Path) -> (Option<u128>, Option<u64>, Option<u64>) {
         let rss = pid.and_then(proc_rss);
         let after = pid.and_then(proc_cpu_ticks);
         let cpu = match (before, after) {
-            (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+            (Some(before), Some(after)) => {
+                let ticks = after.saturating_sub(before);
+                let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+                (hz > 0).then(|| ticks.saturating_mul(100) / (hz as u64 * 2))
+            }
             _ => None,
         };
         let _ = writer.write_all(b"/exit\n");
