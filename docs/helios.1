@@ -28,3 +28,10 @@ For exec, select text, json, or stream-json.
 .SH SEE ALSO
 .BR helios (1),
 .BR agent-cli (1)
+.SH LOCAL COMMANDS
+.B helios resume
+opens a workspace-scoped resumed TTY session.  
+.B helios models --json
+lists local provider capability metadata without network access.  
+.B helios review security|performance|tests --json
+reads the current bounded worktree diff and emits a read-only review envelope.

@@ -84,6 +84,18 @@ async fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
         },
+        Ok(Command::Resume(selector)) => match interactive_command_with_resume(selector) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Models { json }) => match models_command(json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+        Ok(Command::Review { focus, json }) => match review_command(focus, json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
         Ok(Command::ContextHelp(path)) => {
             print_command_help(&path);
             ExitCode::SUCCESS
@@ -697,6 +709,14 @@ enum Command {
     Help,
     Interactive,
     ContextHelp(Vec<String>),
+    Resume(Option<String>),
+    Models {
+        json: bool,
+    },
+    Review {
+        focus: Option<String>,
+        json: bool,
+    },
     Run(RunOptions),
     Sessions {
         command: SessionCommand,
@@ -950,6 +970,42 @@ fn command_registry() -> Vec<CommandDefinition> {
             requires_agent: true,
             local: false,
             handler_id: "exec",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "resume",
+            aliases: &[],
+            description: "resume a workspace session in the interactive TTY",
+            category: "sessions",
+            arguments: "[latest|ID|TITLE]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "resume",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "models",
+            aliases: &[],
+            description: "list local provider/model metadata",
+            category: "model",
+            arguments: "[--json]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "models",
+            source: "builtin",
+        },
+        CommandDefinition {
+            name: "review",
+            aliases: &[],
+            description: "run a bounded read-only current-diff review",
+            category: "diagnostics",
+            arguments: "[security|performance|tests] [--json]",
+            destructive: false,
+            requires_agent: false,
+            local: true,
+            handler_id: "review",
             source: "builtin",
         },
         CommandDefinition {
@@ -1606,6 +1662,12 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         .skip(1)
         .any(|arg| arg == "--help" || arg == "-h")
     {
+        let known = command_registry().iter().any(|definition| {
+            definition.name == args[0] || definition.aliases.iter().any(|alias| *alias == args[0])
+        });
+        if !known {
+            return Err(format!("unknown command: {}", args[0]));
+        }
         let path = args
             .iter()
             .take_while(|arg| *arg != "--help" && *arg != "-h")
@@ -1615,6 +1677,14 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
     }
     match args[0].as_str() {
         "--help" | "-h" | "help" => Ok(Command::Help),
+        "resume" => Ok(Command::Resume(args.get(1).cloned())),
+        "models" => Ok(Command::Models {
+            json: args.iter().any(|arg| arg == "--json"),
+        }),
+        "review" => Ok(Command::Review {
+            focus: args.get(1).filter(|value| !value.starts_with('-')).cloned(),
+            json: args.iter().any(|arg| arg == "--json"),
+        }),
         "sessions" => parse_sessions_command(&args[1..]),
         "database" => parse_database_command(&args[1..]),
         "audit" => parse_audit_command(&args[1..]),
@@ -2380,7 +2450,76 @@ fn default_db_path() -> Result<PathBuf, String> {
     Ok(app_paths()?.db_path)
 }
 
+fn models_command(json: bool) -> Result<(), String> {
+    let paths = app_paths()?;
+    let config = load_user_config(paths.effective_project_config()).unwrap_or_default();
+    let known = ["fake", "openai", "anthropic", "gemini", "generic"];
+    let models = known
+        .iter()
+        .map(|provider| {
+            serde_json::json!({
+                "provider": provider,
+                "configured": config.provider.as_deref() == Some(*provider),
+                "model": if config.provider.as_deref() == Some(*provider) { config.model.clone() } else { None::<String> },
+                "capabilities": provider_capability_summary(provider),
+            })
+        })
+        .collect::<Vec<_>>();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&models).map_err(|error| error.to_string())?
+        );
+    } else {
+        for model in models {
+            println!(
+                "{} configured={} model={} {}",
+                model["provider"].as_str().unwrap_or("unknown"),
+                model["configured"],
+                model["model"].as_str().unwrap_or("(built-in/default)"),
+                model["capabilities"].as_str().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn review_command(focus: Option<String>, json: bool) -> Result<(), String> {
+    let focus = focus.unwrap_or_else(|| "general".into());
+    if !matches!(
+        focus.as_str(),
+        "general" | "security" | "performance" | "tests"
+    ) {
+        return Err("review focus must be security, performance, or tests".into());
+    }
+    let paths = app_paths()?;
+    let registry = ToolRegistry::new(&paths.workspace, PermissionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    let diff = registry
+        .git_diff_variant("worktree")
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "focus": focus,
+                "read_only": true,
+                "status": format!("{:?}", diff.status),
+                "summary": diff.summary,
+                "diff": diff.data,
+            })
+        );
+    } else {
+        println!("review focus={focus} (read-only)\n{}", diff.data);
+    }
+    Ok(())
+}
+
 fn interactive_command() -> Result<(), String> {
+    interactive_command_with_resume(None)
+}
+
+fn interactive_command_with_resume(selector: Option<String>) -> Result<(), String> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(
             "interactive mode requires a TTY; use `helios exec` for headless operation".into(),
@@ -2403,6 +2542,49 @@ fn interactive_command() -> Result<(), String> {
     let session_provider = Arc::new(Mutex::new(None::<String>));
     let session_effort = Arc::new(Mutex::new(None::<String>));
     let active_session = Arc::new(Mutex::new(None::<i64>));
+    let db_path = paths.db_path.clone();
+    if let Some(selector) = selector {
+        let workspace_id = paths.workspace.display().to_string();
+        let db = Database::open(&db_path).map_err(|error| error.to_string())?;
+        let summaries = db
+            .list_session_summaries(&workspace_id)
+            .map_err(|error| error.to_string())?;
+        let selected = if selector.eq_ignore_ascii_case("latest") {
+            summaries.into_iter().next()
+        } else if let Ok(id) = selector.parse::<i64>() {
+            summaries.into_iter().find(|summary| summary.id == id)
+        } else {
+            let matches = summaries
+                .into_iter()
+                .filter(|summary| {
+                    summary
+                        .title
+                        .as_deref()
+                        .unwrap_or(&summary.objective)
+                        .eq_ignore_ascii_case(&selector)
+                })
+                .collect::<Vec<_>>();
+            if matches.len() == 1 {
+                matches.into_iter().next()
+            } else {
+                None
+            }
+        }
+        .ok_or("session not found or title is ambiguous in this workspace")?;
+        *active_session
+            .lock()
+            .map_err(|_| "session state unavailable")? = Some(selected.id);
+        first_turn.store(false, Ordering::Release);
+        *session_provider
+            .lock()
+            .map_err(|_| "session state unavailable")? = selected.provider;
+        *session_model
+            .lock()
+            .map_err(|_| "session state unavailable")? = selected.model;
+        *session_effort
+            .lock()
+            .map_err(|_| "session state unavailable")? = selected.effort;
+    }
     let steering = SteeringChannel::bounded(8, 8 * 1024);
     let controller = ForegroundTaskController::default();
     let project_config_path = paths.effective_project_config().to_path_buf();
@@ -7139,6 +7321,9 @@ fn print_command_help(path: &[String]) {
     let (usage, body) = match key.as_str() {
         "run" => ("helios run [OPTIONS] PROMPT".into(), "Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config."),
         "exec" => ("helios exec [OPTIONS] PROMPT".into(), "Headless execution; --output-format is text, json, or stream-json. No TUI or alternate screen is initialized."),
+        "resume" => ("helios resume [latest|ID|TITLE]".into(), "Resumes an exact workspace-scoped session in the interactive TTY; no selector opens the session browser."),
+        "models" => ("helios models [--json]".into(), "Lists only local configured/known provider metadata; it never calls a provider or network."),
+        "review" => ("helios review [security|performance|tests] [--json]".into(), "Produces a bounded read-only review of the current worktree diff."),
         "auth" => ("helios auth status|login|logout PROVIDER [--token-stdin]".into(), "login uses hidden TTY input or explicit non-TTY --token-stdin; token values are never arguments or output."),
         "auth login" => ("helios auth login PROVIDER [--token-stdin]".into(), "Stores the token in the OS keyring; plaintext fallback is refused."),
         "self" => ("helios self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
@@ -9344,6 +9529,21 @@ impl EventSink for PrintingSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_resume_models_review_and_unknown_help_are_typed() {
+        assert!(
+            matches!(parse_args(vec!["resume".into(), "latest".into()]), Ok(Command::Resume(Some(value))) if value == "latest")
+        );
+        assert!(matches!(
+            parse_args(vec!["models".into(), "--json".into()]),
+            Ok(Command::Models { json: true })
+        ));
+        assert!(
+            matches!(parse_args(vec!["review".into(), "security".into(), "--json".into()]), Ok(Command::Review { focus: Some(value), json: true }) if value == "security")
+        );
+        assert!(parse_args(vec!["not-a-command".into(), "--help".into()]).is_err());
+    }
 
     #[test]
     fn approval_worker_to_tui_decision_gates_workspace_effect() {

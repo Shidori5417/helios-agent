@@ -1,7 +1,7 @@
 #compdef helios agent-cli
 _helios() {
   _arguments \
-    '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff)' \
+    '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec resume models review sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff)' \
     '--workspace[workspace root]:path:_files' \
     '--provider[provider adapter]:provider:(fake openai anthropic gemini generic openai-compatible)' \
     '--model[model name]:model:' \

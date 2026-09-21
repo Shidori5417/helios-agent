@@ -169,7 +169,7 @@
   },
   {
     "path": "crates/cli/src/main.rs",
-    "bytes": 402692
+    "bytes": 410451
   },
   {
     "path": "crates/context/Cargo.toml",
@@ -309,15 +309,15 @@
   },
   {
     "path": "completions/agent-cli.bash",
-    "bytes": 1243
+    "bytes": 1264
   },
   {
     "path": "completions/agent-cli.fish",
-    "bytes": 2925
+    "bytes": 2967
   },
   {
     "path": "completions/agent-cli.zsh",
-    "bytes": 1821
+    "bytes": 1842
   },
   {
     "path": "docs/INSTALL.md",
@@ -329,7 +329,7 @@
   },
   {
     "path": "docs/helios.1",
-    "bytes": 731
+    "bytes": 1036
   },
   {
     "path": "examples/plugins/sample/plugin.json",
