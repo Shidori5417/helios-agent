@@ -674,6 +674,36 @@ impl Database {
         rows.collect()
     }
 
+    pub fn list_session_summaries_page(
+        &self,
+        workspace: &str,
+        limit: usize,
+        offset: usize,
+    ) -> SqlResult<Vec<SessionSummary>> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.id, s.objective, s.title, s.workspace, s.created_at, MAX(t.created_at), COUNT(t.id), s.provider, s.model, s.effort, s.git_branch
+             FROM sessions s LEFT JOIN turns t ON t.session_id = s.id
+             WHERE s.workspace = ?1 AND s.archived = 0 AND s.deleted_at IS NULL
+             GROUP BY s.id ORDER BY s.id DESC LIMIT ?2 OFFSET ?3",
+        )?;
+        let rows = statement.query_map(params![workspace, limit as i64, offset as i64], |row| {
+            Ok(SessionSummary {
+                id: row.get(0)?,
+                objective: row.get(1)?,
+                title: row.get(2)?,
+                workspace: row.get(3)?,
+                created_at: row.get(4)?,
+                last_activity: row.get(5)?,
+                turn_count: row.get(6)?,
+                provider: row.get(7)?,
+                model: row.get(8)?,
+                effort: row.get(9)?,
+                git_branch: row.get(10)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn set_session_override(
         &self,
         id: i64,

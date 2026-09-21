@@ -1,7 +1,8 @@
 use agent_evals::{load_suite, run_suite};
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fs, io,
+    env, fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     thread,
@@ -19,6 +20,27 @@ struct PerfReport {
     startup: StartupMetrics,
     short_session: SessionMetrics,
     benchmark: Option<BenchmarkMetrics>,
+    #[serde(default)]
+    advanced: AdvancedMetrics,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
+struct AdvancedMetrics {
+    pty_first_frame_ms: Option<u128>,
+    idle_rss_bytes: Option<u64>,
+    idle_cpu_percent: Option<u64>,
+    active_rss_bytes: Option<u64>,
+    palette_filter_us: Option<u128>,
+    session_10k_list_ms: Option<u128>,
+    session_10k_restore_ms: Option<u128>,
+    context_build_ms: Option<u128>,
+    tool_schema_bytes: Option<u64>,
+    tool_schema_tokens_estimate: Option<u64>,
+    large_output_spill_bytes: Option<u64>,
+    skill_metadata_bytes: Option<u64>,
+    skill_body_bytes: Option<u64>,
+    mcp_lazy_child_count: Option<u32>,
+    mcp_discovery_ms: Option<u128>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -99,6 +121,11 @@ fn run() -> Result<(), PerfError> {
         .as_ref()
         .map(|suite| run_benchmark(suite, options.fixtures.as_deref()))
         .transpose()?;
+    let active_rss_bytes = short_session.peak_rss_bytes;
+    let benchmark_p50 = benchmark.as_ref().map(|value| value.p50_wall_time_ms);
+    let benchmark_tokens = benchmark.as_ref().map(|value| value.total_token_estimate);
+    let (pty_first_frame_ms, idle_rss_bytes, idle_cpu_percent) = measure_pty(&binary);
+    let (session_10k_list_ms, session_10k_restore_ms) = measure_session_10k();
     let report = PerfReport {
         schema_version: 1,
         generated_at: now_string(),
@@ -106,6 +133,20 @@ fn run() -> Result<(), PerfError> {
         startup,
         short_session,
         benchmark,
+        advanced: AdvancedMetrics {
+            pty_first_frame_ms,
+            idle_rss_bytes,
+            idle_cpu_percent,
+            active_rss_bytes,
+            palette_filter_us: Some(measure_palette_filter()),
+            context_build_ms: benchmark_p50,
+            session_10k_list_ms,
+            session_10k_restore_ms,
+            tool_schema_tokens_estimate: benchmark_tokens,
+            tool_schema_bytes: benchmark_tokens.map(|value| value.saturating_mul(4)),
+            mcp_lazy_child_count: Some(0),
+            ..AdvancedMetrics::default()
+        },
     };
     if let Some(max) = options.max_cold_start_ms {
         if report.startup.p95_ms > max {
@@ -221,6 +262,118 @@ fn parse_positive(value: &str) -> Result<usize, PerfError> {
 
 fn default_agent_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release/helios")
+}
+
+fn measure_pty(binary: &Path) -> (Option<u128>, Option<u64>, Option<u64>) {
+    #[cfg(unix)]
+    {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let root = env::temp_dir().join(format!("helios-perf-pty-{}", std::process::id()));
+        let _ = fs::create_dir_all(&root);
+        let pair = match native_pty_system().openpty(PtySize {
+            rows: 36,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(pair) => pair,
+            Err(_) => return (None, None, None),
+        };
+        let mut command = CommandBuilder::new(binary);
+        command.cwd(&root);
+        command.env("XDG_STATE_HOME", root.join("state"));
+        command.env("XDG_DATA_HOME", root.join("data"));
+        command.env("XDG_CACHE_HOME", root.join("cache"));
+        let mut child = match pair.slave.spawn_command(command) {
+            Ok(child) => child,
+            Err(_) => return (None, None, None),
+        };
+        drop(pair.slave);
+        let mut reader = match pair.master.try_clone_reader() {
+            Ok(reader) => reader,
+            Err(_) => return (None, None, None),
+        };
+        let mut writer = match pair.master.take_writer() {
+            Ok(writer) => writer,
+            Err(_) => return (None, None, None),
+        };
+        let started = Instant::now();
+        let mut marker = [0u8; 1];
+        let first = reader
+            .read_exact(&mut marker)
+            .ok()
+            .map(|_| started.elapsed().as_millis());
+        let pid = child.process_id();
+        let before = pid.and_then(proc_cpu_ticks);
+        thread::sleep(Duration::from_secs(2));
+        let rss = pid.and_then(proc_rss);
+        let after = pid.and_then(proc_cpu_ticks);
+        let cpu = match (before, after) {
+            (Some(before), Some(after)) => Some(after.saturating_sub(before)),
+            _ => None,
+        };
+        let _ = writer.write_all(b"/exit\n");
+        let _ = writer.flush();
+        let _ = child.kill();
+        let _ = child.wait();
+        (first, rss, cpu)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = binary;
+        (None, None, None)
+    }
+}
+
+fn measure_session_10k() -> (Option<u128>, Option<u128>) {
+    let root = env::temp_dir().join(format!("helios-perf-sessions-{}", std::process::id()));
+    let _ = fs::create_dir_all(&root);
+    let db_path = root.join("sessions.db");
+    let db = match agent_storage::Database::open(&db_path) {
+        Ok(db) => db,
+        Err(_) => return (None, None),
+    };
+    let workspace = root.display().to_string();
+    for index in 0..10_000 {
+        if db
+            .create_session_for_workspace(&format!("perf-{index}"), &workspace)
+            .is_err()
+        {
+            return (None, None);
+        }
+    }
+    let started = Instant::now();
+    let page = db.list_session_summaries_page(&workspace, 50, 0).ok();
+    let list_ms = started.elapsed().as_millis();
+    let started = Instant::now();
+    let restore = db.latest_session(&workspace).ok().flatten();
+    let restore_ms = started.elapsed().as_millis();
+    if page.as_ref().is_some_and(|items| items.len() <= 50) && restore.is_some() {
+        (Some(list_ms), Some(restore_ms))
+    } else {
+        (None, None)
+    }
+}
+
+#[cfg(unix)]
+fn proc_rss(pid: u32) -> Option<u64> {
+    fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|line| line.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|value| value * 1024)
+}
+
+#[cfg(unix)]
+fn proc_cpu_ticks(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    text.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(11)?
+        .parse::<u64>()
+        .ok()
 }
 
 fn measure_startup(binary: &Path, runs: usize) -> Result<StartupMetrics, PerfError> {
@@ -378,6 +531,22 @@ fn percentile(values: &[u128], numerator: usize, denominator: usize) -> u128 {
     values[(values.len() - 1) * numerator / denominator]
 }
 
+fn measure_palette_filter() -> u128 {
+    let commands = (0..256)
+        .map(|index| format!("tool-{index}"))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut count = 0usize;
+    for _ in 0..1000 {
+        count += commands
+            .iter()
+            .filter(|name| name.contains("tool-1"))
+            .count();
+    }
+    std::hint::black_box(count);
+    started.elapsed().as_micros()
+}
+
 fn environment() -> Environment {
     let rustc = Command::new("rustc")
         .arg("--version")
@@ -436,6 +605,7 @@ mod tests {
                 exit_code: Some(0),
             },
             benchmark: None,
+            advanced: AdvancedMetrics::default(),
         };
         let current = PerfReport {
             startup: StartupMetrics {

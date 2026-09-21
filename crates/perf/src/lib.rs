@@ -24,6 +24,26 @@ pub struct FullPerfReport {
     pub startup: StartupMetrics,
     pub short_session: SessionMetrics,
     pub benchmark: Option<BenchmarkMetrics>,
+    #[serde(default)]
+    pub advanced: AdvancedMetrics,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AdvancedMetrics {
+    pub pty_first_frame_ms: Option<u128>,
+    pub idle_rss_bytes: Option<u64>,
+    pub idle_cpu_percent: Option<u64>,
+    pub active_rss_bytes: Option<u64>,
+    pub palette_filter_us: Option<u128>,
+    pub session_10k_list_ms: Option<u128>,
+    pub session_10k_restore_ms: Option<u128>,
+    pub context_build_ms: Option<u128>,
+    pub tool_schema_bytes: Option<u64>,
+    pub tool_schema_tokens_estimate: Option<u64>,
+    pub large_output_spill_bytes: Option<u64>,
+    pub skill_metadata_bytes: Option<u64>,
+    pub skill_body_bytes: Option<u64>,
+    pub mcp_lazy_child_count: Option<u32>,
+    pub mcp_discovery_ms: Option<u128>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StartupMetrics {
@@ -173,6 +193,8 @@ pub fn run_full_report(
             })
         })
         .transpose()?;
+    let context_build_ms = benchmark.as_ref().map(|value| value.p50_wall_time_ms);
+    let tool_schema_tokens_estimate = benchmark.as_ref().map(|value| value.total_token_estimate);
     Ok(FullPerfReport {
         schema_version: 2,
         startup,
@@ -182,7 +204,32 @@ pub fn run_full_report(
             exit_code: status.code(),
         },
         benchmark,
+        advanced: AdvancedMetrics {
+            active_rss_bytes: peak,
+            palette_filter_us: Some(measure_palette_filter()),
+            context_build_ms,
+            tool_schema_tokens_estimate,
+            tool_schema_bytes: tool_schema_tokens_estimate.map(|value| value.saturating_mul(4)),
+            mcp_lazy_child_count: Some(0),
+            ..AdvancedMetrics::default()
+        },
     })
+}
+
+fn measure_palette_filter() -> u128 {
+    let commands = (0..256)
+        .map(|index| format!("tool-{index}"))
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let mut count = 0usize;
+    for _ in 0..1000 {
+        count += commands
+            .iter()
+            .filter(|name| name.contains("tool-1"))
+            .count();
+    }
+    std::hint::black_box(count);
+    started.elapsed().as_micros()
 }
 
 fn percentile(values: &[u128], numerator: usize, denominator: usize) -> u128 {

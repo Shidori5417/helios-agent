@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 agent-evals = { path = "../evals" }
+agent-storage = { path = "../storage" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+portable-pty.workspace = true

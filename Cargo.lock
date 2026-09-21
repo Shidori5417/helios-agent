@@ -112,6 +112,8 @@ name = "agent-perf"
 version = "0.1.0"
 dependencies = [
  "agent-evals",
+ "agent-storage",
+ "portable-pty",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

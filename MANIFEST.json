@@ -229,7 +229,7 @@
   },
   {
     "path": "crates/storage/src/lib.rs",
-    "bytes": 71437
+    "bytes": 72652
   },
   {
     "path": "crates/terminal/Cargo.toml",
@@ -257,7 +257,7 @@
   },
   {
     "path": "Cargo.lock",
-    "bytes": 63632
+    "bytes": 63667
   },
   {
     "path": "crates/mcp/Cargo.toml",
@@ -373,19 +373,19 @@
   },
   {
     "path": "crates/perf/Cargo.toml",
-    "bytes": 312
+    "bytes": 382
   },
   {
     "path": "crates/perf/src/main.rs",
-    "bytes": 14480
+    "bytes": 20488
   },
   {
     "path": "crates/perf/src/lib.rs",
-    "bytes": 8406
+    "bytes": 10197
   },
   {
     "path": "docs/PERFORMANCE.md",
-    "bytes": 2321
+    "bytes": 2996
   },
   {
     "path": "scripts/run-perf.sh",
