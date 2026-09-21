@@ -44,6 +44,8 @@ pub struct AdvancedMetrics {
     pub skill_body_bytes: Option<u64>,
     pub mcp_lazy_child_count: Option<u32>,
     pub mcp_discovery_ms: Option<u128>,
+    pub cache_cleanup_deleted_bytes: Option<u64>,
+    pub cache_cleanup_remaining_bytes: Option<u64>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StartupMetrics {

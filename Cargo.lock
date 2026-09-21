@@ -112,7 +112,11 @@ name = "agent-perf"
 version = "0.1.0"
 dependencies = [
  "agent-evals",
+ "agent-mcp",
+ "agent-sandbox",
+ "agent-skills",
  "agent-storage",
+ "agent-terminal",
  "libc",
  "portable-pty",
  "serde",

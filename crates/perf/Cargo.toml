@@ -14,6 +14,10 @@ path = "src/lib.rs"
 [dependencies]
 agent-evals = { path = "../evals" }
 agent-storage = { path = "../storage" }
+agent-terminal = { path = "../terminal" }
+agent-skills = { path = "../skills" }
+agent-sandbox = { path = "../sandbox" }
+agent-mcp = { path = "../mcp" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

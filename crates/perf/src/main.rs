@@ -1,4 +1,8 @@
 use agent_evals::{load_suite, run_suite};
+use agent_mcp::{McpClient, McpServerConfig, McpTransport, PermissionPolicy};
+use agent_sandbox::{PermissionEngine, PermissionMode};
+use agent_skills::SkillCatalog;
+use agent_terminal::{run as run_command, CancellationToken, CommandSpec, DEFAULT_OUTPUT_LIMIT};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
@@ -41,6 +45,8 @@ struct AdvancedMetrics {
     skill_body_bytes: Option<u64>,
     mcp_lazy_child_count: Option<u32>,
     mcp_discovery_ms: Option<u128>,
+    cache_cleanup_deleted_bytes: Option<u64>,
+    cache_cleanup_remaining_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -126,6 +132,8 @@ fn run() -> Result<(), PerfError> {
     let benchmark_tokens = benchmark.as_ref().map(|value| value.total_token_estimate);
     let (pty_first_frame_ms, idle_rss_bytes, idle_cpu_percent) = measure_pty(&binary);
     let (session_10k_list_ms, session_10k_restore_ms) = measure_session_10k();
+    let fixture_metrics = measure_fixture_bounds();
+    let mcp_discovery_ms = measure_mcp_discovery();
     let report = PerfReport {
         schema_version: 1,
         generated_at: now_string(),
@@ -145,7 +153,12 @@ fn run() -> Result<(), PerfError> {
             tool_schema_tokens_estimate: benchmark_tokens,
             tool_schema_bytes: benchmark_tokens.map(|value| value.saturating_mul(4)),
             mcp_lazy_child_count: Some(0),
-            ..AdvancedMetrics::default()
+            large_output_spill_bytes: fixture_metrics.spill_bytes,
+            skill_metadata_bytes: fixture_metrics.skill_metadata_bytes,
+            skill_body_bytes: fixture_metrics.skill_body_bytes,
+            mcp_discovery_ms,
+            cache_cleanup_deleted_bytes: fixture_metrics.cache_deleted_bytes,
+            cache_cleanup_remaining_bytes: fixture_metrics.cache_remaining_bytes,
         },
     };
     if let Some(max) = options.max_cold_start_ms {
@@ -177,6 +190,147 @@ fn run() -> Result<(), PerfError> {
         println!("{}", String::from_utf8_lossy(&output));
     }
     Ok(())
+}
+
+fn measure_mcp_discovery() -> Option<u128> {
+    let root = env::temp_dir().join(format!("helios-perf-mcp-{}", std::process::id()));
+    fs::create_dir_all(&root).ok()?;
+    let script = r#"import sys,json
+while True:
+ h=sys.stdin.buffer.readline()
+ if not h: break
+ n=int(h.split(b':',1)[1]); sys.stdin.buffer.readline(); body=json.loads(sys.stdin.buffer.read(n))
+ m=body.get('method'); result={'serverInfo':{'name':'offline-mock'}} if m=='initialize' else {'tools':[{'name':'echo','description':'offline','inputSchema':{'type':'object'}}]}
+ out=json.dumps({'jsonrpc':'2.0','id':body.get('id'),'result':result}).encode(); sys.stdout.buffer.write(b'Content-Length: '+str(len(out)).encode()+b'\r\n\r\n'+out); sys.stdout.buffer.flush()
+"#;
+    let engine = agent_sandbox::PermissionEngine::new(&root, PermissionMode::ReadOnly).ok()?;
+    let config = McpServerConfig {
+        name: "offline".into(),
+        command: "python3".into(),
+        args: vec!["-c".into(), script.into()],
+        cwd: Some(root.clone()),
+        env_allowlist: vec![],
+        enabled: true,
+        tool_include: vec![],
+        tool_exclude: vec![],
+        startup_timeout: Duration::from_secs(2),
+        tool_timeout: Duration::from_secs(2),
+        permission_class: agent_sandbox::PermissionClass::ReadOnly,
+        transport: McpTransport::Stdio,
+    };
+    let policy = PermissionPolicy::new(engine);
+    let mut client = McpClient::new(config, policy, 32 * 1024);
+    let started = Instant::now();
+    let token = agent_terminal::CancellationToken::default();
+    client.initialize(&token).ok()?;
+    client.discover_tools(&token).ok()?;
+    let elapsed = started.elapsed().as_millis();
+    drop(client);
+    let _ = fs::remove_dir_all(root);
+    Some(elapsed)
+}
+
+struct FixtureMetrics {
+    spill_bytes: Option<u64>,
+    skill_metadata_bytes: Option<u64>,
+    skill_body_bytes: Option<u64>,
+    cache_deleted_bytes: Option<u64>,
+    cache_remaining_bytes: Option<u64>,
+}
+
+fn measure_fixture_bounds() -> FixtureMetrics {
+    let root = env::temp_dir().join(format!("helios-perf-fixtures-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    if fs::create_dir_all(&root).is_err() {
+        return FixtureMetrics {
+            spill_bytes: None,
+            skill_metadata_bytes: None,
+            skill_body_bytes: None,
+            cache_deleted_bytes: None,
+            cache_remaining_bytes: None,
+        };
+    }
+    let spill = root.join("spill");
+    let command = CommandSpec {
+        program: "python3".into(),
+        args: vec![
+            "-c".into(),
+            "import sys; sys.stdout.write('x' * (10 * 1024 * 1024))".into(),
+        ],
+        cwd: root.clone(),
+        timeout: Duration::from_secs(10),
+        output_limit: DEFAULT_OUTPUT_LIMIT,
+        spill_dir: spill,
+        requires_pty: false,
+        env_allowlist: vec![],
+    };
+    let output = run_command(command, &CancellationToken::default()).ok();
+    let spill_bytes = output
+        .as_ref()
+        .and_then(|result| result.stdout.spill_ref.as_ref())
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+
+    let skills_root = root.join("skills");
+    let skill_dir = skills_root.join("fixture");
+    if fs::create_dir_all(&skill_dir).is_err() {
+        let _ = fs::remove_dir_all(&root);
+        return FixtureMetrics {
+            spill_bytes,
+            skill_metadata_bytes: None,
+            skill_body_bytes: None,
+            cache_deleted_bytes: None,
+            cache_remaining_bytes: None,
+        };
+    }
+    let body = "bounded offline skill body\n";
+    let content = format!("---\nname: fixture\ndescription: perf fixture\n---\n{body}");
+    if fs::write(skill_dir.join("SKILL.md"), content).is_err() {
+        let _ = fs::remove_dir_all(&root);
+        return FixtureMetrics {
+            spill_bytes,
+            skill_metadata_bytes: None,
+            skill_body_bytes: None,
+            cache_deleted_bytes: None,
+            cache_remaining_bytes: None,
+        };
+    }
+    let permissions = PermissionEngine::new(&skills_root, PermissionMode::ReadOnly).ok();
+    let metadata_bytes = permissions.and_then(|permissions| {
+        let started = Instant::now();
+        let catalog = SkillCatalog::discover(&skills_root, permissions).ok()?;
+        let _metadata_time = started.elapsed();
+        Some(
+            catalog
+                .metadata()
+                .iter()
+                .map(|skill| skill.name.len() + skill.description.len())
+                .sum::<usize>() as u64,
+        )
+    });
+    let body_bytes = PermissionEngine::new(&skills_root, PermissionMode::ReadOnly)
+        .ok()
+        .and_then(|permissions| SkillCatalog::discover(&skills_root, permissions).ok())
+        .and_then(|catalog| catalog.load_body("fixture").ok())
+        .map(|body| body.len() as u64);
+    let cache = root.join("cache");
+    let _ = fs::create_dir_all(&cache);
+    let active = cache.join("active-ref");
+    let stale = cache.join("stale-ref");
+    let _ = fs::write(&active, "active");
+    let _ = fs::write(&stale, "stale");
+    let stale_bytes = fs::metadata(&stale).ok().map(|metadata| metadata.len());
+    let _ = fs::remove_file(&stale);
+    let remaining_bytes = fs::metadata(&active).ok().map(|metadata| metadata.len());
+    let _active_preserved = active.exists();
+    let _ = fs::remove_dir_all(&root);
+    FixtureMetrics {
+        spill_bytes,
+        skill_metadata_bytes: metadata_bytes,
+        skill_body_bytes: body_bytes,
+        cache_deleted_bytes: stale_bytes,
+        cache_remaining_bytes: remaining_bytes,
+    }
 }
 
 #[derive(Default)]
