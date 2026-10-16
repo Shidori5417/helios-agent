@@ -10,3 +10,4 @@ agent-terminal = { path = "../terminal" }
 ratatui.workspace = true
 crossterm.workspace = true
 pulldown-cmark.workspace = true
+unicode-width = "0.2"
