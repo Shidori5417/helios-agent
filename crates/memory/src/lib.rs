@@ -183,6 +183,9 @@ impl MemoryStore for SqliteMemoryStore {
     }
 
     fn search(&self, query: &str, limit: usize) -> Result<Vec<StoredMemory>, MemoryError> {
+        let Some(query) = agent_storage::fts_query(query) else {
+            return Ok(Vec::new());
+        };
         let mut statement = self.database.connection().prepare("SELECT m.id, m.scope, m.kind, m.key, m.content, m.confidence, m.importance, m.source_session_id FROM memory_fts f JOIN memory m ON m.id = f.rowid WHERE memory_fts MATCH ?1 AND m.status = 'active' ORDER BY bm25(memory_fts), m.importance DESC LIMIT ?2")?;
         let rows = statement.query_map(params![query, limit as i64], |row| {
             Ok(StoredMemory {

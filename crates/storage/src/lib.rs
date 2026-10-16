@@ -4,6 +4,23 @@ use std::{fs, path::Path};
 
 pub const STORAGE_FORMAT_VERSION: u32 = 12;
 
+/// Maximum number of terms forwarded to an FTS5 `MATCH` expression.
+const FTS_MAX_TERMS: usize = 32;
+
+/// Turns free text into a safe FTS5 `MATCH` expression: each word becomes a
+/// quoted string (implicit AND), so operators and punctuation in user prompts
+/// (`*`, `"`, `-`, `:`, `NEAR`, `**bold**`) cannot cause syntax errors or
+/// change query semantics. Returns `None` when no searchable word remains.
+pub fn fts_query(text: &str) -> Option<String> {
+    let terms = text
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+        .filter(|term| !term.is_empty())
+        .take(FTS_MAX_TERMS)
+        .map(|term| format!("\"{term}\""))
+        .collect::<Vec<_>>();
+    (!terms.is_empty()).then(|| terms.join(" "))
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UsageRecord {
     pub input_tokens: u64,
@@ -1028,6 +1045,9 @@ impl Database {
         query: &str,
         limit: usize,
     ) -> SqlResult<Vec<(i64, String, String)>> {
+        let Some(query) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
         let mut statement = self.connection.prepare("SELECT m.id, m.role, m.content FROM messages_fts f JOIN messages m ON m.id = f.rowid WHERE messages_fts MATCH ?1 ORDER BY bm25(messages_fts) LIMIT ?2")?;
         let rows = statement.query_map(params![query, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1041,6 +1061,9 @@ impl Database {
         workspace: &str,
         limit: usize,
     ) -> SqlResult<Vec<(i64, String, String)>> {
+        let Some(query) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
         let mut statement = self.connection.prepare("SELECT m.id, m.role, m.content FROM messages_fts f JOIN messages m ON m.id = f.rowid JOIN sessions s ON s.id = m.session_id WHERE s.workspace = ?1 AND messages_fts MATCH ?2 ORDER BY bm25(messages_fts) LIMIT ?3")?;
         let rows = statement.query_map(params![workspace, query, limit as i64], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -1330,6 +1353,31 @@ mod tests {
             1
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn search_tolerates_fts_operators_in_free_text() {
+        let db = Database::in_memory().expect("db");
+        let session = db.create_session("ops").expect("session");
+        let turn = db.append_turn(session, 0).expect("turn");
+        db.append_message(session, turn, "user", "write bold code")
+            .expect("message");
+        for query in [
+            "Write **bold** and `code`",
+            "\"unterminated",
+            "a OR NEAR(b) -c :d",
+            "*",
+        ] {
+            assert!(db.search_messages(query, 10).is_ok(), "{query}");
+        }
+        assert_eq!(
+            db.search_messages("**bold** code", 10)
+                .expect("search")
+                .len(),
+            1
+        );
+        assert_eq!(fts_query("*** ---"), None);
+        assert_eq!(fts_query("say \"hi\""), Some("\"say\" \"hi\"".into()));
     }
 
     #[test]

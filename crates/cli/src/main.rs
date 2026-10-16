@@ -55,6 +55,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Process-wide copy of `--workspace`, published once by `main` after
+/// parsing. The thread-local above is only visible on the parsing thread, so
+/// turns and tools running on worker threads (interactive mode, jobs) would
+/// otherwise silently fall back to the process working directory.
+static PROCESS_WORKSPACE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> ExitCode {
     install_broken_pipe_hook();
@@ -73,7 +79,11 @@ async fn main() -> ExitCode {
             Err(error) => fail(error),
         };
     }
-    match parse_args(args) {
+    let parsed = parse_args(args);
+    if let Some(path) = WORKSPACE_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        let _ = PROCESS_WORKSPACE.set(path);
+    }
+    match parsed {
         Ok(Command::Version) => {
             println!("{} {}", program_name, env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -5519,10 +5529,7 @@ fn list_sessions(db_path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 fn search_sessions(db_path: PathBuf, query: &str) -> Result<(), String> {
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let db = open_database(&db_path)?;
     for (id, role, content) in db
         .search_messages_for_workspace(query, &workspace.display().to_string(), 20)
@@ -6876,10 +6883,7 @@ fn resolve_observability_session(
 }
 
 fn context_command(db_path: PathBuf, selector: Option<String>, json: bool) -> Result<(), String> {
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let database = open_database(&db_path)?;
     let session_id = resolve_observability_session(
         &database,
@@ -6932,10 +6936,7 @@ fn context_warning(estimated: u64, budget: u64) -> String {
 }
 
 fn usage_command(db_path: PathBuf, selector: Option<String>, json: bool) -> Result<(), String> {
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let database = open_database(&db_path)?;
     let session_id = resolve_observability_session(
         &database,
@@ -6976,12 +6977,7 @@ fn usage_json(usage: &UsageRecord) -> serde_json::Value {
 }
 
 fn memory_command(command: MemoryCommand) -> Result<(), String> {
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?
-        .display()
-        .to_string();
+    let workspace = workspace_root()?.display().to_string();
     match command {
         MemoryCommand::List { db_path, limit } => {
             let store = SqliteMemoryStore::open(db_path, 128, 16 * 1024)
@@ -7092,10 +7088,7 @@ fn memory_command(command: MemoryCommand) -> Result<(), String> {
 }
 
 fn plugins_command(command: PluginCommand) -> Result<(), String> {
-    let workspace = env::current_dir()
-        .map_err(|error| error.to_string())?
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let requested_enable = matches!(&command, PluginCommand::Enable { .. });
     match command {
         PluginCommand::List => {
@@ -7342,7 +7335,7 @@ impl MemoryRetriever for StaticMemory {
 }
 
 fn verify_command(argv: Vec<String>) -> Result<(), String> {
-    let workspace = env::current_dir().map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let registry = ToolRegistry::new(workspace, PermissionMode::WorkspaceWrite)
         .map_err(|error| error.to_string())?;
     let result = registry
@@ -7356,7 +7349,7 @@ fn verify_command(argv: Vec<String>) -> Result<(), String> {
     }
 }
 fn diff_command() -> Result<(), String> {
-    let workspace = env::current_dir().map_err(|error| error.to_string())?;
+    let workspace = workspace_root()?;
     let registry = ToolRegistry::new(workspace, PermissionMode::ReadOnly)
         .map_err(|error| error.to_string())?;
     let result = registry.git_diff().map_err(|error| error.to_string())?;
@@ -7473,6 +7466,9 @@ fn generated_help_usage(path: &[String]) -> String {
 fn workspace_root() -> Result<PathBuf, String> {
     if let Some(path) = WORKSPACE_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return Ok(path);
+    }
+    if let Some(path) = PROCESS_WORKSPACE.get() {
+        return Ok(path.clone());
     }
     env::current_dir()
         .map_err(|error| error.to_string())?

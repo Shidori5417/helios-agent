@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Fixed prompts containing FTS5 operators (e.g. `**bold**`, quotes, `*`)
+  failing the whole turn with an SQLite syntax error during memory/session
+  search; free text is now converted to quoted terms.
+- Fixed `--workspace` being ignored by interactive turns (worker threads)
+  and by `search`, `context`, `usage`, `memory`, `plugins`, `verify` and
+  `diff`, which fell back to the process working directory.
+- Interactive TUI: styled markdown and diffs with Dark/Light/Monochrome
+  palettes, readline-style composer keys, large-paste chips, slash-command
+  popup, follow-bottom scrolling with mouse wheel, spinner with elapsed time
+  and tokens, status line, collapsible tool cards (Ctrl+O), and a bell after
+  long turns.
 - Security: dangling symlinks can no longer redirect workspace writes outside
   the workspace; the terminal is restored when a release build panics.
 - Providers send the session effort (OpenAI `reasoning.effort`, Anthropic
