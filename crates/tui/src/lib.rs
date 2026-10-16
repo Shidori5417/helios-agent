@@ -1,7 +1,12 @@
+pub mod status;
+
 use agent_protocol::Event;
 use crossterm::{
     cursor::{Hide, Show},
-    event::{DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -9,25 +14,36 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
-    text::Text,
+    text::{Line, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+use status::{BodyMetrics, LiveStatus};
 use std::{
-    io::{self, IsTerminal},
+    cell::Cell,
+    collections::VecDeque,
+    io::{self, IsTerminal, Write},
     sync::mpsc::{Receiver, SyncSender, TryRecvError},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiModel {
     pub status: String,
-    pub transcript: Vec<TranscriptItem>,
+    pub transcript: VecDeque<TranscriptItem>,
     pub tool: Option<String>,
     pub permission: Option<String>,
     pub verification: Option<String>,
     pub context: Option<String>,
     pub scroll: usize,
+    /// Keep the body pinned to the newest output (cleared by manual scrolling).
+    pub follow: bool,
+    /// Body geometry measured by the last render, used by scrolling.
+    pub metrics: Cell<BodyMetrics>,
+    pub live: LiveStatus,
+    /// Set when a long turn finished; consumed by `take_bell`.
+    pub bell_due: bool,
+    next_card_id: u64,
     pub viewport_height: usize,
     pub scroll_step: usize,
     pub composer: Composer,
@@ -70,12 +86,17 @@ impl Default for TuiModel {
     fn default() -> Self {
         Self {
             status: String::new(),
-            transcript: Vec::new(),
+            transcript: VecDeque::new(),
             tool: None,
             permission: None,
             verification: None,
             context: None,
             scroll: 0,
+            follow: true,
+            metrics: Cell::new(BodyMetrics::default()),
+            live: LiveStatus::default(),
+            bell_due: false,
+            next_card_id: 0,
             viewport_height: 0,
             scroll_step: 1,
             composer: Composer::default(),
@@ -283,6 +304,9 @@ pub struct PermissionPrompt {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCard {
+    pub id: u64,
+    pub started: Option<Instant>,
+    pub duration: Option<Duration>,
     pub name: String,
     pub status: String,
     pub summary: String,
@@ -394,7 +418,14 @@ pub enum TranscriptItem {
     User(String),
     Assistant(String),
     Activity(String),
-    Tool { name: String, output: String },
+    Tool {
+        name: String,
+        output: String,
+    },
+    /// Accumulated reasoning summary, shown collapsed.
+    Thinking(String),
+    /// Position marker for the `ToolCard` with this id.
+    ToolCard(u64),
     FileChange(String),
     Error(String),
     Notification(String),
@@ -407,6 +438,8 @@ impl TranscriptItem {
             Self::Assistant(text) => format!("assistant: {text}"),
             Self::Activity(text) => format!("· {text}"),
             Self::Tool { name, output } => format!("tool {name}: {output}"),
+            Self::Thinking(text) => format!("· reasoning: {text}"),
+            Self::ToolCard(id) => format!("tool card #{id}"),
             Self::FileChange(path) => format!("change: {path}"),
             Self::Error(error) => format!("error: {error}"),
             Self::Notification(text) => text.clone(),
@@ -1109,27 +1142,37 @@ impl TuiModel {
     }
 
     pub fn push_item(&mut self, item: TranscriptItem) {
-        self.transcript.push(item);
-        while self.transcript.len() > MAX_TRANSCRIPT_ITEMS
-            || self
-                .transcript
-                .iter()
-                .map(TranscriptItem::size)
-                .sum::<usize>()
-                > MAX_TRANSCRIPT_BYTES
+        self.transcript.push_back(item);
+        let mut bytes = self
+            .transcript
+            .iter()
+            .map(TranscriptItem::size)
+            .sum::<usize>();
+        while (self.transcript.len() > MAX_TRANSCRIPT_ITEMS || bytes > MAX_TRANSCRIPT_BYTES)
+            && self.transcript.len() > 1
         {
-            if self.transcript.len() <= 1 {
-                break;
+            if let Some(removed) = self.transcript.pop_front() {
+                bytes = bytes.saturating_sub(removed.size());
             }
-            self.transcript.remove(0);
         }
+    }
+
+    fn append_thinking_delta(&mut self, delta: &str) {
+        if let Some(TranscriptItem::Thinking(text)) = self.transcript.back_mut() {
+            let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(text.len());
+            text.extend(delta.chars().take(remaining));
+            return;
+        }
+        self.push_item(TranscriptItem::Thinking(
+            delta.chars().take(MAX_STREAM_ITEM_BYTES).collect(),
+        ));
     }
 
     fn append_assistant_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
-        if let Some(TranscriptItem::Assistant(text)) = self.transcript.last_mut() {
+        if let Some(TranscriptItem::Assistant(text)) = self.transcript.back_mut() {
             let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(text.len());
             text.extend(delta.chars().take(remaining));
             return;
@@ -1144,7 +1187,7 @@ impl TuiModel {
         if let Some(TranscriptItem::Tool {
             name: current,
             output,
-        }) = self.transcript.last_mut()
+        }) = self.transcript.back_mut()
         {
             if *current == name {
                 let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(output.len());
@@ -1163,22 +1206,32 @@ impl TuiModel {
             Event::TurnStarted => {
                 self.status = "turn started".into();
                 self.active_turn = true;
+                self.live.start_turn(Instant::now());
             }
             Event::ModelDelta(text) => self.append_assistant_delta(text),
-            Event::ReasoningSummaryDelta(text) => {
-                self.push_item(TranscriptItem::Activity(format!("reasoning: {text}")))
-            }
+            Event::ReasoningSummaryDelta(text) => self.append_thinking_delta(text),
             Event::ToolRequested(name) | Event::ToolStarted(name) => {
                 self.tool = Some(name.clone());
-                self.tool_cards.push(ToolCard {
-                    name: name.clone(),
-                    status: "running".into(),
-                    summary: "tool execution".into(),
-                    output: String::new(),
-                    expanded: false,
+                let duplicate = self.tool_cards.last().is_some_and(|card| {
+                    card.name == *name && card.status == "running" && card.output.is_empty()
                 });
-                if self.tool_cards.len() > 64 {
-                    self.tool_cards.remove(0);
+                if !duplicate {
+                    let id = self.next_card_id;
+                    self.next_card_id += 1;
+                    self.tool_cards.push(ToolCard {
+                        id,
+                        started: Some(Instant::now()),
+                        duration: None,
+                        name: name.clone(),
+                        status: "running".into(),
+                        summary: "tool execution".into(),
+                        output: String::new(),
+                        expanded: false,
+                    });
+                    self.push_item(TranscriptItem::ToolCard(id));
+                    if self.tool_cards.len() > 64 {
+                        self.tool_cards.remove(0);
+                    }
                 }
             }
             Event::ToolOutputDelta(text) => {
@@ -1193,6 +1246,7 @@ impl TuiModel {
                 self.status = format!("tool: {status}");
                 if let Some(card) = self.tool_cards.last_mut() {
                     card.status = status.chars().take(160).collect();
+                    card.duration = card.started.map(|start| start.elapsed());
                 }
                 self.tool = None;
             }
@@ -1215,8 +1269,10 @@ impl TuiModel {
                 self.context = Some(summary.clone());
                 self.status = summary.clone();
                 self.active_turn = false;
+                self.live.finish_turn(Instant::now());
             }
             Event::UsageUpdated(usage) => {
+                self.live.add_usage(usage);
                 self.push_item(TranscriptItem::Activity(format!("usage: {usage}")))
             }
             Event::HookStarted(name) => {
@@ -1234,20 +1290,29 @@ impl TuiModel {
             Event::TurnCompleted => {
                 self.status = "turn completed".into();
                 self.active_turn = false;
+                self.bell_due = self.live.finish_turn(Instant::now());
             }
             Event::Error(error) => {
                 self.status = format!("error: {error}");
                 self.active_turn = false;
+                self.bell_due = self.live.finish_turn(Instant::now());
                 self.push_item(TranscriptItem::Error(error.clone()));
             }
         }
     }
     pub fn as_text(&self) -> String {
         let mut lines = vec![format!("status: {}", self.status)];
-        lines.extend(self.transcript.iter().map(|item| match item {
-            TranscriptItem::Assistant(text) => format!("assistant: {}", markdown_plain(text)),
-            _ => item.render(),
-        }));
+        lines.extend(
+            self.transcript
+                .iter()
+                .filter(|item| !matches!(item, TranscriptItem::ToolCard(_)))
+                .map(|item| match item {
+                    TranscriptItem::Assistant(text) => {
+                        format!("assistant: {}", markdown_plain(text))
+                    }
+                    _ => item.render(),
+                }),
+        );
         if let Some(tool) = &self.tool {
             lines.push(format!("tool: {tool}"));
         }
@@ -1283,15 +1348,46 @@ impl TuiModel {
             .join("\n")
     }
 
+    fn page_rows(&self) -> usize {
+        self.metrics.get().height.saturating_sub(1).max(1)
+    }
+
+    fn scroll_rows(&mut self, down: bool, rows: usize) {
+        let metrics = self.metrics.get();
+        if down {
+            status::scroll_down(&mut self.scroll, &mut self.follow, metrics, rows);
+        } else {
+            status::scroll_up(&mut self.scroll, &mut self.follow, metrics, rows);
+        }
+    }
+
+    /// Toggles expansion of the most recent tool card (Ctrl-O).
+    pub fn toggle_last_card(&mut self) {
+        if let Some(card) = self.tool_cards.last_mut() {
+            card.expanded = !card.expanded;
+        }
+    }
+
+    /// Returns true once if a long turn just finished.
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.bell_due)
+    }
+
+    /// Advances the spinner; true when a redraw is due.
+    pub fn on_tick(&mut self, now: Instant, tick: Duration) -> bool {
+        self.live.on_tick(now, self.active_turn, tick)
+    }
+
     pub fn reduce_input(&mut self, input: &InputEvent) {
         match input {
             InputEvent::Resize { height, .. } => self.viewport_height = (*height).max(1) as usize,
-            InputEvent::ScrollUp => {
-                self.scroll = self.scroll.saturating_sub(self.scroll_step.max(1))
-            }
-            InputEvent::ScrollDown => {
-                self.scroll = self.scroll.saturating_add(self.scroll_step.max(1))
-            }
+            InputEvent::ScrollUp => self.scroll_rows(false, self.scroll_step.max(1)),
+            InputEvent::ScrollDown => self.scroll_rows(true, self.scroll_step.max(1)),
+            InputEvent::WheelUp => self.scroll_rows(false, status::WHEEL_ROWS),
+            InputEvent::WheelDown => self.scroll_rows(true, status::WHEEL_ROWS),
+            InputEvent::PageUp => self.scroll_rows(false, self.page_rows()),
+            InputEvent::PageDown => self.scroll_rows(true, self.page_rows()),
+            InputEvent::FollowBottom => self.follow = true,
             InputEvent::None | InputEvent::Quit => {}
         }
     }
@@ -1312,6 +1408,10 @@ pub struct TuiSettings {
     pub color: TuiColor,
     pub alternate_screen: bool,
     pub theme: TuiTheme,
+    /// Capture the mouse for wheel scrolling (disables native selection).
+    pub mouse: bool,
+    /// Ring the terminal bell when a turn longer than 10s completes.
+    pub notify: bool,
 }
 
 impl Default for TuiSettings {
@@ -1323,6 +1423,8 @@ impl Default for TuiSettings {
             color: TuiColor::Auto,
             alternate_screen: true,
             theme: TuiTheme::System,
+            mouse: true,
+            notify: true,
         }
     }
 }
@@ -1334,6 +1436,11 @@ pub enum InputEvent {
     Resize { width: u16, height: u16 },
     ScrollUp,
     ScrollDown,
+    WheelUp,
+    WheelDown,
+    PageUp,
+    PageDown,
+    FollowBottom,
 }
 
 pub fn render_event(event: &Event) -> String {
@@ -1436,6 +1543,83 @@ fn composer_text(model: &TuiModel, width: u16, height: u16) -> Text<'static> {
     Text::from(text)
 }
 
+/// Body lines for the transcript: tool cards are one compact line each
+/// (expanded cards show bounded output) and reasoning is collapsed to its tail.
+fn body_lines(model: &TuiModel, width: usize, styled: bool) -> Vec<Line<'static>> {
+    let dim = if styled {
+        Style::default().add_modifier(ratatui::style::Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for item in &model.transcript {
+        match item {
+            TranscriptItem::ToolCard(id) => {
+                let Some(card) = model.tool_cards.iter().find(|card| card.id == *id) else {
+                    continue;
+                };
+                lines.push(Line::from(status::card_line(
+                    &card.name,
+                    &card.status,
+                    &card.summary,
+                    card.duration,
+                    width,
+                )));
+                if card.expanded {
+                    lines.extend(
+                        status::expanded_lines(&card.output, width)
+                            .into_iter()
+                            .map(|line| Line::styled(line, dim)),
+                    );
+                }
+            }
+            // Output is shown through the tool card.
+            TranscriptItem::Tool { .. } => {}
+            TranscriptItem::Thinking(text) => {
+                lines.push(Line::styled("· thinking…", dim));
+                lines.extend(
+                    status::thinking_tail(text, width)
+                        .into_iter()
+                        .map(|line| Line::styled(line, dim)),
+                );
+            }
+            TranscriptItem::Assistant(text) => lines.extend(
+                format!("assistant: {}", markdown_plain(text))
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            ),
+            other => lines.extend(
+                other
+                    .render()
+                    .lines()
+                    .map(|line| Line::from(line.to_owned())),
+            ),
+        }
+    }
+    let extras = [
+        model
+            .permission
+            .as_ref()
+            .map(|v| format!("permission: {v}")),
+        model
+            .verification
+            .as_ref()
+            .map(|v| format!("verification: {v}")),
+        model.context.as_ref().map(|v| format!("context: {v}")),
+        model
+            .permission_request
+            .as_ref()
+            .map(|p| format!("permission pending: {} ({})", p.action, p.risk)),
+    ];
+    lines.extend(extras.into_iter().flatten().map(Line::from));
+    lines
+}
+
+fn short_cost(model: &TuiModel) -> Option<&str> {
+    let cost = model.cost_summary.as_deref()?.lines().next()?;
+    (!cost.contains("unavailable") && cost.chars().count() <= 12).then_some(cost)
+}
+
 fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiSettings) {
     let area = frame.area();
     let mode = layout_mode(area.width, area.height);
@@ -1453,7 +1637,7 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(3),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
     let border_style = if color_enabled(settings) && model.theme != TuiTheme::Monochrome {
@@ -1462,15 +1646,29 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
         Style::default()
     };
     frame.render_widget(Paragraph::new(header_text(model, mode)), chunks[0]);
-    let body = model.as_text();
+    let styled = color_enabled(settings) && model.theme != TuiTheme::Monochrome;
+    let inner_width = chunks[1].width.saturating_sub(2);
+    let inner_height = usize::from(chunks[1].height.saturating_sub(2));
+    let lines = body_lines(model, usize::from(inner_width), styled);
+    let metrics = BodyMetrics {
+        total_rows: status::wrapped_rows(&lines, inner_width),
+        height: inner_height,
+    };
+    model.metrics.set(metrics);
+    let top = status::effective_top(model.scroll, model.follow, metrics);
+    let mut body_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
+    if let Some(more) =
+        status::more_indicator(status::rows_below(model.scroll, model.follow, metrics))
+    {
+        body_block = body_block.title_bottom(Line::from(more).right_aligned());
+    }
     frame.render_widget(
-        Paragraph::new(body)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .block(body_block)
+            .wrap(Wrap { trim: false })
+            .scroll((top.min(usize::from(u16::MAX)) as u16, 0)),
         chunks[1],
     );
     frame.render_widget(
@@ -1483,14 +1681,45 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
         .wrap(Wrap { trim: false }),
         chunks[2],
     );
-    let mut footer = model.status.clone();
-    if let Some(delta) = model.changes_delta {
-        footer.push_str(&format!(" · changes:{delta:+}"));
-    }
-    if let Some(jobs) = model.background_jobs {
-        footer.push_str(&format!(" · jobs:{jobs}"));
-    }
-    frame.render_widget(Paragraph::new(footer), chunks[3]);
+    let footer_width = usize::from(chunks[3].width);
+    let activity = if model.active_turn {
+        status::spinner_text(&model.live, Instant::now())
+    } else {
+        let mut idle = model.status.clone();
+        if let Some(delta) = model.changes_delta {
+            idle.push_str(&format!(" · changes:{delta:+}"));
+        }
+        if let Some(jobs) = model.background_jobs {
+            idle.push_str(&format!(" · jobs:{jobs}"));
+        }
+        idle
+    };
+    let status_line = status::status_line(
+        &status::StatusParts {
+            model: model.model.as_deref(),
+            permission: model.permission_mode.as_deref(),
+            context_percent: model.context_percent,
+            session_tokens: model.live.session_tokens,
+            cost: short_cost(model),
+            branch: model.branch.as_deref(),
+        },
+        footer_width,
+    );
+    let activity_style = if styled && model.active_turn {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                status::truncate_chars(&activity, footer_width),
+                activity_style,
+            ),
+            Line::from(status_line),
+        ]),
+        chunks[3],
+    );
     if model.overlay.is_some() {
         let width = area.width.saturating_sub(6).min(100);
         let height = area.height.saturating_sub(6).min(18);
@@ -1511,20 +1740,30 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
 
 struct TerminalGuard {
     alternate_screen: bool,
+    mouse: bool,
 }
 impl TerminalGuard {
-    fn enter(alternate_screen: bool) -> io::Result<Self> {
+    fn enter(alternate_screen: bool, mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         if alternate_screen {
             execute!(io::stdout(), EnterAlternateScreen)?;
         }
         execute!(io::stdout(), EnableBracketedPaste, Hide)?;
-        Ok(Self { alternate_screen })
+        if mouse {
+            execute!(io::stdout(), EnableMouseCapture)?;
+        }
+        Ok(Self {
+            alternate_screen,
+            mouse,
+        })
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        if self.mouse {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
         if self.alternate_screen {
             let _ = execute!(io::stdout(), LeaveAlternateScreen);
@@ -1562,7 +1801,7 @@ pub fn run_channel_with_settings(
             "TUI requires an interactive TTY",
         ));
     }
-    let _guard = TerminalGuard::enter(settings.alternate_screen)?;
+    let _guard = TerminalGuard::enter(settings.alternate_screen, false)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut model = TuiModel {
@@ -1691,7 +1930,7 @@ where
             "interactive mode requires an interactive TTY",
         ));
     }
-    let _guard = TerminalGuard::enter(settings.alternate_screen)?;
+    let _guard = TerminalGuard::enter(settings.alternate_screen, settings.mouse)?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     let mut model = TuiModel {
@@ -1711,6 +1950,11 @@ where
             if matches!(event, Event::TurnCompleted | Event::Error(_)) {
                 active_cancellation = None;
             }
+        }
+        if model.take_bell() && settings.notify {
+            let mut out = io::stdout();
+            let _ = out.write_all(b"\x07");
+            let _ = out.flush();
         }
         if cancellation.is_cancelled() {
             break;
@@ -1773,6 +2017,7 @@ where
                                 let turn_cancellation =
                                     agent_terminal::CancellationToken::default();
                                 active_cancellation = Some(turn_cancellation.clone());
+                                model.follow = true;
                                 model.active_turn = true;
                                 match submit(command, sender.clone(), turn_cancellation) {
                                     SubmitAction::Exit => cancellation.cancel(),
@@ -1843,12 +2088,24 @@ where
                         continue;
                     }
                     if key.code == KeyCode::PageUp {
-                        model.reduce_input(&InputEvent::ScrollUp);
+                        model.reduce_input(&InputEvent::PageUp);
                         needs_draw = true;
                         continue;
                     }
                     if key.code == KeyCode::PageDown {
-                        model.reduce_input(&InputEvent::ScrollDown);
+                        model.reduce_input(&InputEvent::PageDown);
+                        needs_draw = true;
+                        continue;
+                    }
+                    if key.code == KeyCode::End && !model.follow {
+                        model.reduce_input(&InputEvent::FollowBottom);
+                        needs_draw = true;
+                        continue;
+                    }
+                    if key.code == KeyCode::Char('o')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        model.toggle_last_card();
                         needs_draw = true;
                         continue;
                     }
@@ -1882,6 +2139,7 @@ where
                             }
                             model.history.push(prompt.clone());
                             model.history_index = None;
+                            model.follow = true;
                             model.active_turn = true;
                             let turn_cancellation = agent_terminal::CancellationToken::default();
                             active_cancellation = Some(turn_cancellation.clone());
@@ -1936,8 +2194,22 @@ where
                     model.reduce_input(&InputEvent::Resize { width, height });
                     needs_draw = true;
                 }
+                crossterm::event::Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        model.reduce_input(&InputEvent::WheelUp);
+                        needs_draw = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        model.reduce_input(&InputEvent::WheelDown);
+                        needs_draw = true;
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
+        }
+        if model.on_tick(Instant::now(), tick) {
+            needs_draw = true;
         }
     }
     Ok(())
@@ -2315,5 +2587,117 @@ mod tests {
             model.handle_overlay_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
             OverlayAction::Close
         );
+    }
+
+    #[test]
+    fn reasoning_deltas_coalesce_into_one_thinking_item() {
+        let mut model = TuiModel::default();
+        for part in ["a", "b\nc", "d"] {
+            model.reduce(&Event::ReasoningSummaryDelta(part.into()));
+        }
+        assert_eq!(
+            model.transcript,
+            vec![TranscriptItem::Thinking("ab\ncd".into())]
+        );
+        let text = body_lines(&model, 40, false)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(text, vec!["· thinking…", "  ab", "  cd"]);
+    }
+
+    #[test]
+    fn transcript_evicts_oldest_at_cap() {
+        let mut model = TuiModel::default();
+        for index in 0..(MAX_TRANSCRIPT_ITEMS + 5) {
+            model.push_item(TranscriptItem::Notification(index.to_string()));
+        }
+        assert_eq!(model.transcript.len(), MAX_TRANSCRIPT_ITEMS);
+        assert_eq!(
+            model.transcript.front(),
+            Some(&TranscriptItem::Notification("5".into()))
+        );
+    }
+
+    #[test]
+    fn tool_cards_render_one_line_and_toggle_expansion() {
+        let mut model = TuiModel::default();
+        model.reduce(&Event::ToolRequested("bash".into()));
+        model.reduce(&Event::ToolStarted("bash".into()));
+        assert_eq!(model.tool_cards.len(), 1);
+        model.reduce(&Event::ToolOutputDelta("l1\nl2\n".into()));
+        model.reduce(&Event::ToolCompleted("ok".into()));
+        let collapsed = body_lines(&model, 60, false);
+        assert_eq!(collapsed.len(), 1);
+        assert!(collapsed[0].to_string().starts_with("✓ bash"));
+        model.toggle_last_card();
+        assert!(model.tool_cards[0].expanded);
+        assert_eq!(body_lines(&model, 60, false).len(), 3);
+        model.toggle_last_card();
+        assert!(!model.tool_cards[0].expanded);
+    }
+
+    #[test]
+    fn scrolling_follows_bottom_until_user_scrolls() {
+        let mut model = TuiModel::default();
+        model.metrics.set(BodyMetrics {
+            total_rows: 50,
+            height: 10,
+        });
+        assert!(model.follow);
+        model.reduce_input(&InputEvent::PageUp);
+        assert!(!model.follow);
+        assert_eq!(model.scroll, 40 - 9);
+        model.reduce_input(&InputEvent::FollowBottom);
+        assert!(model.follow);
+        model.reduce_input(&InputEvent::WheelUp);
+        model.reduce_input(&InputEvent::PageDown);
+        assert!(model.follow);
+    }
+
+    #[test]
+    fn long_turn_sets_bell_and_usage_counts_tokens() {
+        let mut model = TuiModel::default();
+        model.reduce(&Event::TurnStarted);
+        model.reduce(&Event::UsageUpdated("input=1 output=2 total=3".into()));
+        assert_eq!(model.live.turn_tokens, 3);
+        model.live.started = Instant::now().checked_sub(Duration::from_secs(11));
+        model.reduce(&Event::TurnCompleted);
+        assert!(model.take_bell());
+        assert!(!model.take_bell());
+        model.reduce(&Event::TurnStarted);
+        model.reduce(&Event::TurnCompleted);
+        assert!(!model.take_bell());
+    }
+
+    #[test]
+    fn footer_renders_status_line_truncated_at_40_columns() {
+        use ratatui::backend::TestBackend;
+        let mut model = TuiModel {
+            model: Some("claude-sonnet".into()),
+            permission_mode: Some("workspace-write".into()),
+            context_percent: Some(42),
+            branch: Some("main".into()),
+            ..TuiModel::default()
+        };
+        model.status = "ready".into();
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        terminal
+            .draw(|frame| render_frame(frame, &model, TuiSettings::default()))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let row = |y: u16| {
+            (0..40)
+                .map(|x| buffer[(x, y)].symbol().to_owned())
+                .collect::<String>()
+        };
+        assert!(row(10).starts_with("ready"), "{:?}", row(10));
+        let status = row(11);
+        assert!(
+            status.starts_with("claude-sonnet · workspace-write"),
+            "{status:?}"
+        );
+        assert!(!status.contains("main"));
+        assert!(model.metrics.get().height > 0);
     }
 }

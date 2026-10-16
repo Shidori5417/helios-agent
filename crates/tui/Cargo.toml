@@ -7,5 +7,5 @@ license.workspace = true
 [dependencies]
 agent-protocol = { path = "../protocol" }
 agent-terminal = { path = "../terminal" }
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true
