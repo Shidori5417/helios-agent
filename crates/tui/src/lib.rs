@@ -1,6 +1,9 @@
+mod assist;
 mod composer;
+mod mention;
 pub mod status;
 
+pub use assist::ReverseSearch;
 pub use composer::{Composer, ComposerAction};
 
 use agent_protocol::Event;
@@ -34,6 +37,16 @@ use std::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TuiModel {
+    /// Workspace-relative files for the `@` popup, built lazily on first use.
+    pub file_index: Option<Vec<String>>,
+    pub mention_query: String,
+    pub mention_selected: usize,
+    /// Start of an `@` token whose popup the user closed with Esc.
+    pub mention_dismissed: Option<usize>,
+    pub reverse_search: Option<ReverseSearch>,
+    /// Set at the start of a turn so its first delta opens a new assistant item.
+    pub assistant_break: bool,
+    pub workspace_root: Option<std::path::PathBuf>,
     pub status: String,
     pub transcript: VecDeque<TranscriptItem>,
     pub tool: Option<String>,
@@ -90,6 +103,13 @@ pub struct TuiModel {
 impl Default for TuiModel {
     fn default() -> Self {
         Self {
+            file_index: None,
+            mention_query: String::new(),
+            mention_selected: 0,
+            mention_dismissed: None,
+            reverse_search: None,
+            assistant_break: false,
+            workspace_root: None,
             status: String::new(),
             transcript: VecDeque::new(),
             tool: None,
@@ -815,7 +835,7 @@ impl TuiModel {
             );
         }
         if overlay.kind == OverlayKind::Keybindings {
-            return "Keybindings\nEnter submit · Alt+Enter newline · Ctrl-C cancel\nEsc close · PageUp/PageDown scroll · Ctrl-L redraw".into();
+            return "Keybindings\nEnter submit · Alt+Enter newline · Ctrl-C cancel\nEsc close · PageUp/PageDown scroll · Ctrl-L redraw\n@path file mention: Up/Down select · Tab/Enter insert · Esc close\nCtrl-R reverse history search (Ctrl-R older · Enter use · Esc cancel)\nShift-Tab toggle plan (read-only) / workspace-write".into();
         }
         if matches!(
             overlay.kind,
@@ -1017,6 +1037,8 @@ impl TuiModel {
 
     pub fn set_runtime_context(&mut self, context: TuiContext) {
         self.workspace = context.workspace;
+        self.workspace_root = context.workspace_root;
+        self.file_index = None;
         self.branch = context.branch;
         self.dirty_files = context.dirty_files;
         self.model = context.model;
@@ -1094,7 +1116,10 @@ impl TuiModel {
         if delta.is_empty() {
             return;
         }
-        if let Some(TranscriptItem::Assistant(text)) = self.transcript.back_mut() {
+        let continues = !std::mem::take(&mut self.assistant_break);
+        if let Some(TranscriptItem::Assistant(text)) =
+            self.transcript.back_mut().filter(|_| continues)
+        {
             let remaining = MAX_STREAM_ITEM_BYTES.saturating_sub(text.len());
             text.extend(delta.chars().take(remaining));
             return;
@@ -1126,6 +1151,7 @@ impl TuiModel {
     pub fn reduce(&mut self, event: &Event) {
         match event {
             Event::TurnStarted => {
+                self.assistant_break = true;
                 self.status = "turn started".into();
                 self.active_turn = true;
                 self.live.start_turn(Instant::now());
@@ -1184,6 +1210,7 @@ impl TuiModel {
                 self.open_permission(parse_permission_prompt(request));
             }
             Event::ContextCompacted(summary) => self.context = Some(summary.clone()),
+            Event::PermissionModeChanged(mode) => self.permission_mode = Some(mode.clone()),
             Event::SessionReset(summary) => {
                 self.transcript.clear();
                 self.tool_cards.clear();
@@ -1378,6 +1405,8 @@ pub fn bounded_event_channel(capacity: usize) -> (SyncSender<Event>, Receiver<Ev
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TuiContext {
     pub workspace: Option<String>,
+    /// Canonical workspace root used to index files for `@` mentions.
+    pub workspace_root: Option<std::path::PathBuf>,
     pub branch: Option<String>,
     pub dirty_files: Option<usize>,
     pub model: Option<String>,
@@ -1454,6 +1483,49 @@ fn header_text(model: &TuiModel, mode: LayoutMode) -> String {
         text = text.chars().take(70).collect();
     }
     text
+}
+
+fn render_mention_popup(
+    frame: &mut ratatui::Frame<'_>,
+    model: &TuiModel,
+    composer_area: Rect,
+    top: u16,
+) {
+    let matches = model.mention_matches();
+    if matches.is_empty() {
+        return;
+    }
+    let height = (matches.len() as u16 + 2).min(composer_area.y.saturating_sub(top));
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: composer_area.x,
+        y: composer_area.y - height,
+        width: composer_area.width.min(72),
+        height,
+    };
+    let inner = usize::from(area.width.saturating_sub(2));
+    let selected = model.mention_selected.min(matches.len() - 1);
+    let lines: Vec<ratatui::text::Line<'static>> = matches
+        .iter()
+        .take(usize::from(height - 2))
+        .enumerate()
+        .map(|(index, path)| {
+            let style = if index == selected {
+                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ratatui::text::Line::styled(path.chars().take(inner).collect::<String>(), style)
+        })
+        .collect();
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("Files")),
+        area,
+    );
 }
 
 fn render_slash_popup(
@@ -1632,25 +1704,41 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
             .scroll((top.min(usize::from(u16::MAX)) as u16, 0)),
         chunks[1],
     );
+    let reverse_prompt = model.reverse_prompt();
     let first_row = (composer_layout.cursor_row + 1).saturating_sub(composer_rows);
-    let composer_lines: Vec<ratatui::text::Line<'static>> = composer_layout
-        .rows
-        .iter()
-        .skip(first_row)
-        .take(composer_rows)
-        .map(|row| ratatui::text::Line::from(row.clone()))
-        .collect();
+    let composer_lines: Vec<ratatui::text::Line<'static>> = match &reverse_prompt {
+        Some(prompt) => vec![ratatui::text::Line::from(
+            prompt
+                .chars()
+                .take(usize::from(chunks[2].width.saturating_sub(2)))
+                .collect::<String>(),
+        )],
+        None => composer_layout
+            .rows
+            .iter()
+            .skip(first_row)
+            .take(composer_rows)
+            .map(|row| ratatui::text::Line::from(row.clone()))
+            .collect(),
+    };
     frame.render_widget(
         Paragraph::new(Text::from(composer_lines))
             .block(Block::default().borders(Borders::ALL).title("Composer")),
         chunks[2],
     );
     if model.overlay.is_none() {
-        let cursor_x = (chunks[2].x + 1 + composer_layout.cursor_col as u16)
-            .min(chunks[2].right().saturating_sub(2));
-        let cursor_y = chunks[2].y + 1 + (composer_layout.cursor_row - first_row) as u16;
-        frame.set_cursor_position((cursor_x, cursor_y));
+        let (cursor_col, cursor_row) = match &reverse_prompt {
+            Some(prompt) => (prompt.chars().count(), 0),
+            None => (
+                composer_layout.cursor_col,
+                composer_layout.cursor_row - first_row,
+            ),
+        };
+        let cursor_x =
+            (chunks[2].x + 1 + cursor_col as u16).min(chunks[2].right().saturating_sub(2));
+        frame.set_cursor_position((cursor_x, chunks[2].y + 1 + cursor_row as u16));
         render_slash_popup(frame, model, chunks[2], chunks[1].y);
+        render_mention_popup(frame, model, chunks[2], chunks[1].y);
     }
     let footer_width = usize::from(chunks[3].width);
     let activity = if model.active_turn {
@@ -2054,6 +2142,24 @@ where
                         needs_draw = true;
                         continue;
                     }
+                    if model.handle_reverse_key(key) || model.handle_mention_key(key) {
+                        needs_draw = true;
+                        continue;
+                    }
+                    if key.code == KeyCode::BackTab && !model.active_turn {
+                        if let Some(command) = model.permission_cycle() {
+                            let turn_cancellation = agent_terminal::CancellationToken::default();
+                            active_cancellation = Some(turn_cancellation.clone());
+                            model.active_turn = true;
+                            if submit(command.into(), sender.clone(), turn_cancellation)
+                                == SubmitAction::Exit
+                            {
+                                cancellation.cancel();
+                            }
+                        }
+                        needs_draw = true;
+                        continue;
+                    }
                     if key.code == KeyCode::Up
                         && !model.active_turn
                         && model.composer.wants_history_up(&model.palette)
@@ -2183,6 +2289,7 @@ where
                             needs_draw = true;
                         }
                         ComposerAction::None => {
+                            model.refresh_mentions();
                             needs_draw = true;
                         }
                     }
@@ -2699,5 +2806,25 @@ mod tests {
         );
         assert!(!status.contains("main"));
         assert!(model.metrics.get().height > 0);
+    }
+
+    #[test]
+    fn each_turn_opens_a_new_assistant_item() {
+        let mut model = TuiModel::default();
+        for text in ["first", "second"] {
+            model.reduce(&Event::TurnStarted);
+            model.reduce(&Event::ModelDelta(text.into()));
+            model.reduce(&Event::ModelDelta(" more".into()));
+            model.reduce(&Event::TurnCompleted);
+        }
+        let items: Vec<_> = model
+            .transcript
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::Assistant(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items, vec!["first more", "second more"]);
     }
 }

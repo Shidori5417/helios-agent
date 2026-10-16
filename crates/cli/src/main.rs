@@ -3282,13 +3282,19 @@ fn interactive_command_with_resume(selector: Option<String>) -> Result<(), Strin
                     &["set-mode".into(), "read-only".into()],
                     &project_config_path,
                 );
-                Some(result.map(|_| "plan mode enabled: reads/search/review only".into()).unwrap_or_else(|error| error))
+                Some(result.map(|_| {
+                    let _ = events.send(agent_protocol::Event::PermissionModeChanged("ReadOnly".into()));
+                    "plan mode enabled: reads/search/review only".into()
+                }).unwrap_or_else(|error| error))
             } else if command == "/permissions workspace-write" {
                 let result = runtime_permissions_command(
                     &["set-mode".into(), "workspace-write".into()],
                     &project_config_path,
                 );
-                Some(result.map(|_| "permission mode=workspace-write".into()).unwrap_or_else(|error| error))
+                Some(result.map(|_| {
+                    let _ = events.send(agent_protocol::Event::PermissionModeChanged("WorkspaceWrite".into()));
+                    "permission mode=workspace-write".into()
+                }).unwrap_or_else(|error| error))
             } else if command == "/review" || command.starts_with("/review ") {
                 let focus = command.strip_prefix("/review ").unwrap_or("general");
                 let variant = "worktree";
@@ -4005,6 +4011,7 @@ fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext {
         })
         .unwrap_or_default();
     agent_tui::TuiContext {
+        workspace_root: Some(paths.workspace.clone()),
         workspace: Some(
             paths
                 .workspace
@@ -5322,6 +5329,7 @@ fn event_record(event: &agent_protocol::Event) -> (&'static str, String) {
         Event::PermissionRequested(value) => ("permission_requested", value.clone()),
         Event::ContextCompacted(value) => ("context_compacted", value.clone()),
         Event::SessionReset(value) => ("session_reset", value.clone()),
+        Event::PermissionModeChanged(value) => ("permission_mode", value.clone()),
         Event::TurnStarted => ("turn_started", String::new()),
         Event::TurnCompleted => ("turn_completed", String::new()),
     }

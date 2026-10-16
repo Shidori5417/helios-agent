@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Interactive TUI: `@path` file mentions with a fuzzy popup (bounded,
+  symlink-safe index built on first use), Ctrl+R reverse history search and
+  Shift+Tab to toggle plan (read-only) and workspace-write. The header now
+  follows permission-mode changes (`PermissionModeChanged` event), and each
+  turn opens its own assistant block instead of appending to the last one.
+- Providers: MCP, LSP and plugin tool names such as `mcp.git.status` are sent
+  as wire-safe names (`mcp_git_status`) and mapped back on the response;
+  OpenAI and Anthropic reject dots and colons in function names.
 - Tools: added `glob`; `search_files` is now bounded (relative paths, result
   and line caps, `glob`/`ignore_case`/`max_results`, no symlink following, skips
   vendor and binary files) and no longer recurses through symlink loops;

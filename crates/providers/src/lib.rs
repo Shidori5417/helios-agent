@@ -232,6 +232,70 @@ fn system_note(message: &Message) -> String {
     }
 }
 
+/// Wire-safe function names. OpenAI and Anthropic accept only
+/// `[A-Za-z0-9_-]{1,64}`, but MCP, LSP and plugin tools are named
+/// `mcp.server.tool` / `lsp:name:tool`. Plain names pass through unchanged
+/// (keeping prompts stable); others are sanitised deterministically and
+/// de-duplicated so the response can be mapped back.
+fn wire_tool_names(tools: &[agent_protocol::ToolDefinition]) -> Vec<String> {
+    let mut used = std::collections::BTreeSet::new();
+    tools
+        .iter()
+        .map(|tool| {
+            let base = tool
+                .name
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .take(64)
+                .collect::<String>();
+            let mut candidate = if base.is_empty() {
+                "tool".to_owned()
+            } else {
+                base.clone()
+            };
+            let mut suffix = 1_usize;
+            while !used.insert(candidate.clone()) {
+                let tail = format!("_{suffix}");
+                let keep = 64_usize.saturating_sub(tail.len());
+                candidate = format!("{}{tail}", base.chars().take(keep).collect::<String>());
+                suffix += 1;
+            }
+            candidate
+        })
+        .collect()
+}
+
+fn wire_tools(tools: &[agent_protocol::ToolDefinition]) -> Vec<agent_protocol::ToolDefinition> {
+    wire_tool_names(tools)
+        .into_iter()
+        .zip(tools)
+        .map(|(name, tool)| agent_protocol::ToolDefinition {
+            name,
+            ..tool.clone()
+        })
+        .collect()
+}
+
+/// Maps tool-call names in a response back to the registered tool names.
+fn restore_tool_names(
+    mut response: ModelResponse,
+    tools: &[agent_protocol::ToolDefinition],
+) -> ModelResponse {
+    let wire = wire_tool_names(tools);
+    for call in &mut response.tool_calls {
+        if let Some(index) = wire.iter().position(|name| *name == call.name) {
+            call.name = tools[index].name.clone();
+        }
+    }
+    response
+}
+
 fn request_error() -> ProviderError {
     ProviderError::Failed("provider request failed".into())
 }
@@ -435,7 +499,7 @@ impl OpenAiProvider {
                 "content": [{"type": "input_text", "text": message.content}]
             })
         }).collect::<Vec<_>>();
-        let tools = request.tools.iter().map(|tool| json!({
+        let tools = wire_tools(&request.tools).iter().map(|tool| json!({
             "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
         })).collect::<Vec<_>>();
         let mut body = json!({"model": self.model, "input": input, "tools": tools});
@@ -465,7 +529,7 @@ impl ModelProvider for OpenAiProvider {
                 "provider returned HTTP {status}"
             )));
         }
-        parse_responses_body(body)
+        parse_responses_body(body).map(|response| restore_tool_names(response, &request.tools))
     }
 
     fn complete_streaming(
@@ -483,6 +547,7 @@ impl ModelProvider for OpenAiProvider {
             sink,
             parse_openai_stream,
         )
+        .map(|response| restore_tool_names(response, &request.tools))
     }
 }
 
@@ -664,7 +729,7 @@ impl AnthropicProvider {
                 }
             })
             .collect::<Vec<_>>();
-        let mut tools = request.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>();
+        let mut tools = wire_tools(&request.tools).iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>();
         if let Some(tool) = tools.last_mut() {
             tool["cache_control"] = cache.clone();
         }
@@ -702,7 +767,7 @@ impl ModelProvider for AnthropicProvider {
                 "provider returned HTTP {status}"
             )));
         }
-        parse_anthropic_body(body)
+        parse_anthropic_body(body).map(|response| restore_tool_names(response, &request.tools))
     }
 
     fn complete_streaming(
@@ -721,6 +786,7 @@ impl ModelProvider for AnthropicProvider {
             sink,
             parse_anthropic_stream,
         )
+        .map(|response| restore_tool_names(response, &request.tools))
     }
 }
 fn parse_anthropic_body(body: Value) -> Result<ModelResponse, ProviderError> {
@@ -872,7 +938,7 @@ impl GeminiProvider {
     fn request_body(&self, request: &ModelRequest) -> Value {
         let (system, conversation) = split_leading_system(&request.messages);
         let contents = conversation.iter().map(|message| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":system_note(message)}]})).collect::<Vec<_>>();
-        let declarations = request.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
+        let declarations = wire_tools(&request.tools).iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
         let mut body = json!({"contents":contents,"tools":[{"functionDeclarations":declarations}],"generationConfig":{"responseMimeType":"text/plain"}});
         if let Some(system) = system {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
@@ -899,7 +965,7 @@ impl ModelProvider for GeminiProvider {
                 "provider returned HTTP {status}"
             )));
         }
-        parse_gemini_body(body)
+        parse_gemini_body(body).map(|response| restore_tool_names(response, &request.tools))
     }
 
     fn complete_streaming(
@@ -923,6 +989,7 @@ impl ModelProvider for GeminiProvider {
             sink,
             parse_gemini_stream,
         )
+        .map(|response| restore_tool_names(response, &request.tools))
     }
 }
 fn parse_gemini_body(body: Value) -> Result<ModelResponse, ProviderError> {
@@ -1054,7 +1121,7 @@ impl OpenAiCompatibleProvider {
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
         let messages = request.messages.iter().map(|message| json!({"role":match message.role { Role::System=>"system",Role::Assistant=>"assistant",Role::Tool=>"tool",Role::User=>"user"},"content":message.content})).collect::<Vec<_>>();
-        let tools = request.tools.iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>();
+        let tools = wire_tools(&request.tools).iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>();
         let mut body = json!({"model":self.model,"messages":messages,"tools":tools});
         if let Some(limit) = self.tuning.max_output_tokens {
             body["max_tokens"] = json!(limit);
@@ -1078,7 +1145,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 "provider returned HTTP {status}"
             )));
         }
-        parse_chat_body(body)
+        parse_chat_body(body).map(|response| restore_tool_names(response, &request.tools))
     }
 
     fn complete_streaming(
@@ -1096,6 +1163,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
             sink,
             parse_chat_stream,
         )
+        .map(|response| restore_tool_names(response, &request.tools))
     }
 }
 fn parse_chat_body(body: Value) -> Result<ModelResponse, ProviderError> {
@@ -1498,6 +1566,64 @@ data: [DONE]
                 },
             ],
         }
+    }
+
+    fn named_tool(name: &str) -> agent_protocol::ToolDefinition {
+        agent_protocol::ToolDefinition {
+            name: name.into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[test]
+    fn tool_names_are_wire_safe_unique_and_restored() {
+        let tools = vec![
+            named_tool("read_file"),
+            named_tool("mcp.git.status"),
+            named_tool("mcp:git:status"),
+            named_tool("lsp:rust-analyzer:symbols"),
+        ];
+        let wire = wire_tool_names(&tools);
+        assert_eq!(wire[0], "read_file");
+        assert_eq!(wire[1], "mcp_git_status");
+        assert_eq!(wire[2], "mcp_git_status_1");
+        assert_eq!(wire[3], "lsp_rust-analyzer_symbols");
+        assert!(wire.iter().all(|name| !name.is_empty()
+            && name.len() <= 64
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')));
+        let response = ModelResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: String::new(),
+            },
+            tool_calls: vec![agent_protocol::ToolCall {
+                id: None,
+                name: "mcp_git_status_1".into(),
+                arguments: serde_json::json!({}),
+            }],
+        };
+        let restored = restore_tool_names(response, &tools);
+        assert_eq!(restored.tool_calls[0].name, "mcp:git:status");
+        let long = vec![named_tool(&format!("a.{}", "b".repeat(100)))];
+        assert_eq!(wire_tool_names(&long)[0].len(), 64);
+    }
+
+    #[test]
+    fn request_bodies_use_wire_names_for_every_adapter() {
+        let mut request = tuning_request();
+        request.tools = vec![named_tool("mcp.fs.read")];
+        let anthropic = AnthropicProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request);
+        assert_eq!(anthropic["tools"][0]["name"], "mcp_fs_read");
+        let openai =
+            OpenAiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        assert_eq!(openai["tools"][0]["name"], "mcp_fs_read");
+        let generic = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request);
+        assert_eq!(generic["tools"][0]["function"]["name"], "mcp_fs_read");
     }
 
     #[test]

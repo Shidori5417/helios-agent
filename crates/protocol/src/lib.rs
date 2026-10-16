@@ -56,6 +56,8 @@ pub enum Event {
     PermissionRequested(String),
     ContextCompacted(String),
     SessionReset(String),
+    /// The active permission mode changed (for example `ReadOnly`).
+    PermissionModeChanged(String),
     UsageUpdated(String),
     HookStarted(String),
     HookResult(String),
