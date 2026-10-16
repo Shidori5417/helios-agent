@@ -335,6 +335,7 @@ pub struct AgentLoop<P> {
     compactor: Option<Box<dyn Compactor>>,
     hooks: Option<Box<dyn HookRunner>>,
     steering: Option<SteeringChannel>,
+    system_prompt: Option<String>,
 }
 
 impl<P> AgentLoop<P>
@@ -352,7 +353,30 @@ where
             compactor: None,
             hooks: None,
             steering: None,
+            system_prompt: None,
         }
+    }
+
+    /// Sets the stable system prompt sent first in every request. It is kept
+    /// outside the session transcript so it never gets compacted or dropped
+    /// and the provider prompt-cache prefix stays byte-identical across turns.
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        let prompt = prompt.into();
+        self.system_prompt = (!prompt.trim().is_empty()).then_some(prompt);
+        self
+    }
+
+    fn with_system_prefix(&self, mut messages: Vec<Message>) -> Vec<Message> {
+        if let Some(prompt) = &self.system_prompt {
+            messages.insert(
+                0,
+                Message {
+                    role: Role::System,
+                    content: prompt.clone(),
+                },
+            );
+        }
+        messages
     }
 
     pub fn with_context_budget(mut self, budget: u64) -> Self {
@@ -474,7 +498,7 @@ where
         self.run_hook(LifecycleEvent::BeforePrompt, sink)?;
         self.consume_steering();
         let request = ModelRequest {
-            messages: self.session.messages.clone(),
+            messages: self.with_system_prefix(self.session.messages.clone()),
             tools: vec![],
         };
         let mut forwarder = ProviderEventForwarder {
@@ -665,7 +689,7 @@ where
             }
             self.session.context_plan = Some(plan);
             let request = ModelRequest {
-                messages: request_messages,
+                messages: self.with_system_prefix(request_messages),
                 tools: definitions,
             };
             let mut forwarder = ProviderEventForwarder {
@@ -901,6 +925,33 @@ mod tests {
                 tool_calls: vec![],
             })
         }
+    }
+
+    #[test]
+    fn system_prompt_leads_every_request_even_after_compaction() {
+        let provider = ContextRecordingProvider { seen: Vec::new() };
+        let mut agent = AgentLoop::new(provider)
+            .with_context_budget(4)
+            .with_compactor(Box::new(agent_context::LocalCompactor))
+            .with_system_prompt("base rules");
+        let mut executor = RecordingExecutor { calls: 0 };
+        let mut sink = VecEventSink::default();
+        agent
+            .run_coding_loop(
+                "a long enough objective to exceed budget",
+                &mut executor,
+                1,
+                &mut sink,
+            )
+            .expect("loop");
+        let first = &agent.provider.seen[0].messages[0];
+        assert_eq!(first.role, Role::System);
+        assert_eq!(first.content, "base rules");
+        assert!(!agent
+            .session
+            .messages
+            .iter()
+            .any(|message| message.content == "base rules"));
     }
 
     #[test]

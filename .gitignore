@@ -33,3 +33,4 @@ agent-perf*.json
 .cache/
 .idea/
 .vscode/
+.claude/worktrees/

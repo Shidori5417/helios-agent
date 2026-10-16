@@ -21,6 +21,26 @@ pub enum StreamEvent {
     },
 }
 
+/// Per-session request tuning shared by all adapters. `None` keeps each
+/// provider's default so existing behaviour and prompt-cache prefixes hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestTuning {
+    /// Reasoning effort (`minimal`..`max`); `auto` or `None` sends nothing.
+    pub effort: Option<String>,
+    /// Upper bound on generated tokens for one response.
+    pub max_output_tokens: Option<u32>,
+}
+
+impl RequestTuning {
+    fn effort(&self) -> Option<&str> {
+        self.effort.as_deref().filter(|effort| *effort != "auto")
+    }
+}
+
+/// Anthropic default output cap; large enough for multi-file patches while
+/// staying under non-streaming HTTP timeouts.
+const ANTHROPIC_DEFAULT_MAX_TOKENS: u32 = 16_000;
+
 pub trait StreamSink {
     fn emit(&mut self, event: StreamEvent);
     fn is_cancelled(&self) -> bool {
@@ -183,6 +203,35 @@ pub enum ProviderError {
     Malformed(String),
 }
 
+/// Splits the leading run of system messages (the stable, cacheable prefix)
+/// from the rest. Adapters with a dedicated system field send the prefix
+/// there; later system messages (memory, steering) stay in order via
+/// [`system_note`] instead of being dropped.
+fn split_leading_system(messages: &[Message]) -> (Option<String>, Vec<&Message>) {
+    let leading = messages
+        .iter()
+        .take_while(|message| matches!(message.role, Role::System))
+        .count();
+    let system = (leading > 0).then(|| {
+        messages[..leading]
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    });
+    (system, messages[leading..].iter().collect())
+}
+
+/// Content for a conversation message; mid-conversation system messages are
+/// labelled so models without a system role in `messages` still see them.
+fn system_note(message: &Message) -> String {
+    if matches!(message.role, Role::System) {
+        format!("[system note]\n{}", message.content)
+    } else {
+        message.content.clone()
+    }
+}
+
 fn request_error() -> ProviderError {
     ProviderError::Failed("provider request failed".into())
 }
@@ -336,9 +385,15 @@ pub struct OpenAiProvider {
     api_key: String,
     endpoint: String,
     model: String,
+    tuning: RequestTuning,
 }
 
 impl OpenAiProvider {
+    /// Applies effort / output-limit tuning to every subsequent request.
+    pub fn with_tuning(mut self, tuning: RequestTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
     pub fn with_credentials(
         model: impl Into<String>,
         api_key: impl Into<String>,
@@ -349,6 +404,7 @@ impl OpenAiProvider {
             api_key: api_key.into(),
             endpoint: endpoint.into(),
             model: model.into(),
+            tuning: RequestTuning::default(),
         }
     }
     pub fn from_env(model: impl Into<String>) -> Result<Self, ProviderError> {
@@ -368,6 +424,7 @@ impl OpenAiProvider {
             api_key,
             endpoint,
             model: model.into(),
+            tuning: RequestTuning::default(),
         })
     }
 
@@ -381,7 +438,14 @@ impl OpenAiProvider {
         let tools = request.tools.iter().map(|tool| json!({
             "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
         })).collect::<Vec<_>>();
-        json!({"model": self.model, "input": input, "tools": tools})
+        let mut body = json!({"model": self.model, "input": input, "tools": tools});
+        if let Some(effort) = self.tuning.effort() {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+        if let Some(limit) = self.tuning.max_output_tokens {
+            body["max_output_tokens"] = json!(limit);
+        }
+        body
     }
 }
 
@@ -536,8 +600,14 @@ pub struct AnthropicProvider {
     api_key: String,
     endpoint: String,
     model: String,
+    tuning: RequestTuning,
 }
 impl AnthropicProvider {
+    /// Applies effort / output-limit tuning to every subsequent request.
+    pub fn with_tuning(mut self, tuning: RequestTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
     pub fn with_credentials(
         model: impl Into<String>,
         api_key: impl Into<String>,
@@ -548,6 +618,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             endpoint: endpoint.into(),
             model: model.into(),
+            tuning: RequestTuning::default(),
         }
     }
     pub fn from_env(model: impl Into<String>) -> Result<Self, ProviderError> {
@@ -567,20 +638,49 @@ impl AnthropicProvider {
             api_key,
             endpoint,
             model: model.into(),
+            tuning: RequestTuning::default(),
         })
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
-        let messages = request.messages.iter().filter(|message| !matches!(message.role, Role::System)).map(|message| json!({"role": match message.role { Role::Assistant => "assistant", _ => "user" }, "content": message.content})).collect::<Vec<_>>();
-        let system = request
-            .messages
+        // Cache breakpoints (max 4 allowed) sit on the stable prefix: the last
+        // tool definition, the system prompt, and the newest message, so each
+        // turn re-reads the previous turn's prefix from cache.
+        let cache = json!({"type": "ephemeral"});
+        let (system, conversation) = split_leading_system(&request.messages);
+        let last = conversation.len().saturating_sub(1);
+        let messages = conversation
             .iter()
-            .find(|message| matches!(message.role, Role::System))
-            .map(|message| message.content.clone());
-        let tools = request.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>();
+            .enumerate()
+            .map(|(index, message)| {
+                let role = match message.role {
+                    Role::Assistant => "assistant",
+                    _ => "user",
+                };
+                let text = system_note(message);
+                if index == last && !text.is_empty() {
+                    json!({"role": role, "content": [{"type": "text", "text": text, "cache_control": cache}]})
+                } else {
+                    json!({"role": role, "content": text})
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut tools = request.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>();
+        if let Some(tool) = tools.last_mut() {
+            tool["cache_control"] = cache.clone();
+        }
+        let max_tokens = self
+            .tuning
+            .max_output_tokens
+            .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
         let mut body =
-            json!({"model":self.model,"max_tokens":4096,"messages":messages,"tools":tools});
+            json!({"model":self.model,"max_tokens":max_tokens,"messages":messages,"tools":tools});
         if let Some(system) = system {
-            body["system"] = json!(system);
+            body["system"] = json!([{"type": "text", "text": system, "cache_control": cache}]);
+        }
+        if let Some(effort) = self.tuning.effort() {
+            // Messages API effort levels start at `low`.
+            let effort = if effort == "minimal" { "low" } else { effort };
+            body["output_config"] = json!({ "effort": effort });
         }
         body
     }
@@ -691,6 +791,19 @@ fn parse_anthropic_stream(value: &Value) -> Vec<StreamEvent> {
                 Vec::new()
             }
         }
+        "message_start" => value
+            .pointer("/message/usage")
+            .map(|usage| {
+                let tokens = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                vec![StreamEvent::Usage {
+                    input_tokens: tokens("input_tokens"),
+                    output_tokens: tokens("output_tokens"),
+                    cache_read_tokens: tokens("cache_read_input_tokens"),
+                    cache_write_tokens: tokens("cache_creation_input_tokens"),
+                    reasoning_tokens: 0,
+                }]
+            })
+            .unwrap_or_default(),
         "message_delta" => value
             .get("usage")
             .map(|usage| {
@@ -714,8 +827,14 @@ pub struct GeminiProvider {
     client: reqwest::blocking::Client,
     api_key: String,
     endpoint: String,
+    tuning: RequestTuning,
 }
 impl GeminiProvider {
+    /// Applies effort / output-limit tuning to every subsequent request.
+    pub fn with_tuning(mut self, tuning: RequestTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
     pub fn with_credentials(
         model: impl Into<String>,
         api_key: impl Into<String>,
@@ -726,6 +845,7 @@ impl GeminiProvider {
             client: http_client(),
             api_key: api_key.into(),
             endpoint: format!("{}/{model}:generateContent", base_url.into()),
+            tuning: RequestTuning::default(),
         }
     }
     pub fn from_env(model: impl Into<String>) -> Result<Self, ProviderError> {
@@ -746,12 +866,21 @@ impl GeminiProvider {
             client: http_client(),
             api_key,
             endpoint,
+            tuning: RequestTuning::default(),
         })
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
-        let contents = request.messages.iter().map(|message| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":message.content}]})).collect::<Vec<_>>();
+        let (system, conversation) = split_leading_system(&request.messages);
+        let contents = conversation.iter().map(|message| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":system_note(message)}]})).collect::<Vec<_>>();
         let declarations = request.tools.iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
-        json!({"contents":contents,"tools":[{"functionDeclarations":declarations}],"generationConfig":{"responseMimeType":"text/plain"}})
+        let mut body = json!({"contents":contents,"tools":[{"functionDeclarations":declarations}],"generationConfig":{"responseMimeType":"text/plain"}});
+        if let Some(system) = system {
+            body["systemInstruction"] = json!({"parts": [{"text": system}]});
+        }
+        if let Some(limit) = self.tuning.max_output_tokens {
+            body["generationConfig"]["maxOutputTokens"] = json!(limit);
+        }
+        body
     }
 }
 impl ModelProvider for GeminiProvider {
@@ -844,9 +973,15 @@ fn parse_gemini_stream(value: &Value) -> Vec<StreamEvent> {
                 .get("candidatesTokenCount")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            cache_read_tokens: 0,
+            cache_read_tokens: usage
+                .get("cachedContentTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             cache_write_tokens: 0,
-            reasoning_tokens: 0,
+            reasoning_tokens: usage
+                .get("thoughtsTokenCount")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
         });
     }
     if let Some(parts) = value
@@ -876,8 +1011,14 @@ pub struct OpenAiCompatibleProvider {
     api_key: String,
     endpoint: String,
     model: String,
+    tuning: RequestTuning,
 }
 impl OpenAiCompatibleProvider {
+    /// Applies effort / output-limit tuning to every subsequent request.
+    pub fn with_tuning(mut self, tuning: RequestTuning) -> Self {
+        self.tuning = tuning;
+        self
+    }
     pub fn with_credentials(
         model: impl Into<String>,
         api_key: impl Into<String>,
@@ -888,6 +1029,7 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.into(),
             endpoint: endpoint.into(),
             model: model.into(),
+            tuning: RequestTuning::default(),
         }
     }
     pub fn from_env(model: impl Into<String>) -> Result<Self, ProviderError> {
@@ -907,12 +1049,17 @@ impl OpenAiCompatibleProvider {
             api_key,
             endpoint,
             model: model.into(),
+            tuning: RequestTuning::default(),
         })
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
         let messages = request.messages.iter().map(|message| json!({"role":match message.role { Role::System=>"system",Role::Assistant=>"assistant",Role::Tool=>"tool",Role::User=>"user"},"content":message.content})).collect::<Vec<_>>();
         let tools = request.tools.iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>();
-        json!({"model":self.model,"messages":messages,"tools":tools})
+        let mut body = json!({"model":self.model,"messages":messages,"tools":tools});
+        if let Some(limit) = self.tuning.max_output_tokens {
+            body["max_tokens"] = json!(limit);
+        }
+        body
     }
 }
 impl ModelProvider for OpenAiCompatibleProvider {
@@ -1320,6 +1467,141 @@ data: [DONE]
             .contains(&ReasoningLevel::XHigh));
         assert_eq!(gemini_profile().capabilities.context_window, None);
         assert!(profile_for("not-a-provider").is_none());
+    }
+
+    fn tuning_request() -> ModelRequest {
+        ModelRequest {
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: "system".into(),
+                },
+                Message {
+                    role: Role::User,
+                    content: "first".into(),
+                },
+                Message {
+                    role: Role::User,
+                    content: "latest".into(),
+                },
+            ],
+            tools: vec![
+                agent_protocol::ToolDefinition {
+                    name: "a".into(),
+                    description: "a".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                agent_protocol::ToolDefinition {
+                    name: "b".into(),
+                    description: "b".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn anthropic_body_marks_stable_prefix_for_caching_and_maps_effort() {
+        let provider = AnthropicProvider::with_credentials("m", "k", "http://localhost");
+        let body = provider.request_body(&tuning_request());
+        assert_eq!(body["max_tokens"], 16_000);
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["system"][0]["text"], "system");
+        assert_eq!(body["messages"][0]["content"], "first");
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        let tuned = provider.with_tuning(RequestTuning {
+            effort: Some("minimal".into()),
+            max_output_tokens: Some(4_096),
+        });
+        let body = tuned.request_body(&tuning_request());
+        assert_eq!(body["max_tokens"], 4_096);
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn later_system_messages_are_kept_as_notes_not_dropped() {
+        let mut request = tuning_request();
+        request.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                content: "base".into(),
+            },
+        );
+        request.messages.insert(
+            3,
+            Message {
+                role: Role::System,
+                content: "memory".into(),
+            },
+        );
+        let anthropic = AnthropicProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request);
+        assert_eq!(anthropic["system"][0]["text"], "base\n\nsystem");
+        assert_eq!(anthropic["messages"][1]["content"], "[system note]\nmemory");
+        let gemini =
+            GeminiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        assert_eq!(
+            gemini["systemInstruction"]["parts"][0]["text"],
+            "base\n\nsystem"
+        );
+        assert_eq!(gemini["contents"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[test]
+    fn openai_body_sends_effort_only_when_explicit() {
+        let provider = OpenAiProvider::with_credentials("m", "k", "http://localhost");
+        assert!(provider
+            .request_body(&tuning_request())
+            .get("reasoning")
+            .is_none());
+        let auto = OpenAiProvider::with_credentials("m", "k", "http://localhost").with_tuning(
+            RequestTuning {
+                effort: Some("auto".into()),
+                max_output_tokens: None,
+            },
+        );
+        assert!(auto
+            .request_body(&tuning_request())
+            .get("reasoning")
+            .is_none());
+        let high = provider.with_tuning(RequestTuning {
+            effort: Some("high".into()),
+            max_output_tokens: Some(2_000),
+        });
+        let body = high.request_body(&tuning_request());
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["max_output_tokens"], 2_000);
+    }
+
+    #[test]
+    fn anthropic_message_start_reports_cache_usage() {
+        let events = parse_anthropic_stream(&serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 12,
+                "output_tokens": 1,
+                "cache_read_input_tokens": 900,
+                "cache_creation_input_tokens": 30
+            }}
+        }));
+        assert_eq!(
+            events,
+            vec![StreamEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 1,
+                cache_read_tokens: 900,
+                cache_write_tokens: 30,
+                reasoning_tokens: 0,
+            }]
+        );
     }
 
     #[test]

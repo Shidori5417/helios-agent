@@ -1,5 +1,6 @@
 use agent_context::{
-    CompactionRequest, Compactor, ContextSegment, LocalCompactor, Priority, SegmentKind, Stability,
+    load_project_instructions, CompactionRequest, Compactor, ContextSegment, LocalCompactor,
+    Priority, SegmentKind, Stability,
 };
 use agent_core::{
     AgentLoop, EventSink, ForegroundTaskController, HookRunner, LifecycleEvent, MemoryRetriever,
@@ -19,7 +20,7 @@ use agent_plugins::{HookEvent, PluginRegistry};
 use agent_protocol::{Message, Role};
 use agent_providers::{
     profile_for, AnthropicProvider, FakeProvider, GeminiProvider, ModelProvider,
-    OpenAiCompatibleProvider, OpenAiProvider,
+    OpenAiCompatibleProvider, OpenAiProvider, RequestTuning,
 };
 use agent_sandbox::PermissionMode;
 use agent_sandbox::{PermissionClass, PermissionEngine};
@@ -2463,6 +2464,18 @@ fn required_value(args: &[String], index: &mut usize, name: &str) -> Result<Stri
         .ok_or_else(|| format!("{name} requires a value"))
 }
 
+/// Builds provider request tuning from the session effort and the optional
+/// `HELIOS_MAX_OUTPUT_TOKENS` override (useful for models with small output caps).
+fn request_tuning(effort: Option<&str>) -> RequestTuning {
+    RequestTuning {
+        effort: effort.map(str::to_owned),
+        max_output_tokens: env::var("HELIOS_MAX_OUTPUT_TOKENS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0),
+    }
+}
+
 fn validate_effort(value: &str) -> Result<(), String> {
     if matches!(
         value,
@@ -4132,7 +4145,18 @@ fn slash_command_output(command: &str) -> Option<String> {
                 .map(|model| format!("model={model}"))
                 .unwrap_or_else(|| "model=unavailable".into())
         }),
-        "/effort" => Some("effort=provider-default (no session override)".into()),
+        "/effort" => Some(
+            app_paths()
+                .ok()
+                .and_then(|paths| {
+                    let db = Database::open(&paths.db_path).ok()?;
+                    let workspace = paths.workspace.display().to_string();
+                    let session = db.latest_session(&workspace).ok()??;
+                    db.session_override(session.id, &workspace).ok()??.effort
+                })
+                .map(|effort| format!("effort={effort} (session override)"))
+                .unwrap_or_else(|| "effort=provider-default (no session override)".into()),
+        ),
         "/usage" => app_paths().ok().and_then(|paths| {
             let db = Database::open(&paths.db_path).ok()?;
             let session = db
@@ -5026,7 +5050,8 @@ fn run_selected_provider(
                     .clone()
                     .or_else(|| env::var("OPENAI_BASE_URL").ok())
                     .unwrap_or_else(|| "https://api.openai.com/v1/responses".into()),
-            ),
+            )
+            .with_tuning(request_tuning(options.effort.as_deref())),
             tools,
             database,
             session_id,
@@ -5050,7 +5075,8 @@ fn run_selected_provider(
                     .clone()
                     .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
                     .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
-            ),
+            )
+            .with_tuning(request_tuning(options.effort.as_deref())),
             tools,
             database,
             session_id,
@@ -5076,7 +5102,8 @@ fn run_selected_provider(
                     .unwrap_or_else(|| {
                         "https://generativelanguage.googleapis.com/v1beta/models".into()
                     }),
-            ),
+            )
+            .with_tuning(request_tuning(options.effort.as_deref())),
             tools,
             database,
             session_id,
@@ -5100,7 +5127,8 @@ fn run_selected_provider(
                     .clone()
                     .or_else(|| env::var("GENERIC_BASE_URL").ok())
                     .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into()),
-            ),
+            )
+            .with_tuning(request_tuning(options.effort.as_deref())),
             tools,
             database,
             session_id,
@@ -5117,6 +5145,22 @@ fn run_selected_provider(
         ),
         other => Err(format!("unknown provider: {other}")),
     }
+}
+
+/// Stable system prompt: base rules, a role overlay, then bounded project
+/// instructions (`AGENTS.md`, `.helios/AGENTS.md`). Built once per run so the
+/// provider prompt-cache prefix stays byte-identical across turns.
+fn system_prompt(overlay: &str, root: &Path) -> String {
+    let mut sections = vec![
+        include_str!("../../../prompts/SYSTEM.md").trim().to_owned(),
+        overlay.trim().to_owned(),
+    ];
+    if let Some(instructions) = load_project_instructions(root) {
+        sections.push(format!(
+            "Repository instructions follow. Apply them unless they conflict with the rules above or with workspace, network and approval restrictions.\n\n{instructions}"
+        ));
+    }
+    sections.join("\n\n")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5142,7 +5186,11 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
         .with_context_budget(context_budget)
         .with_memory_scope(memory_scope)
         .with_memory_retriever(Box::new(StaticMemory(startup_memory)))
-        .with_compactor(Box::new(LocalCompactor));
+        .with_compactor(Box::new(LocalCompactor))
+        .with_system_prompt(system_prompt(
+            include_str!("../../../prompts/CODING_AGENT.md"),
+            &workspace_root()?,
+        ));
     if let Some(steering) = steering {
         agent = agent.with_steering(steering);
     }
@@ -9027,7 +9075,8 @@ impl agent_subagents::Executor for RealSubagentExecutor {
                             .clone()
                             .or_else(|| env::var("OPENAI_BASE_URL").ok())
                             .unwrap_or_else(|| "https://api.openai.com/v1/responses".into()),
-                    ),
+                    )
+                    .with_tuning(request_tuning(None)),
                     task,
                     &prompt,
                     cancellation,
@@ -9043,7 +9092,8 @@ impl agent_subagents::Executor for RealSubagentExecutor {
                             .clone()
                             .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
                             .unwrap_or_else(|| "https://api.anthropic.com/v1/messages".into()),
-                    ),
+                    )
+                    .with_tuning(request_tuning(None)),
                     task,
                     &prompt,
                     cancellation,
@@ -9061,7 +9111,8 @@ impl agent_subagents::Executor for RealSubagentExecutor {
                             .unwrap_or_else(|| {
                                 "https://generativelanguage.googleapis.com/v1beta/models".into()
                             }),
-                    ),
+                    )
+                    .with_tuning(request_tuning(None)),
                     task,
                     &prompt,
                     cancellation,
@@ -9077,7 +9128,8 @@ impl agent_subagents::Executor for RealSubagentExecutor {
                             .clone()
                             .or_else(|| env::var("GENERIC_BASE_URL").ok())
                             .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into()),
-                    ),
+                    )
+                    .with_tuning(request_tuning(None)),
                     task,
                     &prompt,
                     cancellation,
@@ -9133,7 +9185,12 @@ fn execute_subagent_provider<P: ModelProvider>(
         Ok(tools) => tools,
         Err(error) => return failed_subagent(task, error),
     };
-    let mut agent = AgentLoop::new(provider).with_context_budget(task.budgets.max_tokens);
+    let mut agent = AgentLoop::new(provider)
+        .with_context_budget(task.budgets.max_tokens)
+        .with_system_prompt(system_prompt(
+            include_str!("../../../prompts/SUBAGENT.md"),
+            &root,
+        ));
     let mut sink = SubagentSink {
         events: Vec::new(),
         cancellation,

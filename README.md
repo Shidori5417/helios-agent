@@ -72,7 +72,11 @@ stderr and failed/cancelled executions return a non-zero exit status.
 
 Provider adapters resolve credentials keyring-first through `auth login PROVIDER`, with separate environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, or `GENERIC_API_KEY`) as an explicit compatibility fallback. Their `*_BASE_URL` variables (or CLI `--base-url`) select a test/local endpoint. Secret values are never put in errors, logs, or model context. Provider profiles expose typed tool-shape, caching, compaction, reasoning, and streaming capabilities while keeping wire formats outside core.
 
-For example: `cargo run -p agent-cli --bin helios -- --provider anthropic --model claude-3-5-sonnet "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.
+For example: `cargo run -p agent-cli --bin helios -- --provider anthropic --model claude-opus-5-5 "inspect the tests"`; network calls are opt-in through provider selection and are not made by the test suite.
+
+The session effort (`--effort` or `/effort`) is sent as OpenAI `reasoning.effort` and Anthropic `output_config.effort` (`auto` sends nothing). Anthropic requests default to `max_tokens` 16000 and place prompt-cache breakpoints on the last tool definition, the system prompt and the newest message; cache read/write tokens are reported for Anthropic, OpenAI and Gemini. Set `HELIOS_MAX_OUTPUT_TOKENS` to cap generated tokens for models with smaller output limits.
+
+Every request starts with a stable system prompt built from `prompts/SYSTEM.md`, a role overlay (`prompts/CODING_AGENT.md`, or `prompts/SUBAGENT.md` for subagents) and the workspace's `AGENTS.md` and `.helios/AGENTS.md` (each capped at 16 KiB, read only when it resolves inside the canonical workspace). The prompt is kept outside the transcript, so compaction never drops it and the cache prefix stays byte-identical. Later system messages such as memory or steering are forwarded as labelled notes instead of being dropped by adapters with a single system field.
 
 Context planning is provider-neutral: `ContextSegment`/`ContextPlan` provide deterministic ordering, bounded selection, stable-prefix fingerprints, saturating usage accounting, and a compaction boundary.
 

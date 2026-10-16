@@ -2,6 +2,52 @@ use std::cmp::Ordering;
 
 pub const DEFAULT_TOOL_OUTPUT_BYTES: usize = 8 * 1024;
 
+/// Per-file cap for project instruction files injected into the system prompt.
+pub const PROJECT_INSTRUCTIONS_FILE_BYTES: usize = 16 * 1024;
+/// Workspace-relative project instruction files, most general first.
+pub const PROJECT_INSTRUCTION_FILES: &[&str] = &["AGENTS.md", ".helios/AGENTS.md"];
+
+/// Loads bounded project instruction files (`AGENTS.md`, `.helios/AGENTS.md`)
+/// from the canonical workspace root. Files that resolve outside the root
+/// (e.g. through a symlink), are not regular files, or are not UTF-8 are
+/// skipped. Oversized files are truncated on a char boundary with a marker.
+pub fn load_project_instructions(root: &std::path::Path) -> Option<String> {
+    let root = root.canonicalize().ok()?;
+    let mut sections = Vec::new();
+    for name in PROJECT_INSTRUCTION_FILES {
+        let Ok(path) = root.join(name).canonicalize() else {
+            continue;
+        };
+        if !path.starts_with(&root) || !path.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut end = text.len().min(PROJECT_INSTRUCTIONS_FILE_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = if end < text.len() {
+            "\n[truncated]"
+        } else {
+            ""
+        };
+        sections.push(format!(
+            "<project-instructions source=\"{name}\">\n{}{truncated}\n</project-instructions>",
+            &text[..end]
+        ));
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum SegmentKind {
     System,
@@ -276,6 +322,36 @@ impl Compactor for LocalCompactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_instructions_are_bounded_and_contained() {
+        let root = std::env::temp_dir().join(format!("agent-context-instr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".helios")).expect("fixture");
+        assert_eq!(load_project_instructions(&root), None);
+        std::fs::write(root.join("AGENTS.md"), "Run cargo test.\n").expect("agents");
+        std::fs::write(
+            root.join(".helios/AGENTS.md"),
+            "é".repeat(PROJECT_INSTRUCTIONS_FILE_BYTES),
+        )
+        .expect("local");
+        let loaded = load_project_instructions(&root).expect("instructions");
+        assert!(loaded.starts_with("<project-instructions source=\"AGENTS.md\">\nRun cargo test."));
+        assert!(loaded.contains("source=\".helios/AGENTS.md\""));
+        assert!(loaded.contains("[truncated]"));
+        assert!(loaded.len() < 2 * PROJECT_INSTRUCTIONS_FILE_BYTES);
+        #[cfg(unix)]
+        {
+            let outside = root.with_extension("outside");
+            std::fs::write(&outside, "secret").expect("outside");
+            std::fs::remove_file(root.join("AGENTS.md")).expect("remove");
+            std::os::unix::fs::symlink(&outside, root.join("AGENTS.md")).expect("symlink");
+            let loaded = load_project_instructions(&root).expect("local only");
+            assert!(!loaded.contains("secret"));
+            let _ = std::fs::remove_file(outside);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
     #[test]
     fn plan_and_fingerprint_are_deterministic() {
         let a = ContextSegment::new(

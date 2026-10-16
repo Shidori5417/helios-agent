@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Security: dangling symlinks can no longer redirect workspace writes outside
+  the workspace; the terminal is restored when a release build panics.
+- Providers send the session effort (OpenAI `reasoning.effort`, Anthropic
+  `output_config.effort`), Anthropic prompt-cache breakpoints and a 16000
+  `max_tokens` default; cache read/write usage is reported.
+- The agent now sends a stable system prompt with bounded `AGENTS.md`
+  project instructions; Anthropic/Gemini no longer drop later system messages.
 - Fixed `helios --db-path PATH exec ...` (and other run options placed before
   `run`/`exec`) being parsed as a non-exec run with `exec` as prompt text.
 - Fixed `clippy::manual_option_zip` under Rust 1.97 so the CI lint gate passes.
