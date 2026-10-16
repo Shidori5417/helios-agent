@@ -480,7 +480,15 @@ mod tests {
             .expect("pid number");
         let mut gone = false;
         for _ in 0..20 {
-            if !std::path::PathBuf::from(format!("/proc/{pid}")).exists() {
+            // A killed orphan may linger as a zombie when PID 1 does not reap
+            // (common in containers); it no longer runs, so treat it as gone.
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next().map(str::to_owned))
+                });
+            if state.is_none_or(|state| state == "Z" || state == "X") {
                 gone = true;
                 break;
             }

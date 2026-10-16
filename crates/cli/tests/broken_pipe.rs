@@ -29,17 +29,20 @@ fn help_pipe_closure_is_clean() {
 
 #[test]
 fn sessions_pipe_closure_is_clean() {
-    exits_cleanly_after_stdout_consumer_closes(&["sessions", "list"]);
+    let workspace = temp_workspace();
+    let db_path_arg = workspace.join("sessions.db").to_string_lossy().into_owned();
+    exits_cleanly_after_stdout_consumer_closes(&[
+        "sessions",
+        "list",
+        "--db-path",
+        db_path_arg.as_str(),
+    ]);
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 #[test]
 fn stream_exec_pipe_closure_is_clean() {
-    let workspace = std::env::temp_dir().join(format!(
-        "helios-broken-pipe-{}-{}",
-        std::process::id(),
-        unique_suffix()
-    ));
-    std::fs::create_dir(&workspace).expect("create workspace");
+    let workspace = temp_workspace();
     let workspace_arg = workspace.to_string_lossy().into_owned();
     let db_path = workspace.join("sessions.db");
     let db_path_arg = db_path.to_string_lossy().into_owned();
@@ -57,6 +60,16 @@ fn stream_exec_pipe_closure_is_clean() {
     ];
     exits_cleanly_after_stdout_consumer_closes(&args);
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+fn temp_workspace() -> std::path::PathBuf {
+    let workspace = std::env::temp_dir().join(format!(
+        "helios-broken-pipe-{}-{}",
+        std::process::id(),
+        unique_suffix()
+    ));
+    std::fs::create_dir(&workspace).expect("create workspace");
+    workspace
 }
 
 fn unique_suffix() -> u128 {

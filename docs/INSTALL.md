@@ -48,11 +48,13 @@ cosign verify-blob \
   helios-x86_64-unknown-linux-gnu
 ```
 
-The workflows use the official `sigstore/cosign-installer@v4.1.0` and
-`anchore/sbom-action@v0.24.0` release tags. They are intentionally not
-invented commit pins; pinning these actions to independently verified commit
-SHAs remains supply-chain debt to resolve before treating releases as fully
-reproducible. No signing key or repository secret is used.
+Every third-party action in the CI and release workflows is pinned to a full
+commit SHA (resolved from the upstream tag with `git ls-remote`), with the tag
+kept as a trailing comment: `actions/checkout` v4, `dtolnay/rust-toolchain`
+stable, `anchore/sbom-action` v0.24.0, `sigstore/cosign-installer` v4.1.0 and
+`actions/upload-artifact` v4. Update a pin by re-resolving the tag and
+replacing the SHA and comment together. Workflow tokens default to
+`contents: read`. No signing key or repository secret is used.
 
 ## Arch package
 

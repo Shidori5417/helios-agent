@@ -1642,7 +1642,7 @@ fn default_run_options(
 }
 
 fn parse_args(args: Vec<String>) -> Result<Command, String> {
-    let args = extract_workspace_flag(args)?;
+    let args = hoist_run_subcommand(extract_workspace_flag(args)?);
     if args.len() == 1 && args[0] == "--version" {
         return Ok(Command::Version);
     }
@@ -1761,6 +1761,31 @@ fn parse_args(args: Vec<String>) -> Result<Command, String> {
         "status" => Ok(Command::Runtime(RuntimeCommand::Status(args[1..].to_vec()))),
         _ => parse_run(&args, false),
     }
+}
+
+/// Moves an explicit `run`/`exec` subcommand that follows leading run options
+/// (for example `helios --db-path X exec PROMPT`) to the front, so it is not
+/// mistaken for prompt text. Only known run options are skipped; anything
+/// else leaves the argument order untouched.
+fn hoist_run_subcommand(mut args: Vec<String>) -> Vec<String> {
+    let mut index = 0;
+    while let Some(arg) = args.get(index) {
+        match arg.as_str() {
+            "--provider" | "--model" | "--effort" | "--base-url" | "--db-path" | "--resume"
+            | "--output-format" | "--config" => index += 2,
+            "--tui" => index += 1,
+            _ => break,
+        }
+    }
+    if index > 0
+        && args
+            .get(index)
+            .is_some_and(|arg| matches!(arg.as_str(), "run" | "exec" | "r" | "x"))
+    {
+        let subcommand = args.remove(index);
+        args.insert(0, subcommand);
+    }
+    args
 }
 
 fn extract_workspace_flag(args: Vec<String>) -> Result<Vec<String>, String> {
@@ -3055,9 +3080,7 @@ fn interactive_command_with_resume(selector: Option<String>) -> Result<(), Strin
                                 .map(|s| s.id)
                         })
                     });
-                let result = id
-                    .and_then(|id| Database::open(&db_path).ok().map(|db| (db, id)))
-                    .map(|(db, id)| {
+                let result = Database::open(&db_path).ok().zip(id).map(|(db, id)| {
                         let previous = db.last_user_message(id).ok().flatten();
                         let boundary = db.create_boundary_before_last_exchange(
                             id,
@@ -9713,6 +9736,30 @@ mod tests {
                 argv: vec!["cargo".into(), "test".into()]
             }
         );
+    }
+
+    #[test]
+    fn run_options_before_exec_subcommand_are_accepted() {
+        let command = parse_args(vec![
+            "--db-path".into(),
+            "/tmp/sessions.db".into(),
+            "exec".into(),
+            "--output-format".into(),
+            "json".into(),
+            "prompt".into(),
+        ])
+        .expect("exec after leading options");
+        assert!(matches!(
+            command,
+            Command::Run(RunOptions {
+                exec: true,
+                output_format: OutputFormat::Json,
+                ref db_path,
+                ref prompt,
+                ..
+            }) if prompt == "prompt" && db_path == Path::new("/tmp/sessions.db")
+        ));
+        assert!(parse_args(vec!["--tui".into(), "exec".into(), "prompt".into()]).is_err());
     }
 
     #[test]

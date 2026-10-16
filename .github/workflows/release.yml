@@ -9,28 +9,30 @@ jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
       id-token: write
       actions: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - run: cargo build --release --locked --target x86_64-unknown-linux-gnu
       - run: |
           mkdir -p dist
           install -Dm755 target/x86_64-unknown-linux-gnu/release/helios dist/helios-x86_64-unknown-linux-gnu
           sha256sum dist/helios-x86_64-unknown-linux-gnu > dist/SHA256SUMS
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: dist/helios-x86_64-unknown-linux-gnu
           format: spdx-json
           output-file: dist/helios-x86_64-unknown-linux-gnu.spdx.json
           artifact-name: helios-linux-x86_64-sbom
       - name: Install cosign
-        uses: sigstore/cosign-installer@v4.1.0
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
       - name: Sign artifact with GitHub OIDC
         run: |
           cosign sign-blob --yes \
@@ -43,7 +45,7 @@ jobs:
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             --certificate-identity-regexp 'https://github.com/.+/.github/workflows/release.yml@.*' \
             dist/helios-x86_64-unknown-linux-gnu
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: helios-linux-x86_64
           path: dist/
