@@ -303,14 +303,49 @@ pub trait Compactor {
 
 #[derive(Default)]
 pub struct LocalCompactor;
+
+/// Most recent entries kept per checkpoint section; older ones are counted.
+const COMPACTION_ITEMS_PER_SECTION: usize = 8;
+/// Per-entry character cap so one huge failure cannot dominate the summary.
+const COMPACTION_ITEM_CHARS: usize = 240;
+
 impl Compactor for LocalCompactor {
+    /// Deterministic, provider-free checkpoint: keeps the newest bounded
+    /// entries of each section so the model retains what was decided, what
+    /// failed and what was verified after older turns are dropped.
     fn compact(&mut self, request: CompactionRequest) -> Result<CompactionResult, CompactionError> {
-        let summary = format!(
-            "objective={} decisions={} failures={}",
-            request.objective,
-            request.decisions.len(),
-            request.unresolved_failures.len()
-        );
+        let sections = [
+            ("constraints", &request.accepted_constraints, true),
+            ("decisions", &request.decisions, false),
+            ("failures", &request.unresolved_failures, false),
+            ("verification", &request.verification_results, true),
+        ];
+        // Single-line header first (counts; optional sections only when used),
+        // then the newest bounded entries of each non-empty section.
+        let mut summary = format!("objective={}", request.objective);
+        for (title, items, optional) in sections {
+            if !(optional && items.is_empty()) {
+                summary.push_str(&format!(" {title}={}", items.len()));
+            }
+        }
+        for (title, items, _) in sections {
+            if items.is_empty() {
+                continue;
+            }
+            let skipped = items.len().saturating_sub(COMPACTION_ITEMS_PER_SECTION);
+            summary.push_str(&format!("\n{title}:"));
+            if skipped > 0 {
+                summary.push_str(&format!(" ({skipped} older omitted)"));
+            }
+            for item in items.iter().skip(skipped) {
+                let line = item.split_whitespace().collect::<Vec<_>>().join(" ");
+                let mut line = line.chars().take(COMPACTION_ITEM_CHARS).collect::<String>();
+                if item.chars().count() > COMPACTION_ITEM_CHARS {
+                    line.push('…');
+                }
+                summary.push_str(&format!("\n- {line}"));
+            }
+        }
         Ok(CompactionResult {
             checkpoint: request,
             summary,
@@ -417,5 +452,28 @@ mod tests {
         let result = LocalCompactor.compact(request.clone()).expect("compact");
         assert_eq!(result.checkpoint, request);
         assert!(result.summary.contains("objective=fix"));
+        assert!(result
+            .summary
+            .starts_with("objective=fix constraints=1 decisions=1 failures=0 verification=1\n"));
+        assert!(result.summary.contains("decisions:\n- minimal"));
+    }
+
+    #[test]
+    fn compaction_summary_keeps_newest_bounded_entries() {
+        let request = CompactionRequest {
+            objective: "fix".into(),
+            accepted_constraints: vec![],
+            decisions: (0..20).map(|index| format!("step {index}")).collect(),
+            unresolved_failures: vec!["x".repeat(1_000)],
+            verification_results: vec![],
+            relevant_memory_ids: vec![],
+        };
+        let summary = LocalCompactor.compact(request).expect("compact").summary;
+        assert!(summary.starts_with("objective=fix decisions=20 failures=1\n"));
+        assert!(summary.contains("(12 older omitted)"));
+        assert!(!summary.contains("- step 11\n"));
+        assert!(summary.contains("- step 19"));
+        assert!(summary.contains('…'));
+        assert!(summary.len() < 2_000);
     }
 }
