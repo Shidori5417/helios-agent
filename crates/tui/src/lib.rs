@@ -1509,14 +1509,46 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
     }
 }
 
+/// Terminal state that must be undone on exit: 0 = untouched, 1 = raw mode,
+/// 2 = raw mode plus alternate screen. Read by the panic hook because the
+/// release profile uses `panic = "abort"`, which skips `Drop`.
+static TERMINAL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static PANIC_HOOK: std::sync::Once = std::sync::Once::new();
+
+fn restore_terminal(alternate_screen: bool) {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
+    if alternate_screen {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+/// Chains a panic hook that restores the terminal before the previous hook
+/// prints the panic message, so the message lands on a usable screen.
+fn install_restore_panic_hook() {
+    PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            match TERMINAL_STATE.swap(0, std::sync::atomic::Ordering::SeqCst) {
+                0 => {}
+                state => restore_terminal(state == 2),
+            }
+            previous(info);
+        }));
+    });
+}
+
 struct TerminalGuard {
     alternate_screen: bool,
 }
 impl TerminalGuard {
     fn enter(alternate_screen: bool) -> io::Result<Self> {
+        install_restore_panic_hook();
         enable_raw_mode()?;
+        TERMINAL_STATE.store(1, std::sync::atomic::Ordering::SeqCst);
         if alternate_screen {
             execute!(io::stdout(), EnterAlternateScreen)?;
+            TERMINAL_STATE.store(2, std::sync::atomic::Ordering::SeqCst);
         }
         execute!(io::stdout(), EnableBracketedPaste, Hide)?;
         Ok(Self { alternate_screen })
@@ -1524,10 +1556,8 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, Show);
-        if self.alternate_screen {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        if TERMINAL_STATE.swap(0, std::sync::atomic::Ordering::SeqCst) != 0 {
+            restore_terminal(self.alternate_screen);
         }
     }
 }
