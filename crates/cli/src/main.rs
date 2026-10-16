@@ -8580,6 +8580,12 @@ fn load_tui_settings(path: &Path) -> Result<agent_tui::TuiSettings, String> {
     if let Some(value) = table.get("alternate_screen").and_then(toml::Value::as_bool) {
         settings.alternate_screen = value;
     }
+    if let Some(value) = table.get("mouse").and_then(toml::Value::as_bool) {
+        settings.mouse = value;
+    }
+    if let Some(value) = table.get("notify").and_then(toml::Value::as_bool) {
+        settings.notify = value;
+    }
     settings.color = match table.get("color").and_then(toml::Value::as_str) {
         Some("always") => agent_tui::TuiColor::Always,
         Some("never") => agent_tui::TuiColor::Never,

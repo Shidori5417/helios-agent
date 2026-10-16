@@ -99,6 +99,15 @@ impl Palette {
         }
     }
 
+    pub fn warning_style(&self) -> Style {
+        let style = Self::fg(self.warning);
+        if self.is_mono() {
+            style.add_modifier(Modifier::BOLD)
+        } else {
+            style
+        }
+    }
+
     pub fn border_style(&self) -> Style {
         Self::fg(self.border)
     }
