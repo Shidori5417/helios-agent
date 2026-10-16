@@ -224,6 +224,7 @@ dependencies = [
  "agent-terminal",
  "crossterm",
  "ratatui",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

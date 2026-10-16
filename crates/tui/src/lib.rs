@@ -1,3 +1,7 @@
+mod composer;
+
+pub use composer::{Composer, ComposerAction};
+
 use agent_protocol::Event;
 use crossterm::{
     cursor::{Hide, Show},
@@ -415,128 +419,6 @@ impl TranscriptItem {
 
     fn size(&self) -> usize {
         self.render().len()
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Composer {
-    pub text: String,
-    pub cursor: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ComposerAction {
-    None,
-    Submit(String),
-    Cancel,
-    Exit,
-    Redraw,
-}
-
-impl Composer {
-    const MAX_INPUT_BYTES: usize = 64 * 1024;
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('c') => ComposerAction::Cancel,
-                KeyCode::Char('l') => ComposerAction::Redraw,
-                KeyCode::Char('d') if self.text.is_empty() => ComposerAction::Exit,
-                _ => ComposerAction::None,
-            };
-        }
-        if key.code == KeyCode::Esc {
-            return ComposerAction::Cancel;
-        }
-        match key.code {
-            KeyCode::Enter => {
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
-                {
-                    self.insert('\n');
-                    ComposerAction::None
-                } else if self.text.trim().is_empty() {
-                    ComposerAction::None
-                } else {
-                    let value = std::mem::take(&mut self.text);
-                    self.cursor = 0;
-                    ComposerAction::Submit(value)
-                }
-            }
-            KeyCode::Char(character) => {
-                self.insert(character);
-                ComposerAction::None
-            }
-            KeyCode::Backspace => {
-                self.backspace();
-                ComposerAction::None
-            }
-            KeyCode::Delete => {
-                self.delete();
-                ComposerAction::None
-            }
-            KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
-                ComposerAction::None
-            }
-            KeyCode::Right => {
-                if let Some((offset, _)) = self.text[self.cursor..].char_indices().nth(1) {
-                    self.cursor += offset;
-                } else {
-                    self.cursor = self.text.len();
-                }
-                ComposerAction::None
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                ComposerAction::None
-            }
-            KeyCode::End => {
-                self.cursor = self.text.len();
-                ComposerAction::None
-            }
-            _ => ComposerAction::None,
-        }
-    }
-
-    pub fn paste(&mut self, value: &str) {
-        for character in value.chars().take(Self::MAX_INPUT_BYTES) {
-            self.insert(character);
-        }
-    }
-
-    fn insert(&mut self, character: char) {
-        if self.text.len() >= Self::MAX_INPUT_BYTES {
-            return;
-        }
-        self.text.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let previous = self.text[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        self.text.drain(previous..self.cursor);
-        self.cursor = previous;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.text.len() {
-            return;
-        }
-        let end = self.text[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| self.cursor + index)
-            .unwrap_or(self.text.len());
-        self.text.drain(self.cursor..end);
     }
 }
 
@@ -1427,13 +1309,50 @@ fn header_text(model: &TuiModel, mode: LayoutMode) -> String {
     text
 }
 
-fn composer_text(model: &TuiModel, width: u16, height: u16) -> Text<'static> {
-    let mut text = model.composer.text.clone();
-    let cursor = model.composer.cursor.min(text.len());
-    text.insert(cursor, '▌');
-    let max_bytes = usize::from(width.max(1)) * usize::from(height.max(1)) * 4;
-    text.truncate(text.len().min(max_bytes));
-    Text::from(text)
+fn render_slash_popup(
+    frame: &mut ratatui::Frame<'_>,
+    model: &TuiModel,
+    composer_area: Rect,
+    top: u16,
+) {
+    let window = model.composer.popup_window(&model.palette);
+    if window.is_empty() {
+        return;
+    }
+    let height = (window.len() as u16 + 2).min(composer_area.y.saturating_sub(top));
+    if height < 3 {
+        return;
+    }
+    let area = Rect {
+        x: composer_area.x,
+        y: composer_area.y - height,
+        width: composer_area.width.min(72),
+        height,
+    };
+    let inner = usize::from(area.width.saturating_sub(2));
+    let lines: Vec<ratatui::text::Line<'static>> = window
+        .iter()
+        .take(usize::from(height - 2))
+        .map(|(command, selected)| {
+            let name = command.name.trim_start_matches('/');
+            let row: String = format!("/{name}  {}", command.description)
+                .chars()
+                .take(inner)
+                .collect();
+            let style = if *selected {
+                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ratatui::text::Line::styled(row, style)
+        })
+        .collect();
+    frame.render_widget(ratatui::widgets::Clear, area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title("Commands")),
+        area,
+    );
 }
 
 fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiSettings) {
@@ -1447,12 +1366,20 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
         );
         return;
     }
+    let composer_layout = model
+        .composer
+        .visual(usize::from(area.width.saturating_sub(2)));
+    let composer_rows = composer_layout
+        .rows
+        .len()
+        .clamp(1, usize::from((area.height / 3).max(1)))
+        .min(6);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(composer_rows as u16 + 2),
             Constraint::Length(1),
         ])
         .split(area);
@@ -1473,16 +1400,26 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+    let first_row = (composer_layout.cursor_row + 1).saturating_sub(composer_rows);
+    let composer_lines: Vec<ratatui::text::Line<'static>> = composer_layout
+        .rows
+        .iter()
+        .skip(first_row)
+        .take(composer_rows)
+        .map(|row| ratatui::text::Line::from(row.clone()))
+        .collect();
     frame.render_widget(
-        Paragraph::new(composer_text(
-            model,
-            chunks[2].width.saturating_sub(2),
-            chunks[2].height.saturating_sub(2),
-        ))
-        .block(Block::default().borders(Borders::ALL).title("Composer"))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(composer_lines))
+            .block(Block::default().borders(Borders::ALL).title("Composer")),
         chunks[2],
     );
+    if model.overlay.is_none() {
+        let cursor_x = (chunks[2].x + 1 + composer_layout.cursor_col as u16)
+            .min(chunks[2].right().saturating_sub(2));
+        let cursor_y = chunks[2].y + 1 + (composer_layout.cursor_row - first_row) as u16;
+        frame.set_cursor_position((cursor_x, cursor_y));
+        render_slash_popup(frame, model, chunks[2], chunks[1].y);
+    }
     let mut footer = model.status.clone();
     if let Some(delta) = model.changes_delta {
         footer.push_str(&format!(" · changes:{delta:+}"));
@@ -1813,7 +1750,10 @@ where
                         needs_draw = true;
                         continue;
                     }
-                    if key.code == KeyCode::Up && !model.active_turn {
+                    if key.code == KeyCode::Up
+                        && !model.active_turn
+                        && model.composer.wants_history_up(&model.palette)
+                    {
                         if let Some(index) = model.history_index {
                             if index > 0 {
                                 model.history_index = Some(index - 1);
@@ -1828,7 +1768,10 @@ where
                         needs_draw = true;
                         continue;
                     }
-                    if key.code == KeyCode::Down && !model.active_turn {
+                    if key.code == KeyCode::Down
+                        && !model.active_turn
+                        && model.composer.wants_history_down(&model.palette)
+                    {
                         if let Some(index) = model.history_index {
                             if index + 1 < model.history.len() {
                                 model.history_index = Some(index + 1);
@@ -1852,7 +1795,7 @@ where
                         needs_draw = true;
                         continue;
                     }
-                    match model.composer.handle_key(key) {
+                    match model.composer.handle_key_with(key, &model.palette) {
                         ComposerAction::Submit(prompt) => {
                             needs_draw = true;
                             if let Some(variant) = prompt.trim().strip_prefix("/diff") {
@@ -1911,8 +1854,7 @@ where
                             if let Some(turn) = &active_cancellation {
                                 turn.cancel();
                             } else {
-                                model.composer.text.clear();
-                                model.composer.cursor = 0;
+                                model.composer.clear();
                             }
                         }
                         ComposerAction::Exit => {
@@ -1923,11 +1865,6 @@ where
                             needs_draw = true;
                         }
                         ComposerAction::None => {
-                            if model.composer.text == "/" {
-                                model.composer.text.clear();
-                                model.composer.cursor = 0;
-                                model.open_overlay(OverlayKind::Palette);
-                            }
                             needs_draw = true;
                         }
                     }

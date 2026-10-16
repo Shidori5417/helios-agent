@@ -9,3 +9,4 @@ agent-protocol = { path = "../protocol" }
 agent-terminal = { path = "../terminal" }
 ratatui.workspace = true
 crossterm.workspace = true
+unicode-width = "0.2"
