@@ -16,6 +16,7 @@ static OUTPUT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 pub const CORE_TOOL_NAMES: &[&str] = &[
     "read_file",
     "search_files",
+    "glob",
     "apply_patch",
     "shell",
     "process",
@@ -248,7 +249,9 @@ pub enum ToolError {
     Io(#[from] std::io::Error),
     #[error("terminal failed: {0}")]
     Terminal(#[from] agent_terminal::TerminalError),
-    #[error("patch conflict: file changed since it was read")]
+    #[error(
+        "patch conflict: the expected text was not found in the current file; re-read it and retry"
+    )]
     PatchConflict,
     #[error("approval denied or timed out")]
     Approval(String),
@@ -314,6 +317,16 @@ impl agent_core::ToolExecutor for ToolRegistry {
                         _ => agent_core::ToolFailureKind::PermissionDenied,
                     },
                     ToolError::UnknownTool(_) => agent_core::ToolFailureKind::InvalidInput,
+                    ToolError::Io(io)
+                        if matches!(
+                            io.kind(),
+                            std::io::ErrorKind::NotFound
+                                | std::io::ErrorKind::PermissionDenied
+                                | std::io::ErrorKind::InvalidData
+                        ) =>
+                    {
+                        agent_core::ToolFailureKind::Recoverable
+                    }
                     ToolError::Io(_) | ToolError::Terminal(_) => agent_core::ToolFailureKind::Fatal,
                     ToolError::Approval(_) => agent_core::ToolFailureKind::PermissionDenied,
                 };
@@ -365,35 +378,94 @@ impl ToolRegistry {
     }
 
     pub fn metadata(&self, name: &str) -> Option<ToolMetadata> {
-        let read_schema = || json!({"type":"object","required":["path"]});
-        let command_schema = || json!({"type":"object","required":["program","args"],"properties":{"program":{"type":"string"},"args":{"type":"array","items":{"type":"string"}},"cwd":{"type":"string"},"requires_pty":{"type":"boolean"}}});
+        let command_schema = || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "program": {"type": "string", "description": "Executable name or path; no shell parsing, pipes or globbing"},
+                    "args": {"type": "array", "items": {"type": "string"}, "description": "Argument list passed verbatim"},
+                    "cwd": {"type": "string", "description": "Workspace-relative working directory (default: workspace root)"},
+                    "requires_pty": {"type": "boolean", "description": "Allocate a pseudo-terminal; only for programs that need one"}
+                },
+                "required": ["program", "args"],
+                "additionalProperties": false
+            })
+        };
         let (description, class, schema, parallel, budget, timeout) = match name {
             "read_file" => (
-                "Read a bounded file range",
+                "Read a UTF-8 text file, optionally a 1-based inclusive line range. Long output is cut at a line boundary with a hint naming the next start_line.",
                 PermissionClass::ReadOnly,
-                read_schema(),
-                false,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First line to return (default 1)"},
+                        "end_line": {"type": "integer", "minimum": 1, "description": "Last line to return, inclusive (default end of file)"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+                true,
                 self.output_budget,
                 self.timeout,
             ),
             "search_files" => (
-                "Search workspace text",
+                "Search file contents for a literal string; returns relative-path:line:text. Skips .git, target, node_modules, binary and very large files. Use glob to find files by name.",
                 PermissionClass::ReadOnly,
-                json!({"type":"object","required":["query"]}),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Literal text to find (not a regex)"},
+                        "path": {"type": "string", "description": "Workspace-relative directory or file to search (default: whole workspace)"},
+                        "glob": {"type": "string", "description": "Only search files whose workspace-relative path matches this glob, e.g. **/*.rs"},
+                        "ignore_case": {"type": "boolean", "description": "Case-insensitive match (default false)"},
+                        "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum matching lines to return (default 200)"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+                true,
+                self.output_budget,
+                self.timeout,
+            ),
+            "glob" => (
+                "List workspace files matching a glob (** across directories, * and ? within a name). A pattern without '/' matches file names at any depth. Sorted by path.",
+                PermissionClass::ReadOnly,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Glob relative to the workspace root, e.g. src/**/*.rs or *.toml"},
+                        "path": {"type": "string", "description": "Workspace-relative directory to restrict the listing to (default: whole workspace)"}
+                    },
+                    "required": ["pattern"],
+                    "additionalProperties": false
+                }),
                 true,
                 self.output_budget,
                 self.timeout,
             ),
             "apply_patch" => (
-                "Apply an exact preimage patch",
+                "Edit or create a file. Preferred: old_text/new_text replaces one unique snippet (replace_all for every occurrence); an empty old_text creates a new file. Alternative: expected_content/replacement swaps the whole file when expected_content equals its current content. Use exactly one form.",
                 PermissionClass::WorkspaceWrite,
-                json!({"type":"object","required":["path","expected_content","replacement"]}),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Workspace-relative file path"},
+                        "old_text": {"type": "string", "description": "Exact text to replace; must match once unless replace_all is set; empty creates a new file"},
+                        "new_text": {"type": "string", "description": "Replacement text (may be empty to delete the snippet)"},
+                        "replace_all": {"type": "boolean", "description": "Replace every occurrence of old_text (default false)"},
+                        "expected_content": {"type": "string", "description": "Whole-file form: the file's complete current content (empty for a new file)"},
+                        "replacement": {"type": "string", "description": "Whole-file form: the complete new content"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
                 false,
                 1024,
                 self.timeout,
             ),
             "shell" => (
-                "Run one direct process",
+                "Run one program with an explicit argument list (no shell parsing, pipes or globbing); returns stdout and stderr, truncated if large. Use for builds, tests and git.",
                 PermissionClass::WorkspaceWrite,
                 command_schema(),
                 false,
@@ -401,7 +473,7 @@ impl ToolRegistry {
                 self.timeout,
             ),
             "process" => (
-                "Run a cancellable process",
+                "Run one long-running or cancellable program with an explicit argument list; returns stdout and stderr.",
                 PermissionClass::Process,
                 command_schema(),
                 false,
@@ -409,9 +481,27 @@ impl ToolRegistry {
                 self.timeout,
             ),
             "update_plan" => (
-                "Update machine-readable task state",
+                "Record the current task plan. Send the full step list each time; at most one step is in_progress.",
                 PermissionClass::WorkspaceWrite,
-                json!({"type":"object"}),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "explanation": {"type": "string", "description": "Why the plan changed (optional)"},
+                        "steps": {
+                            "type": "array",
+                            "description": "Ordered plan steps",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "step": {"type": "string"},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                                },
+                                "required": ["step", "status"]
+                            }
+                        }
+                    },
+                    "required": ["steps"]
+                }),
                 false,
                 1024,
                 self.timeout,
@@ -469,6 +559,7 @@ impl ToolRegistry {
         match name {
             "read_file" => self.read_file(args),
             "search_files" => self.search_files(args),
+            "glob" => self.glob(args),
             "apply_patch" => self.apply_patch(args),
             "shell" | "process" => self.command(name, args, cancellation),
             "update_plan" => Ok(ToolOutcome {
@@ -577,23 +668,81 @@ impl ToolRegistry {
             end_line: Option<usize>,
         }
         let input: Input = parse("read_file", args)?;
-        let path = self.permissions.resolve_path(input.path)?;
-        let content = fs::read_to_string(path)?;
+        let path = self.permissions.resolve_path(&input.path)?;
+        let invalid = |reason: String| ToolError::InvalidArguments {
+            tool: "read_file".into(),
+            reason,
+        };
+        let metadata =
+            fs::metadata(&path).map_err(|error| io_failure("read_file", &input.path, &error))?;
+        if !metadata.is_file() {
+            return Err(invalid(format!("{}: not a regular file", input.path)));
+        }
+        if metadata.len() > MAX_READ_FILE_BYTES {
+            return Err(invalid(format!(
+                "{}: file is larger than {} MiB; use search_files or read a line range with a shell tool",
+                input.path,
+                MAX_READ_FILE_BYTES / (1024 * 1024)
+            )));
+        }
         let start = input.start_line.unwrap_or(1).max(1);
         let end = input.end_line.unwrap_or(usize::MAX);
-        let selected = content
-            .lines()
-            .enumerate()
-            .filter(|(index, _)| *index + 1 >= start && *index < end)
-            .map(|(_, line)| line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(bounded(
-            ToolStatus::Ok,
-            "file read",
-            selected,
-            self.output_budget,
-        ))
+        if end < start {
+            return Err(invalid(
+                "end_line must not be smaller than start_line".into(),
+            ));
+        }
+        let file =
+            fs::File::open(&path).map_err(|error| io_failure("read_file", &input.path, &error))?;
+        let mut full = String::new();
+        let mut collected_all = true;
+        for (index, line) in std::io::BufRead::lines(std::io::BufReader::new(file)).enumerate() {
+            let number = index + 1;
+            let line = line.map_err(|error| io_failure("read_file", &input.path, &error))?;
+            if number < start {
+                continue;
+            }
+            if number > end {
+                break;
+            }
+            if full.len() + line.len() + 1 > MAX_READ_COLLECT_BYTES {
+                collected_all = false;
+                break;
+            }
+            if number > start {
+                full.push('\n');
+            }
+            full.push_str(&line);
+        }
+        if collected_all && full.len() <= self.output_budget {
+            return Ok(bounded(
+                ToolStatus::Ok,
+                "file read",
+                full,
+                self.output_budget,
+            ));
+        }
+        let window = &full[..floor_char_boundary(&full, self.output_budget)];
+        let (shown, hint) = match window.rfind('\n') {
+            Some(cut) => {
+                let lines = window[..cut].matches('\n').count() + 1;
+                (
+                    window[..cut].to_owned(),
+                    format!("\n[truncated after line {}; use start_line={} to continue]", start + lines - 1, start + lines),
+                )
+            }
+            None => (
+                window.to_owned(),
+                format!("\n[line {start} exceeds the output limit and was cut; inspect it with a narrower tool]"),
+            ),
+        };
+        Ok(ToolOutcome {
+            status: ToolStatus::Ok,
+            summary: "file read".into(),
+            data: format!("{shown}{hint}"),
+            truncated: true,
+            spill_ref: bounded_spill(&full),
+        })
     }
 
     fn search_files(&self, args: Value) -> Result<ToolOutcome, ToolError> {
@@ -601,38 +750,184 @@ impl ToolRegistry {
         struct Input {
             query: String,
             path: Option<String>,
+            glob: Option<String>,
+            ignore_case: Option<bool>,
+            max_results: Option<usize>,
         }
         let input: Input = parse("search_files", args)?;
-        let root = match input.path {
-            Some(path) => self.permissions.resolve_path(path)?,
-            None => self.permissions.root().to_path_buf(),
+        if input.query.is_empty() {
+            return Err(ToolError::InvalidArguments {
+                tool: "search_files".into(),
+                reason: "query must not be empty".into(),
+            });
+        }
+        if let Some(pattern) = &input.glob {
+            validate_glob("search_files", pattern)?;
+        }
+        let max_results = input
+            .max_results
+            .unwrap_or(DEFAULT_SEARCH_RESULTS)
+            .clamp(1, 1000);
+        let ignore_case = input.ignore_case.unwrap_or(false);
+        let needle = if ignore_case {
+            input.query.to_lowercase()
+        } else {
+            input.query.clone()
         };
-        let mut hits = String::new();
-        search_recursive(&self.permissions, &root, &input.query, &mut hits)?;
-        Ok(bounded(
-            ToolStatus::Ok,
-            "search complete",
-            hits,
-            self.output_budget,
-        ))
+        let scope = self.scope("search_files", input.path.as_deref())?;
+        let root = self.permissions.root();
+        let (files, scan_cut) = walk_files(&scope);
+        let mut out = String::new();
+        let mut results = 0_usize;
+        let mut limit_hit = false;
+        'files: for file in files {
+            let relative = relative_display(root, &file);
+            if let Some(pattern) = &input.glob {
+                if !glob_match(pattern, &relative) {
+                    continue;
+                }
+            }
+            let Some(content) = read_searchable(&file) else {
+                continue;
+            };
+            for (index, text) in content.lines().enumerate() {
+                let hit = if ignore_case {
+                    text.to_lowercase().contains(&needle)
+                } else {
+                    text.contains(&needle)
+                };
+                if !hit {
+                    continue;
+                }
+                let line = format!(
+                    "{relative}:{}:{}\n",
+                    index + 1,
+                    cap_chars(text, MAX_SEARCH_LINE_CHARS)
+                );
+                if results >= max_results || out.len() + line.len() > self.output_budget {
+                    limit_hit = true;
+                    break 'files;
+                }
+                out.push_str(&line);
+                results += 1;
+            }
+        }
+        if limit_hit {
+            out.push_str(&format!(
+                "[stopped at the limit of {results} results; narrow the query, path or glob]\n"
+            ));
+        }
+        if scan_cut {
+            out.push_str(&format!(
+                "[file scan stopped after {WALK_MAX_FILES} files; narrow the path]\n"
+            ));
+        }
+        Ok(ToolOutcome {
+            status: ToolStatus::Ok,
+            summary: "search complete".into(),
+            data: out,
+            truncated: limit_hit || scan_cut,
+            spill_ref: None,
+        })
+    }
+
+    fn glob(&self, args: Value) -> Result<ToolOutcome, ToolError> {
+        #[derive(Deserialize)]
+        struct Input {
+            pattern: String,
+            path: Option<String>,
+        }
+        let input: Input = parse("glob", args)?;
+        validate_glob("glob", &input.pattern)?;
+        let scope = self.scope("glob", input.path.as_deref())?;
+        let root = self.permissions.root();
+        let (files, scan_cut) = walk_files(&scope);
+        let mut out = Vec::new();
+        let mut used = 0_usize;
+        let mut limit_hit = false;
+        for file in files {
+            let relative = relative_display(root, &file);
+            if !glob_match(&input.pattern, &relative) {
+                continue;
+            }
+            if out.len() >= MAX_GLOB_RESULTS || used + relative.len() + 1 > self.output_budget {
+                limit_hit = true;
+                break;
+            }
+            used += relative.len() + 1;
+            out.push(relative);
+        }
+        let mut data = out.join("\n");
+        if out.is_empty() {
+            data = "no files matched".into();
+        }
+        if limit_hit {
+            data.push_str(&format!(
+                "\n[stopped at {} files; use a narrower pattern or path]",
+                out.len()
+            ));
+        }
+        if scan_cut {
+            data.push_str(&format!(
+                "\n[file scan stopped after {WALK_MAX_FILES} files; narrow the path]"
+            ));
+        }
+        Ok(ToolOutcome {
+            status: ToolStatus::Ok,
+            summary: "glob complete".into(),
+            data,
+            truncated: limit_hit || scan_cut,
+            spill_ref: None,
+        })
+    }
+
+    /// Resolves an optional workspace-relative search scope to an existing path.
+    fn scope(&self, tool: &str, path: Option<&str>) -> Result<PathBuf, ToolError> {
+        let Some(path) = path else {
+            return Ok(self.permissions.root().to_path_buf());
+        };
+        let resolved = self.permissions.resolve_path(path)?;
+        if !resolved.exists() {
+            return Err(ToolError::InvalidArguments {
+                tool: tool.into(),
+                reason: format!("{path}: no such file or directory"),
+            });
+        }
+        Ok(resolved)
     }
 
     fn apply_patch(&self, args: Value) -> Result<ToolOutcome, ToolError> {
         #[derive(Deserialize)]
         struct Input {
             path: String,
-            expected_content: String,
-            replacement: String,
+            expected_content: Option<String>,
+            replacement: Option<String>,
+            old_text: Option<String>,
+            new_text: Option<String>,
+            replace_all: Option<bool>,
         }
         let input: Input = parse("apply_patch", args)?;
-        let path = self.permissions.resolve_path(input.path)?;
+        let invalid = |reason: &str| ToolError::InvalidArguments {
+            tool: "apply_patch".into(),
+            reason: reason.into(),
+        };
+        let snippet_form = input.old_text.is_some() || input.new_text.is_some();
+        let whole_form = input.expected_content.is_some() || input.replacement.is_some();
+        if snippet_form == whole_form {
+            return Err(invalid(
+                "provide either old_text and new_text, or expected_content and replacement",
+            ));
+        }
+        let path = self.permissions.resolve_path(&input.path)?;
         let current = fs::read(&path).unwrap_or_default();
         let existed = path.exists();
-        if !existed && !input.expected_content.is_empty() {
-            return Err(ToolError::InvalidArguments {
-                tool: "apply_patch".into(),
-                reason: "missing file requires empty expected_content".into(),
-            });
+        if !existed
+            && input
+                .expected_content
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+        {
+            return Err(invalid("missing file requires empty expected_content"));
         }
         if let Some(hook) = &self.snapshot_hook {
             hook(SnapshotEvent::Before {
@@ -642,25 +937,86 @@ impl ToolRegistry {
             })
             .map_err(ToolError::Approval)?;
         }
-        let current_text = String::from_utf8(current).map_err(|_| ToolError::InvalidArguments {
-            tool: "apply_patch".into(),
-            reason: "apply_patch requires UTF-8; use a binary-safe tool for binary files".into(),
+        let current_text = String::from_utf8(current).map_err(|_| {
+            invalid("apply_patch requires UTF-8; use a binary-safe tool for binary files")
         })?;
-        if current_text != input.expected_content {
-            return Err(ToolError::PatchConflict);
+        let (updated, note) = if snippet_form {
+            let old = input
+                .old_text
+                .ok_or_else(|| invalid("old_text is required with new_text"))?;
+            let new = input
+                .new_text
+                .ok_or_else(|| invalid("new_text is required with old_text"))?;
+            if old.is_empty() {
+                if existed {
+                    return Err(invalid(
+                        "old_text is empty but the file exists; provide the text to replace",
+                    ));
+                }
+                (new, "file created".to_owned())
+            } else {
+                if !existed {
+                    return Err(invalid(
+                        "file does not exist; use an empty old_text to create it",
+                    ));
+                }
+                let matches = current_text.matches(old.as_str()).count();
+                if matches == 0 {
+                    return Err(ToolError::PatchConflict);
+                }
+                let replace_all = input.replace_all.unwrap_or(false);
+                if matches > 1 && !replace_all {
+                    return Err(ToolError::InvalidArguments {
+                        tool: "apply_patch".into(),
+                        reason: format!(
+                            "old_text matches {matches} locations; include more surrounding context or set replace_all"
+                        ),
+                    });
+                }
+                let updated = if replace_all {
+                    current_text.replace(old.as_str(), &new)
+                } else {
+                    current_text.replacen(old.as_str(), &new, 1)
+                };
+                (
+                    updated,
+                    format!(
+                        "replaced {} occurrence(s)",
+                        if replace_all { matches } else { 1 }
+                    ),
+                )
+            }
+        } else {
+            let expected = input
+                .expected_content
+                .ok_or_else(|| invalid("expected_content is required with replacement"))?;
+            let replacement = input
+                .replacement
+                .ok_or_else(|| invalid("replacement is required with expected_content"))?;
+            if current_text != expected {
+                return Err(ToolError::PatchConflict);
+            }
+            (replacement, String::new())
+        };
+        if !existed {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| io_failure("apply_patch", &input.path, &error))?;
+            }
         }
-        fs::write(&path, input.replacement.as_bytes())?;
+        fs::write(&path, updated.as_bytes())
+            .map_err(|error| io_failure("apply_patch", &input.path, &error))?;
         if let Some(hook) = &self.snapshot_hook {
             let _ = hook(SnapshotEvent::After {
                 path,
-                content: input.replacement.into_bytes(),
+                content: updated.into_bytes(),
                 existed: true,
             });
         }
         Ok(bounded(
             ToolStatus::Ok,
             "patch applied",
-            "".into(),
+            note,
             self.output_budget,
         ))
     }
@@ -683,6 +1039,7 @@ impl ToolRegistry {
             Some(path) => self.permissions.resolve_path(path)?,
             None => self.permissions.root().to_path_buf(),
         };
+        let program = input.program.clone();
         let result = run(
             CommandSpec {
                 program: input.program,
@@ -695,7 +1052,14 @@ impl ToolRegistry {
                 env_allowlist: vec![],
             },
             cancellation,
-        )?;
+        )
+        .map_err(|error| match error {
+            agent_terminal::TerminalError::Start(io) => ToolError::InvalidArguments {
+                tool: name.into(),
+                reason: format!("cannot start `{program}`: {io}"),
+            },
+            other => ToolError::Terminal(other),
+        })?;
         let status = match result.status {
             CommandStatus::Exited(0) => ToolStatus::Ok,
             CommandStatus::Exited(_) => ToolStatus::Error,
@@ -789,10 +1153,203 @@ fn bounded(status: ToolStatus, summary: &str, data: String, limit: usize) -> Too
     ToolOutcome {
         status,
         summary: summary.into(),
-        data: data[..limit].to_owned(),
+        data: data[..floor_char_boundary(&data, limit)].to_owned(),
         truncated: true,
         spill_ref,
     }
+}
+
+/// Largest index `<= limit` that is a char boundary of `text`.
+fn floor_char_boundary(text: &str, limit: usize) -> usize {
+    let mut end = limit.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Largest regular file `read_file` will open.
+const MAX_READ_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Most text `read_file` collects for one request before it stops reading.
+const MAX_READ_COLLECT_BYTES: usize = 1024 * 1024;
+const DEFAULT_SEARCH_RESULTS: usize = 200;
+const MAX_SEARCH_LINE_CHARS: usize = 300;
+const MAX_SEARCH_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_GLOB_RESULTS: usize = 500;
+const WALK_MAX_FILES: usize = 20_000;
+const WALK_MAX_DEPTH: usize = 32;
+const WALK_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+];
+
+/// Maps an I/O failure to a recoverable, path-bearing tool error so a typo in
+/// a model-supplied path is reported back instead of ending the turn.
+fn io_failure(tool: &str, path: &str, error: &std::io::Error) -> ToolError {
+    use std::io::ErrorKind::*;
+    match error.kind() {
+        NotFound | PermissionDenied | InvalidData | IsADirectory | NotADirectory
+        | AlreadyExists | InvalidInput => ToolError::InvalidArguments {
+            tool: tool.into(),
+            reason: format!("{path}: {error}"),
+        },
+        _ => ToolError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{path}: {error}"),
+        )),
+    }
+}
+
+fn cap_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut capped = text.chars().take(max).collect::<String>();
+    capped.push('…');
+    capped
+}
+
+fn relative_display(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Reads a small UTF-8 text file; binary, oversized and unreadable files are skipped.
+fn read_searchable(path: &Path) -> Option<String> {
+    if fs::metadata(path).ok()?.len() > MAX_SEARCH_FILE_BYTES {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Deterministic, bounded file listing below `scope`. Symlinks are never
+/// followed (no loops, no escapes) and vendor/VCS directories are skipped.
+/// Returns the files and whether the scan stopped early.
+fn walk_files(scope: &Path) -> (Vec<PathBuf>, bool) {
+    fn visit(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+        let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if kind.is_dir() {
+                let name = entry.file_name();
+                if depth >= WALK_MAX_DEPTH
+                    || WALK_SKIP_DIRS
+                        .iter()
+                        .any(|skip| name == std::ffi::OsStr::new(skip))
+                {
+                    continue;
+                }
+                if visit(&path, depth + 1, out) {
+                    return true;
+                }
+            } else if kind.is_file() {
+                if out.len() >= WALK_MAX_FILES {
+                    return true;
+                }
+                out.push(path);
+            }
+        }
+        false
+    }
+    let mut files = Vec::new();
+    if fs::symlink_metadata(scope).is_ok_and(|meta| meta.is_file()) {
+        files.push(scope.to_path_buf());
+        return (files, false);
+    }
+    let cut = visit(scope, 0, &mut files);
+    (files, cut)
+}
+
+fn validate_glob(tool: &str, pattern: &str) -> Result<(), ToolError> {
+    let invalid = |reason: &str| ToolError::InvalidArguments {
+        tool: tool.into(),
+        reason: reason.into(),
+    };
+    if pattern.is_empty() || pattern.len() > 200 {
+        return Err(invalid("glob must be 1-200 characters"));
+    }
+    if pattern.starts_with('/') || pattern.split('/').any(|part| part == "..") {
+        return Err(invalid(
+            "glob must be workspace-relative and must not contain ..",
+        ));
+    }
+    if pattern.split('/').filter(|part| *part == "**").count() > 4 {
+        return Err(invalid("glob may contain at most four ** segments"));
+    }
+    Ok(())
+}
+
+/// Matches a workspace-relative path against a glob. `**` spans directories,
+/// `*`/`?` stay inside one name, and a pattern without `/` matches at any depth.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    fn segments(pattern: &[&str], path: &[&str]) -> bool {
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
+            Some((head, rest)) => path
+                .split_first()
+                .is_some_and(|(name, tail)| name_match(head, name) && segments(rest, tail)),
+        }
+    }
+    fn name_match(pattern: &str, name: &str) -> bool {
+        let pattern = pattern.chars().collect::<Vec<_>>();
+        let name = name.chars().collect::<Vec<_>>();
+        let (mut p, mut n) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while n < name.len() {
+            if p < pattern.len()
+                && (pattern[p] == '?' || pattern[p] == name[n])
+                && pattern[p] != '*'
+            {
+                p += 1;
+                n += 1;
+            } else if p < pattern.len() && pattern[p] == '*' {
+                star = Some((p, n));
+                p += 1;
+            } else if let Some((star_p, star_n)) = star {
+                p = star_p + 1;
+                n = star_n + 1;
+                star = Some((star_p, star_n + 1));
+            } else {
+                return false;
+            }
+        }
+        pattern[p..].iter().all(|ch| *ch == '*')
+    }
+    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+    let expanded;
+    let pattern = if pattern.contains('/') {
+        pattern
+    } else {
+        expanded = format!("**/{pattern}");
+        expanded.as_str()
+    };
+    let pattern = pattern.split('/').collect::<Vec<_>>();
+    let path = path.split('/').collect::<Vec<_>>();
+    segments(&pattern, &path)
 }
 
 fn bounded_spill(data: &str) -> Option<PathBuf> {
@@ -816,32 +1373,6 @@ fn bounded_spill(data: &str) -> Option<PathBuf> {
         let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
     Some(path)
-}
-
-fn search_recursive(
-    engine: &PermissionEngine,
-    root: &Path,
-    query: &str,
-    hits: &mut String,
-) -> Result<(), ToolError> {
-    for entry in fs::read_dir(root)? {
-        let path = entry?.path();
-        if engine.resolve_path(&path).is_err() {
-            continue;
-        }
-        if path.is_dir() {
-            search_recursive(engine, &path, query, hits)?;
-            continue;
-        }
-        if let Ok(content) = fs::read_to_string(&path) {
-            for (line, text) in content.lines().enumerate() {
-                if text.contains(query) {
-                    hits.push_str(&format!("{}:{}:{}\n", path.display(), line + 1, text));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -870,6 +1401,196 @@ mod tests {
             )
             .expect_err("conflict");
         assert!(matches!(error, ToolError::PatchConflict));
+    }
+
+    fn run_tool(
+        registry: &ToolRegistry,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolOutcome, ToolError> {
+        registry.execute(name, args, &CancellationToken::default())
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        let text = "ş".repeat(10);
+        let outcome = bounded(ToolStatus::Ok, "ok", text, 5);
+        assert!(outcome.truncated);
+        assert_eq!(outcome.data, "ş".repeat(2));
+    }
+
+    #[test]
+    fn missing_file_is_a_recoverable_tool_failure() {
+        use agent_core::ToolExecutor;
+        let root = root("missing");
+        let mut registry =
+            ToolRegistry::new(&root, PermissionMode::WorkspaceWrite).expect("registry");
+        let failure = registry
+            .execute_typed(&agent_protocol::ToolCall {
+                id: None,
+                name: "read_file".into(),
+                arguments: json!({"path": "nope.rs"}),
+            })
+            .expect_err("missing");
+        assert_eq!(failure.kind, agent_core::ToolFailureKind::Recoverable);
+        assert!(failure.message.contains("nope.rs"), "{}", failure.message);
+    }
+
+    #[test]
+    fn read_file_reports_where_to_continue_when_truncated() {
+        let root = root("read-range");
+        let body = (1..=2_000)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(root.join("big.txt"), body).expect("write");
+        let registry = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("registry");
+        let outcome = run_tool(&registry, "read_file", json!({"path": "big.txt"})).expect("read");
+        assert!(outcome.truncated);
+        assert!(outcome.data.contains("line 1\n"));
+        assert!(outcome.data.contains("use start_line="), "{}", outcome.data);
+        let tail = run_tool(
+            &registry,
+            "read_file",
+            json!({"path": "big.txt", "start_line": 1_999, "end_line": 2_000}),
+        )
+        .expect("range");
+        assert_eq!(tail.data, "line 1999\nline 2000");
+        assert!(!tail.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_ignores_symlink_loops_and_vendor_directories() {
+        let root = root("search-loop");
+        fs::create_dir_all(root.join("src")).expect("src");
+        fs::create_dir_all(root.join("target/debug")).expect("target");
+        fs::create_dir_all(root.join("node_modules/pkg")).expect("node_modules");
+        fs::write(root.join("src/lib.rs"), "fn needle() {}\n").expect("lib");
+        fs::write(root.join("target/debug/out.txt"), "needle\n").expect("target file");
+        fs::write(root.join("node_modules/pkg/index.js"), "needle\n").expect("vendor file");
+        std::os::unix::fs::symlink(&root, root.join("src/loop")).expect("loop");
+        let registry = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("registry");
+        let outcome =
+            run_tool(&registry, "search_files", json!({"query": "needle"})).expect("search");
+        assert_eq!(outcome.data.trim(), "src/lib.rs:1:fn needle() {}");
+    }
+
+    #[test]
+    fn search_is_bounded_and_supports_glob_and_ignore_case() {
+        let root = root("search-bounds");
+        fs::create_dir_all(root.join("docs")).expect("docs");
+        let many = "Match\n".repeat(500);
+        fs::write(root.join("a.txt"), &many).expect("a");
+        fs::write(root.join("docs/b.md"), "match here\n").expect("b");
+        fs::write(root.join("bin.dat"), b"match\0\x01\x02").expect("binary");
+        let registry = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("registry");
+        let limited = run_tool(
+            &registry,
+            "search_files",
+            json!({"query": "Match", "max_results": 3}),
+        )
+        .expect("search");
+        assert_eq!(limited.data.matches("a.txt:").count(), 3);
+        assert!(limited.data.contains("limit of 3 results"));
+        let filtered = run_tool(
+            &registry,
+            "search_files",
+            json!({"query": "MATCH", "ignore_case": true, "glob": "**/*.md"}),
+        )
+        .expect("search");
+        assert_eq!(filtered.data.trim(), "docs/b.md:1:match here");
+    }
+
+    #[test]
+    fn glob_matches_nested_patterns_deterministically() {
+        let root = root("glob");
+        fs::create_dir_all(root.join("src/deep")).expect("dirs");
+        for file in ["src/a.rs", "src/deep/b.rs", "src/deep/c.txt", "top.rs"] {
+            fs::write(root.join(file), "").expect("file");
+        }
+        let registry = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("registry");
+        let rust = run_tool(&registry, "glob", json!({"pattern": "**/*.rs"})).expect("glob");
+        assert_eq!(rust.data, "src/a.rs\nsrc/deep/b.rs\ntop.rs");
+        let scoped = run_tool(&registry, "glob", json!({"pattern": "src/*.rs"})).expect("glob");
+        assert_eq!(scoped.data, "src/a.rs");
+        let single =
+            run_tool(&registry, "glob", json!({"pattern": "src/deep/?.txt"})).expect("glob");
+        assert_eq!(single.data, "src/deep/c.txt");
+        assert!(run_tool(&registry, "glob", json!({"pattern": ""})).is_err());
+    }
+
+    #[test]
+    fn patch_replaces_unique_snippet_without_resending_the_file() {
+        let root = root("snippet");
+        let file = root.join("main.rs");
+        fs::write(&file, "fn a() {}\nfn b() {}\nfn c() {}\n").expect("write");
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite).expect("registry");
+        run_tool(
+            &registry,
+            "apply_patch",
+            json!({"path": "main.rs", "old_text": "fn b() {}", "new_text": "fn b() { 1 }"}),
+        )
+        .expect("snippet patch");
+        assert_eq!(
+            fs::read_to_string(&file).expect("read"),
+            "fn a() {}\nfn b() { 1 }\nfn c() {}\n"
+        );
+        let missing = run_tool(
+            &registry,
+            "apply_patch",
+            json!({"path": "main.rs", "old_text": "fn zzz", "new_text": "x"}),
+        )
+        .expect_err("missing");
+        assert!(matches!(missing, ToolError::PatchConflict));
+        fs::write(&file, "x\nx\n").expect("rewrite");
+        let ambiguous = run_tool(
+            &registry,
+            "apply_patch",
+            json!({"path": "main.rs", "old_text": "x", "new_text": "y"}),
+        )
+        .expect_err("ambiguous");
+        assert!(matches!(ambiguous, ToolError::InvalidArguments { .. }));
+        run_tool(
+            &registry,
+            "apply_patch",
+            json!({"path": "main.rs", "old_text": "x", "new_text": "y", "replace_all": true}),
+        )
+        .expect("replace all");
+        assert_eq!(fs::read_to_string(&file).expect("read"), "y\ny\n");
+        let both = run_tool(
+            &registry,
+            "apply_patch",
+            json!({"path": "main.rs", "old_text": "y", "new_text": "z", "expected_content": "y\ny\n", "replacement": "q"}),
+        )
+        .expect_err("mixed modes");
+        assert!(matches!(both, ToolError::InvalidArguments { .. }));
+    }
+
+    #[test]
+    fn tool_schemas_describe_every_parameter() {
+        let registry =
+            ToolRegistry::new(root("schemas"), PermissionMode::ReadOnly).expect("registry");
+        for name in CORE_TOOL_NAMES {
+            let schema = registry.metadata(name).expect("metadata").input_schema;
+            let properties = schema["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{name} has no properties"));
+            for (property, definition) in properties {
+                assert!(
+                    definition["description"]
+                        .as_str()
+                        .is_some_and(|text| !text.is_empty()),
+                    "{name}.{property} lacks a description"
+                );
+            }
+            for required in schema["required"].as_array().into_iter().flatten() {
+                assert!(
+                    properties.contains_key(required.as_str().unwrap_or_default()),
+                    "{name} requires undeclared {required}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -325,6 +325,9 @@ impl EventSink for VecEventSink {
     }
 }
 
+/// Consecutive recoverable tool failures tolerated before the turn is aborted.
+const MAX_CONSECUTIVE_RECOVERIES: usize = 3;
+
 pub struct AgentLoop<P> {
     provider: P,
     pub session: SessionState,
@@ -728,11 +731,12 @@ where
                 let result = match executor.execute_typed(&call) {
                     Ok(result) => result,
                     Err(error)
-                        if error.kind == ToolFailureKind::Recoverable && recovery_attempts < 2 =>
+                        if error.kind == ToolFailureKind::Recoverable
+                            && recovery_attempts < MAX_CONSECUTIVE_RECOVERIES =>
                     {
                         recovery_attempts += 1;
                         let feedback = format!(
-                            "tool error (recovery attempt {recovery_attempts}/2): {}",
+                            "tool error (recovery attempt {recovery_attempts}/{MAX_CONSECUTIVE_RECOVERIES}): {}",
                             error.message
                         );
                         let output = Event::ToolOutputDelta(feedback.clone());
@@ -765,6 +769,9 @@ where
                         return Err(CoreError::Tool(error.message));
                     }
                 };
+                // A successful call proves the model recovered; only an
+                // unbroken run of failures exhausts the budget.
+                recovery_attempts = 0;
                 let output = Event::ToolOutputDelta(result.output.clone());
                 sink.emit(output.clone());
                 self.session.events.push(output);
@@ -1077,6 +1084,7 @@ mod tests {
                 tool_response("apply_patch"),
                 tool_response("apply_patch"),
                 tool_response("apply_patch"),
+                tool_response("apply_patch"),
             ],
         };
         let mut agent = AgentLoop::new(provider);
@@ -1090,7 +1098,64 @@ mod tests {
             agent.run_coding_loop("patch", &mut executor, 8, &mut sink),
             Err(CoreError::Tool(_))
         ));
-        assert_eq!(executor.calls, 3);
+        assert_eq!(executor.calls, MAX_CONSECUTIVE_RECOVERIES + 1);
+    }
+
+    #[test]
+    fn successful_call_resets_the_recovery_budget() {
+        // Two failures, a success, then two more failures: five failures in
+        // total would exceed a per-turn cap, but never three in a row.
+        struct Alternating {
+            pattern: Vec<bool>,
+            calls: usize,
+        }
+        impl ToolExecutor for Alternating {
+            fn execute(&mut self, _call: &ToolCall) -> Result<ToolExecution, String> {
+                unreachable!("typed path only")
+            }
+            fn execute_typed(&mut self, _call: &ToolCall) -> Result<ToolExecution, ToolFailure> {
+                let fail = self.pattern[self.calls];
+                self.calls += 1;
+                if fail {
+                    Err(ToolFailure {
+                        kind: ToolFailureKind::Recoverable,
+                        message: "typo in path".into(),
+                    })
+                } else {
+                    Ok(ToolExecution {
+                        status: "ok".into(),
+                        output: "fine".into(),
+                    })
+                }
+            }
+        }
+        let provider = ScriptedProvider {
+            responses: vec![
+                tool_response("read_file"),
+                tool_response("read_file"),
+                tool_response("read_file"),
+                tool_response("read_file"),
+                tool_response("read_file"),
+                ModelResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: "done".into(),
+                    },
+                    tool_calls: vec![],
+                },
+            ],
+        };
+        let mut agent = AgentLoop::new(provider);
+        let mut executor = Alternating {
+            pattern: vec![true, true, false, true, true],
+            calls: 0,
+        };
+        let mut sink = VecEventSink::default();
+        let result = agent
+            .run_coding_loop("read", &mut executor, 10, &mut sink)
+            .expect("recovers");
+        assert_eq!(result, "done");
+        assert_eq!(executor.calls, 5);
     }
 
     #[test]

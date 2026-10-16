@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Tools: added `glob`; `search_files` is now bounded (relative paths, result
+  and line caps, `glob`/`ignore_case`/`max_results`, no symlink following, skips
+  vendor and binary files) and no longer recurses through symlink loops;
+  `read_file` streams, refuses huge files and tells the model which
+  `start_line` continues a truncated read; `apply_patch` accepts a unique
+  `old_text`/`new_text` snippet (the whole-file form still works); every
+  tool now publishes a full JSON schema with parameter descriptions.
+- Fixed a panic when tool output was truncated inside a multi-byte character.
+- A wrong path, unreadable file or missing program is now a recoverable tool
+  error instead of ending the turn, and the recovery budget counts
+  consecutive failures (3) instead of 2 per turn.
 - Fixed prompts containing FTS5 operators (e.g. `**bold**`, quotes, `*`)
   failing the whole turn with an SQLite syntax error during memory/session
   search; free text is now converted to quoted terms.
