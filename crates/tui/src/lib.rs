@@ -8,11 +8,13 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::Text,
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
+mod render;
+use render::{diff_lines, markdown_lines, Palette};
 use std::{
     io::{self, IsTerminal},
     sync::mpsc::{Receiver, SyncSender, TryRecvError},
@@ -410,6 +412,45 @@ impl TranscriptItem {
             Self::FileChange(path) => format!("change: {path}"),
             Self::Error(error) => format!("error: {error}"),
             Self::Notification(text) => text.clone(),
+        }
+    }
+
+    fn styled_lines(&self, palette: &Palette, width: u16) -> Vec<Line<'static>> {
+        let prefixed = |label: &'static str, style: Style, mut body: Vec<Line<'static>>| {
+            match body.first_mut() {
+                Some(first) => first.spans.insert(0, Span::styled(label, style)),
+                None => body.push(Line::from(Span::styled(label, style))),
+            }
+            body
+        };
+        match self {
+            Self::User(text) => {
+                let body = text
+                    .lines()
+                    .map(|l| Line::styled(l.to_owned(), palette.accent_style()))
+                    .collect();
+                prefixed("> ", palette.accent_style(), body)
+            }
+            Self::Assistant(text) => markdown_lines(text, palette, width),
+            Self::Error(error) => vec![Line::styled(
+                format!("error: {error}"),
+                palette.danger_style(),
+            )],
+            Self::FileChange(path) => vec![Line::styled(
+                format!("change: {path}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )],
+            Self::Tool { name, output } if output.lines().any(|l| l.starts_with("@@ ")) => {
+                let mut lines = vec![Line::styled(format!("tool {name}:"), palette.muted_style())];
+                lines.extend(diff_lines(output, palette));
+                lines
+            }
+            Self::Activity(_) => vec![Line::styled(self.render(), palette.muted_style())],
+            _ => self
+                .render()
+                .lines()
+                .map(|l| Line::from(l.to_owned()))
+                .collect(),
         }
     }
 
@@ -1242,12 +1283,8 @@ impl TuiModel {
             }
         }
     }
-    pub fn as_text(&self) -> String {
-        let mut lines = vec![format!("status: {}", self.status)];
-        lines.extend(self.transcript.iter().map(|item| match item {
-            TranscriptItem::Assistant(text) => format!("assistant: {}", markdown_plain(text)),
-            _ => item.render(),
-        }));
+    fn extra_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
         if let Some(tool) = &self.tool {
             lines.push(format!("tool: {tool}"));
         }
@@ -1269,6 +1306,42 @@ impl TuiModel {
         if let Some(card) = self.tool_cards.last() {
             lines.push(format!("tool card: {} [{}]", card.name, card.status));
         }
+        lines
+    }
+
+    /// Styled counterpart of [`Self::as_text`]; same entry-based scroll window.
+    fn as_styled_text(&self, palette: &Palette, width: u16) -> Text<'static> {
+        let mut entries: Vec<Vec<Line<'static>>> =
+            vec![vec![Line::from(format!("status: {}", self.status))]];
+        entries.extend(
+            self.transcript
+                .iter()
+                .map(|item| item.styled_lines(palette, width)),
+        );
+        entries.extend(self.extra_lines().into_iter().map(|l| vec![Line::from(l)]));
+        let start = self.scroll.min(entries.len().saturating_sub(1));
+        let limit = if self.viewport_height == 0 {
+            usize::MAX
+        } else {
+            self.viewport_height
+        };
+        Text::from(
+            entries
+                .into_iter()
+                .skip(start)
+                .take(limit)
+                .flatten()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    pub fn as_text(&self) -> String {
+        let mut lines = vec![format!("status: {}", self.status)];
+        lines.extend(self.transcript.iter().map(|item| match item {
+            TranscriptItem::Assistant(text) => format!("assistant: {}", markdown_plain(text)),
+            _ => item.render(),
+        }));
+        lines.extend(self.extra_lines());
         let start = self.scroll.min(lines.len().saturating_sub(1));
         let limit = if self.viewport_height == 0 {
             usize::MAX
@@ -1456,13 +1529,10 @@ fn render_frame(frame: &mut ratatui::Frame<'_>, model: &TuiModel, settings: TuiS
             Constraint::Length(1),
         ])
         .split(area);
-    let border_style = if color_enabled(settings) && model.theme != TuiTheme::Monochrome {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default()
-    };
+    let palette = Palette::new(model.theme, color_enabled(settings));
+    let border_style = palette.border_style();
     frame.render_widget(Paragraph::new(header_text(model, mode)), chunks[0]);
-    let body = model.as_text();
+    let body = model.as_styled_text(&palette, chunks[1].width.saturating_sub(2));
     frame.render_widget(
         Paragraph::new(body)
             .block(
