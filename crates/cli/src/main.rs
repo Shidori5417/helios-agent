@@ -637,8 +637,11 @@ impl RuntimeExecutor {
             .resolve_path(&path)
             .map_err(|error| error.to_string())?;
         if server.client.is_none() {
+            // Language servers are untrusted processes: confine them to the workspace
+            // with network denied, unless the sandbox is explicitly turned off.
+            let hook = mcp_child_hook(&server.workspace, false);
             let mut client = LspClient::new(
-                StdioTransport::spawn(&server.config, &server.workspace)
+                StdioTransport::spawn_with_hook(&server.config, &server.workspace, hook)
                     .map_err(|error| error.to_string())?,
                 std::time::Duration::from_millis(server.config.timeout_ms),
             );

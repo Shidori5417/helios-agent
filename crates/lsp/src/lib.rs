@@ -141,6 +141,16 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     pub fn spawn(config: &LspServerConfig, workspace: &Path) -> Result<Self, LspError> {
+        Self::spawn_with_hook(config, workspace, None)
+    }
+
+    /// Spawns the server with `hook` run in the child before exec, so the
+    /// OS sandbox covers the language server like any other spawned process.
+    pub fn spawn_with_hook(
+        config: &LspServerConfig,
+        workspace: &Path,
+        hook: Option<agent_terminal::ChildHook>,
+    ) -> Result<Self, LspError> {
         let cwd = config.cwd.as_deref().unwrap_or(workspace);
         if !cwd.starts_with(workspace) {
             return Err(LspError::OutsideWorkspace);
@@ -159,11 +169,14 @@ impl StdioTransport {
             // The child is an untrusted language server; isolate its descendants so
             // cancellation and Drop can terminate the complete process group.
             unsafe {
-                command.pre_exec(|| {
+                command.pre_exec(move || {
                     if libc::setpgid(0, 0) == -1 {
                         return Err(io::Error::last_os_error());
                     }
-                    Ok(())
+                    match &hook {
+                        Some(hook) => hook(),
+                        None => Ok(()),
+                    }
                 });
             }
         }
@@ -582,5 +595,51 @@ mod tests {
     }
     fn tempfile_root() -> PathBuf {
         std::env::temp_dir().join(format!("agent-lsp-{}", std::process::id()))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn language_server_is_confined_to_the_workspace() {
+        use agent_sandbox::landlock::{status, workspace_sandbox, Status};
+        if status() == Status::Unavailable {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        let root = tempfile_root().join("confined");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let root = root.canonicalize().expect("canonical");
+        let outside =
+            PathBuf::from("/var/tmp").join(format!("agent-lsp-escape-{}", std::process::id()));
+        let _ = fs::remove_file(&outside);
+        let config = |name: &str| LspServerConfig {
+            name: name.into(),
+            command: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                format!("echo leak > {}; sleep 1", outside.display()),
+            ],
+            language: "rust".into(),
+            extensions: vec![],
+            cwd: Some(root.clone()),
+            env_allowlist: vec!["PATH".into()],
+            enabled: true,
+            timeout_ms: 5000,
+        };
+        let sandbox = workspace_sandbox(&root, &[], false)
+            .expect("ruleset")
+            .expect("supported kernel");
+        let hook: agent_terminal::ChildHook =
+            std::sync::Arc::new(move || sandbox.restrict_current());
+        let _confined = StdioTransport::spawn_with_hook(&config("probe"), &root, Some(hook))
+            .expect("spawn confined");
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!outside.exists(), "language server escaped the workspace");
+        // Control: without the hook the same server writes outside, so the absence
+        // above is caused by the sandbox and not by a broken probe.
+        let _control = StdioTransport::spawn(&config("control"), &root).expect("spawn control");
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(outside.exists(), "control server did not write outside");
+        let _ = fs::remove_file(&outside);
     }
 }
