@@ -1090,7 +1090,7 @@ impl ToolRegistry {
                 tool: "web_fetch".into(),
                 reason,
             })?;
-        if !self.web_hosts.iter().any(|host| *host == target.host) {
+        if !self.web_hosts.contains(&target.host) {
             return Err(ToolError::Permission(PermissionError::Denied {
                 class: PermissionClass::Network,
             }));
