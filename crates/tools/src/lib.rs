@@ -1,3 +1,5 @@
+mod filter;
+
 use agent_sandbox::{PermissionClass, PermissionEngine, PermissionError, PermissionMode};
 use agent_terminal::{run, CancellationToken, CommandSpec, CommandStatus};
 use serde::Deserialize;
@@ -1039,7 +1041,8 @@ impl ToolRegistry {
             Some(path) => self.permissions.resolve_path(path)?,
             None => self.permissions.root().to_path_buf(),
         };
-        let program = input.program.clone();
+        let program_name = input.program.clone();
+        let input_args = input.args.clone();
         let result = run(
             CommandSpec {
                 program: input.program,
@@ -1056,7 +1059,7 @@ impl ToolRegistry {
         .map_err(|error| match error {
             agent_terminal::TerminalError::Start(io) => ToolError::InvalidArguments {
                 tool: name.into(),
-                reason: format!("cannot start `{program}`: {io}"),
+                reason: format!("cannot start `{program_name}`: {io}"),
             },
             other => ToolError::Terminal(other),
         })?;
@@ -1066,6 +1069,37 @@ impl ToolRegistry {
             CommandStatus::TimedOut => ToolStatus::Timeout,
             CommandStatus::Cancelled => ToolStatus::Cancelled,
         };
+        let spill_ref = result
+            .stdout
+            .spill_ref
+            .clone()
+            .or(result.stderr.spill_ref.clone());
+        let truncated = result.stdout.truncated || result.stderr.truncated;
+        // Build/test output that overflows the budget is condensed to its
+        // failures and summary, read from the full spill when one exists.
+        if truncated {
+            if let Some(family) = filter::family_of(&program_name, &input_args) {
+                let full = match &spill_ref {
+                    Some(path) => read_prefix(path, filter::MAX_SCAN_BYTES),
+                    None => result.stdout.text.clone(),
+                };
+                let condensed = filter::condense(family, &full);
+                let text = format!(
+                    "stdout (condensed: {} of {} lines kept; full output in spill_ref):\n{}\nstderr:\n{}",
+                    condensed.kept_lines,
+                    condensed.total_lines,
+                    condensed.text,
+                    result.stderr.text
+                );
+                return Ok(bounded_with_spill(
+                    status,
+                    &format!("{name} completed (condensed)"),
+                    text,
+                    self.output_budget,
+                    spill_ref,
+                ));
+            }
+        }
         let text = format!(
             "stdout:\n{}\nstderr:\n{}",
             result.stdout.text, result.stderr.text
@@ -1074,9 +1108,48 @@ impl ToolRegistry {
             status,
             summary: format!("{name} completed"),
             data: text,
-            truncated: result.stdout.truncated || result.stderr.truncated,
-            spill_ref: result.stdout.spill_ref.or(result.stderr.spill_ref),
+            truncated,
+            spill_ref,
         })
+    }
+}
+
+/// Reads at most `limit` bytes of `path`, cut on a char boundary. Failures
+/// yield an empty string: condensing is best-effort and the spill still exists.
+fn read_prefix(path: &Path, limit: usize) -> String {
+    use std::io::Read;
+    let Ok(file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(limit.min(1 << 20));
+    let _ = file.take(limit as u64).read_to_end(&mut bytes);
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// Like [`bounded`], but keeps an existing raw-output spill instead of writing
+/// a second copy of the same data.
+fn bounded_with_spill(
+    status: ToolStatus,
+    summary: &str,
+    data: String,
+    limit: usize,
+    spill_ref: Option<PathBuf>,
+) -> ToolOutcome {
+    if data.len() <= limit {
+        return ToolOutcome {
+            status,
+            summary: summary.into(),
+            data,
+            truncated: false,
+            spill_ref,
+        };
+    }
+    ToolOutcome {
+        status,
+        summary: summary.into(),
+        data: data[..floor_char_boundary(&data, limit)].to_owned(),
+        truncated: true,
+        spill_ref,
     }
 }
 
@@ -1409,6 +1482,42 @@ mod tests {
         args: Value,
     ) -> Result<ToolOutcome, ToolError> {
         registry.execute(name, args, &CancellationToken::default())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failing_test_output_is_condensed_and_full_output_stays_spilled() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = root("condense");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let script = bin.join("pytest");
+        fs::write(
+            &script,
+            "#!/bin/sh\ni=0\nwhile [ $i -lt 4000 ]; do echo \"ok line $i\"; i=$((i+1)); done\n\
+echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n",
+        )
+        .expect("script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite).expect("registry");
+        let outcome = run_tool(
+            &registry,
+            "shell",
+            json!({"program": script.display().to_string(), "args": []}),
+        )
+        .expect("run");
+        assert!(outcome.summary.contains("condensed"), "{}", outcome.summary);
+        assert!(outcome.data.contains("E   AssertionError: expected 2"));
+        assert!(outcome.data.contains("1 failed in 0.1s"));
+        assert!(!outcome.data.contains("ok line 1000"));
+        assert!(
+            outcome.data.len() <= 8 * 1024 + 64,
+            "{}",
+            outcome.data.len()
+        );
+        let spill = outcome.spill_ref.expect("full output spill");
+        let full = fs::read_to_string(spill).expect("spill");
+        assert!(full.contains("ok line 3999"));
     }
 
     #[test]

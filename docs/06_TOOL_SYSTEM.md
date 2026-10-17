@@ -54,6 +54,9 @@ Use a deterministic patch format. Validate path scope and preimage. Reject fuzzy
 
 ## Shell
 
+When a recognised build or test command (`cargo test|build|check|clippy`, `pytest`, `python -m pytest`, `go test|build|vet`, `npm|pnpm|yarn|bun test|run|build|lint`) produces more output than the budget, the result is condensed deterministically: only error, failure, location and summary lines are kept, with `… N line(s) omitted` markers. The full stream is always available through `spill_ref`. No model call is involved, and the rules are plain text matches, so they cannot hide a failure that matches a marker.
+
+
 Prefer direct argv execution when no shell syntax is required. Use a shell only for pipes/redirection/globbing/compound commands. This improves quoting safety and observability.
 
 ## Process

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Shell output from recognised build/test commands (cargo, pytest, go, npm
+  family) is condensed to failures and summaries when it exceeds the output
+  budget; the full output stays in the spill file.
 - Tool calls are now a first-class part of the conversation: assistant
   messages keep their calls, tool results carry the call id, and each provider
   uses its native protocol (Anthropic `tool_use`/`tool_result` blocks, OpenAI
