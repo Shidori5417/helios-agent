@@ -9,10 +9,21 @@ pub enum Role {
     Tool,
 }
 
+/// An image attached to a user message. `data` is standard base64 without
+/// line breaks; the CLI validates the bytes and media type before attaching.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ImageInput {
+    pub media_type: String,
+    pub data: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
     pub role: Role,
     pub content: String,
+    /// Images attached to a user message, sent as native image parts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageInput>,
     /// Tool calls requested by an assistant message. Empty for plain text.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
@@ -29,6 +40,7 @@ impl Message {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -36,6 +48,12 @@ impl Message {
     /// for storage and for adapters without a native tool history.
     pub fn plain_text(&self) -> String {
         let mut text = self.content.clone();
+        for image in &self.images {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!("[image attached: {}]", image.media_type));
+        }
         for call in &self.tool_calls {
             if !text.is_empty() {
                 text.push('\n');
@@ -66,6 +84,31 @@ pub struct ToolCall {
     pub id: Option<String>,
     pub name: String,
     pub arguments: Value,
+}
+
+/// Standard base64 (RFC 4648) with padding. Small and dependency-free because
+/// it is only used to embed attached images in provider requests.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(char::from(
+                    ALPHABET[((n >> (18 - 6 * index)) & 63) as usize],
+                ));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Longest argument text rendered by [`ToolCall::summary`].
@@ -141,6 +184,16 @@ mod tests {
         let encoded = serde_json::to_string(&request).expect("serialize request");
         let decoded: ModelRequest = serde_json::from_str(&encoded).expect("deserialize request");
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn base64_matches_rfc_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
     }
 
     #[test]

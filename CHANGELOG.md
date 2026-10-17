@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `helios run|exec --image PATH` attaches PNG, JPEG, GIF or WebP images
+  (at most 4, 5 MiB each) to the prompt. Paths must resolve inside the
+  workspace and the bytes must match the image signature. Images are sent as
+  native parts for Anthropic, OpenAI Responses, chat completions and Gemini.
+  The transcript keeps only an `[image attached]` marker, not the bytes.
+- `helios doctor` reports the OS sandbox state (enforced, disabled, or unavailable).
 - Linux: command execution (`shell`, `process`, `verify`, `git diff`) runs
   under a Landlock ruleset in WorkspaceWrite mode: writes and reads are
   confined to the workspace, temp, the tool spill dir and cargo caches, and

@@ -602,10 +602,20 @@ impl OpenAiProvider {
                     "output": message.content,
                 })),
                 Role::System | Role::User => {
+                    let mut parts: Vec<Value> = Vec::new();
                     if !message.content.is_empty() {
+                        parts.push(json!({"type": "input_text", "text": message.content}));
+                    }
+                    for image in &message.images {
+                        parts.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", image.media_type, image.data)
+                        }));
+                    }
+                    if !parts.is_empty() {
                         input.push(json!({
                             "role": if message.role == Role::System { "system" } else { "user" },
-                            "content": [{"type": "input_text", "text": message.content}]
+                            "content": parts
                         }));
                     }
                 }
@@ -869,8 +879,21 @@ impl AnthropicProvider {
                 _ => {
                     collecting_results = false;
                     let text = system_note(message);
-                    if !text.is_empty() {
-                        messages.push(json!({"role": "user", "content": text}));
+                    if message.images.is_empty() {
+                        if !text.is_empty() {
+                            messages.push(json!({"role": "user", "content": text}));
+                        }
+                    } else {
+                        // Images first, then the text that refers to them.
+                        let mut blocks: Vec<Value> = message
+                            .images
+                            .iter()
+                            .map(|image| json!({"type": "image", "source": {"type": "base64", "media_type": image.media_type, "data": image.data}}))
+                            .collect();
+                        if !text.is_empty() {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                        messages.push(json!({"role": "user", "content": blocks}));
                     }
                 }
             }
@@ -1103,8 +1126,18 @@ impl GeminiProvider {
         let contents = conversation
             .iter()
             .map(|message| (message, system_note(message)))
-            .filter(|(_, text)| !text.is_empty())
-            .map(|(message, text)| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":text}]}))
+            .filter(|(message, text)| !text.is_empty() || !message.images.is_empty())
+            .map(|(message, text)| {
+                let mut parts: Vec<Value> = message
+                    .images
+                    .iter()
+                    .map(|image| json!({"inlineData": {"mimeType": image.media_type, "data": image.data}}))
+                    .collect();
+                if !text.is_empty() {
+                    parts.push(json!({"text": text}));
+                }
+                json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"}, "parts": parts})
+            })
             .collect::<Vec<_>>();
         let declarations = wire_tools(&request.tools).iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
         let mut body =
@@ -1317,7 +1350,15 @@ impl OpenAiCompatibleProvider {
                 }),
                 Role::System => json!({"role": "system", "content": message.content}),
                 Role::Assistant => json!({"role": "assistant", "content": message.content}),
-                Role::User => json!({"role": "user", "content": message.content}),
+                Role::User if message.images.is_empty() => json!({"role": "user", "content": message.content}),
+                Role::User => {
+                    let mut parts = vec![json!({"type": "text", "text": message.content})];
+                    parts.extend(message.images.iter().map(|image| json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{};base64,{}", image.media_type, image.data)}
+                    })));
+                    json!({"role": "user", "content": parts})
+                }
             })
             .collect::<Vec<_>>();
         let tools = wire_tools(&request.tools).iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>();
@@ -1983,6 +2024,54 @@ data: [DONE]
         let body = tuned.request_body(&tuning_request());
         assert_eq!(body["max_tokens"], 4_096);
         assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    fn image_request() -> ModelRequest {
+        let mut user = Message::new(Role::User, "what is this?");
+        user.images = vec![agent_protocol::ImageInput {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }];
+        ModelRequest {
+            messages: vec![user],
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn attached_images_use_each_providers_native_part() {
+        let request = image_request();
+        let anthropic = AnthropicProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request);
+        let blocks = anthropic["messages"][0]["content"]
+            .as_array()
+            .expect("blocks");
+        assert_eq!(blocks[0]["type"], "image");
+        assert_eq!(blocks[0]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[0]["source"]["data"], "iVBORw0KGgo=");
+        assert_eq!(blocks[1]["text"], "what is this?");
+        assert_eq!(blocks[1]["cache_control"]["type"], "ephemeral");
+
+        let openai =
+            OpenAiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        let parts = openai["input"][0]["content"].as_array().expect("parts");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+
+        let chat = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request);
+        assert_eq!(
+            chat["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,iVBORw0KGgo="
+        );
+
+        let gemini =
+            GeminiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        assert_eq!(
+            gemini["contents"][0]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(gemini["contents"][0]["parts"][1]["text"], "what is this?");
     }
 
     #[test]

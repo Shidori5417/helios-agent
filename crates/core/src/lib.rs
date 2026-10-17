@@ -339,6 +339,8 @@ pub struct AgentLoop<P> {
     hooks: Option<Box<dyn HookRunner>>,
     steering: Option<SteeringChannel>,
     system_prompt: Option<String>,
+    /// Images for the next user message, consumed when the turn starts.
+    pending_images: Vec<agent_protocol::ImageInput>,
     /// Source of ids for tool calls that the provider did not number.
     next_call_id: u64,
 }
@@ -359,6 +361,7 @@ where
             hooks: None,
             steering: None,
             system_prompt: None,
+            pending_images: Vec::new(),
             next_call_id: 0,
         }
     }
@@ -366,6 +369,18 @@ where
     /// Sets the stable system prompt sent first in every request. It is kept
     /// outside the session transcript so it never gets compacted or dropped
     /// and the provider prompt-cache prefix stays byte-identical across turns.
+    /// Attaches images to the user message of the next turn.
+    pub fn with_images(mut self, images: Vec<agent_protocol::ImageInput>) -> Self {
+        self.pending_images = images;
+        self
+    }
+
+    fn user_message(&mut self, text: String) -> Message {
+        let mut message = Message::new(Role::User, text);
+        message.images = std::mem::take(&mut self.pending_images);
+        message
+    }
+
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         let prompt = prompt.into();
         self.system_prompt = (!prompt.trim().is_empty()).then_some(prompt);
@@ -487,9 +502,8 @@ where
         sink: &mut impl EventSink,
     ) -> Result<String, CoreError> {
         self.session.objective = user_input.into();
-        self.session
-            .messages
-            .push(Message::new(Role::User, self.session.objective.clone()));
+        let message = self.user_message(self.session.objective.clone());
+        self.session.messages.push(message);
         let start = Event::TurnStarted;
         sink.emit(start.clone());
         self.session.events.push(start);
@@ -531,9 +545,8 @@ where
         let limit = max_iterations.clamp(1, 16);
         let mut recovery_attempts = 0_usize;
         self.session.objective = user_input.into();
-        self.session
-            .messages
-            .push(Message::new(Role::User, self.session.objective.clone()));
+        let message = self.user_message(self.session.objective.clone());
+        self.session.messages.push(message);
         let start = Event::TurnStarted;
         sink.emit(start.clone());
         self.session.events.push(start);

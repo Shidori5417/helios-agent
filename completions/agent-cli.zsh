@@ -11,6 +11,7 @@ _helios() {
     '--registry[plugin registry path or HTTPS URL]:source:' \
     '--trust-store[public key trust store]:path:_files' \
     '--resume[session id or latest]:selector:' \
+    '--image[image file inside the workspace]:path:_files' \
     '--session[session id or latest]:selector:' \
     '--context-file[bounded workspace context file]:path:_files' \
     '--memory-query[bounded workspace memory query]:query:' \

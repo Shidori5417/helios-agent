@@ -1607,6 +1607,8 @@ enum PluginCommand {
 struct RunOptions {
     provider: String,
     model: String,
+    /// Workspace-relative image paths attached to the prompt (`--image`).
+    images: Vec<String>,
     effort: Option<String>,
     base_url: Option<String>,
     prompt: String,
@@ -1652,6 +1654,7 @@ fn default_run_options(
     event_sender: Option<SyncSender<agent_protocol::Event>>,
 ) -> RunOptions {
     RunOptions {
+        images: Vec::new(),
         provider: "fake".into(),
         model: "gpt-5".into(),
         effort: None,
@@ -2412,6 +2415,7 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
     let mut options = RunOptions {
         provider: "fake".into(),
         model: "gpt-5".into(),
+        images: Vec::new(),
         effort: None,
         base_url: None,
         prompt: String::new(),
@@ -2454,6 +2458,9 @@ fn parse_run(args: &[String], exec: bool) -> Result<Command, String> {
                 options.db_path = PathBuf::from(required_value(args, &mut index, "--db-path")?)
             }
             "--resume" => options.resume = Some(required_value(args, &mut index, "--resume")?),
+            "--image" => options
+                .images
+                .push(required_value(args, &mut index, "--image")?),
             "--tui" => options.tui = true,
             "--output-format" => {
                 options.output_format =
@@ -4661,6 +4668,56 @@ fn copy_last_text(target: &str, workspace: &Path) -> String {
     )
 }
 
+/// Reads and validates `--image` files. Each must resolve inside the
+/// workspace (so the model cannot be shown files outside it), be a regular
+/// file of at most 5 MiB, and start with a PNG, JPEG, GIF or WebP signature.
+fn load_run_images(
+    workspace: &Path,
+    paths: &[String],
+) -> Result<Vec<agent_protocol::ImageInput>, String> {
+    const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+    const MAX_IMAGES: usize = 4;
+    if paths.len() > MAX_IMAGES {
+        return Err(format!("at most {MAX_IMAGES} images can be attached"));
+    }
+    let engine = PermissionEngine::new(workspace, PermissionMode::ReadOnly)
+        .map_err(|error| error.to_string())?;
+    paths
+        .iter()
+        .map(|raw| {
+            let path = engine
+                .resolve_path(raw)
+                .map_err(|error| format!("{raw}: {error}"))?;
+            let metadata = fs::metadata(&path).map_err(|error| format!("{raw}: {error}"))?;
+            if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES {
+                return Err(format!("{raw}: image must be a file of at most 5 MiB"));
+            }
+            let bytes = fs::read(&path).map_err(|error| format!("{raw}: {error}"))?;
+            let media_type = image_media_type(&bytes)
+                .ok_or_else(|| format!("{raw}: not a PNG, JPEG, GIF or WebP image"))?;
+            Ok(agent_protocol::ImageInput {
+                media_type: media_type.into(),
+                data: agent_protocol::base64_encode(&bytes),
+            })
+        })
+        .collect()
+}
+
+/// Media type from the leading magic bytes; `None` for anything else.
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 fn run_command(options: RunOptions) -> Result<(), String> {
     run_command_with_cancellation(options, CancellationToken::default())
 }
@@ -5055,6 +5112,7 @@ fn run_selected_provider(
     live_stdout: bool,
     cancellation: CancellationToken,
 ) -> Result<RunOutcome, String> {
+    let images = load_run_images(&workspace_root()?, &options.images)?;
     let context_budget = profile_for(&options.provider)
         .and_then(|profile| profile.capabilities.context_window)
         .unwrap_or(16_000);
@@ -5074,6 +5132,7 @@ fn run_selected_provider(
             cancellation.clone(),
             context_budget,
             options.steering.clone(),
+            images.clone(),
         ),
         "openai" => run_provider(
             OpenAiProvider::with_credentials(
@@ -5099,6 +5158,7 @@ fn run_selected_provider(
             cancellation.clone(),
             context_budget,
             options.steering.clone(),
+            images.clone(),
         ),
         "anthropic" => run_provider(
             AnthropicProvider::with_credentials(
@@ -5124,6 +5184,7 @@ fn run_selected_provider(
             cancellation.clone(),
             context_budget,
             options.steering.clone(),
+            images.clone(),
         ),
         "gemini" => run_provider(
             GeminiProvider::with_credentials(
@@ -5151,6 +5212,7 @@ fn run_selected_provider(
             cancellation.clone(),
             context_budget,
             options.steering.clone(),
+            images.clone(),
         ),
         "generic" | "openai-compatible" => run_provider(
             OpenAiCompatibleProvider::with_credentials(
@@ -5176,6 +5238,7 @@ fn run_selected_provider(
             cancellation,
             context_budget,
             options.steering.clone(),
+            images.clone(),
         ),
         other => Err(format!("unknown provider: {other}")),
     }
@@ -5213,10 +5276,12 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
     cancellation: CancellationToken,
     context_budget: u64,
     steering: Option<SteeringChannel>,
+    images: Vec<agent_protocol::ImageInput>,
 ) -> Result<RunOutcome, String> {
     let previous = messages.len();
     let memory_scope = workspace_root()?.display().to_string();
     let mut agent = AgentLoop::new(provider)
+        .with_images(images)
         .with_context_budget(context_budget)
         .with_memory_scope(memory_scope)
         .with_memory_retriever(Box::new(StaticMemory(startup_memory)))
@@ -8014,6 +8079,7 @@ fn doctor_command(json: bool) -> Result<(), String> {
         "mcp_configured": config_value_count(&config, "mcp_server"), "lsp_configured": config_value_count(&config, "lsp_server"),
         "plugins_dir_present": paths.plugins_dir.is_dir(), "skills_dir_present": workspace.join("skills").is_dir(),
         "permission_mode": load_runtime_policy(&config).map(|policy| format!("{:?}", policy.mode)).unwrap_or_else(|_| "invalid".into()),
+        "os_sandbox": os_sandbox_status(),
     });
     if json {
         println!("{payload}");
@@ -8030,6 +8096,24 @@ fn doctor_command(json: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Reports whether command and MCP processes are confined by the kernel.
+/// Says why not when they are not, so a user can tell a policy gap from a
+/// deliberate opt-out.
+fn os_sandbox_status() -> String {
+    if cfg!(not(target_os = "linux")) {
+        return "unsupported: OS sandbox is Linux-only".into();
+    }
+    if env::var("HELIOS_OS_SANDBOX").is_ok_and(|value| value == "off") {
+        return "disabled: HELIOS_OS_SANDBOX=off".into();
+    }
+    match agent_sandbox::landlock::status() {
+        agent_sandbox::landlock::Status::Enforced { abi } => format!("landlock abi={abi}"),
+        agent_sandbox::landlock::Status::Unavailable => {
+            "unavailable: kernel has no Landlock; commands run unrestricted".into()
+        }
+    }
 }
 
 fn config_value_count(path: &Path, key: &str) -> usize {
@@ -9977,6 +10061,7 @@ mod tests {
         .expect("config");
         WORKSPACE_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(root.clone()));
         let options = RunOptions {
+            images: Vec::new(),
             provider: "fake".into(),
             model: "gpt-5".into(),
             effort: None,
@@ -10530,5 +10615,41 @@ mod tests {
             })
         );
         assert!(parse_args(vec!["tasks".into(), "bg".into()]).is_err());
+    }
+
+    #[test]
+    fn attached_images_are_validated_and_contained() {
+        let root = env::temp_dir().join(format!("helios-images-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root");
+        let root = root.canonicalize().expect("canonical");
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"rest");
+        fs::write(root.join("shot.png"), &png).expect("png");
+        fs::write(root.join("fake.png"), b"plain text, not an image").expect("fake");
+
+        let images = load_run_images(&root, &["shot.png".into()]).expect("valid image");
+        assert_eq!(images[0].media_type, "image/png");
+        assert_eq!(images[0].data, agent_protocol::base64_encode(&png));
+        assert!(load_run_images(&root, &["fake.png".into()]).is_err());
+        assert!(load_run_images(&root, &["../outside.png".into()]).is_err());
+        assert!(load_run_images(&root, &["missing.png".into()]).is_err());
+        let five = vec!["shot.png".to_owned(); 5];
+        assert!(load_run_images(&root, &five).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn image_signatures_cover_the_supported_formats() {
+        assert_eq!(
+            image_media_type(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(image_media_type(b"GIF89a..."), Some("image/gif"));
+        assert_eq!(
+            image_media_type(b"RIFF\0\0\0\0WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(image_media_type(b"<svg>"), None);
     }
 }
