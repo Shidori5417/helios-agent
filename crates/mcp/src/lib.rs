@@ -44,6 +44,18 @@ pub struct LoadedMcpServer {
     pub allowed_hosts: Vec<String>,
     /// Whether a stdio server may open network connections. Off by default.
     pub network_allowed: bool,
+    /// Client-credentials OAuth for HTTP servers; secrets come from env names.
+    pub oauth: Option<OAuthConfig>,
+}
+
+/// OAuth 2.0 client-credentials settings. Only the names of environment
+/// variables holding the client id and secret are configured, never values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub token_url: String,
+    pub client_id_env: String,
+    pub client_secret_env: String,
+    pub scope: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -76,6 +88,10 @@ pub struct McpServerFile {
     /// Let this stdio server open TCP connections (sandbox exception).
     #[serde(default)]
     pub allow_network: bool,
+    pub oauth_token_url: Option<String>,
+    pub oauth_client_id_env: Option<String>,
+    pub oauth_client_secret_env: Option<String>,
+    pub oauth_scope: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -112,6 +128,7 @@ pub fn load_config(
                     "invalid MCP config secret reference".into(),
                 ));
             }
+            let oauth = oauth_from_file(&server)?;
             let cwd = server
                 .cwd
                 .map(|cwd| workspace.join(cwd))
@@ -163,9 +180,45 @@ pub fn load_config(
                 },
                 allowed_hosts,
                 network_allowed: server.allow_network,
+                oauth,
             })
         })
         .collect()
+}
+
+fn oauth_from_file(server: &McpServerFile) -> Result<Option<OAuthConfig>, McpError> {
+    let fields = [
+        &server.oauth_token_url,
+        &server.oauth_client_id_env,
+        &server.oauth_client_secret_env,
+    ];
+    if fields.iter().all(|field| field.is_none()) {
+        return Ok(None);
+    }
+    let (Some(token_url), Some(client_id_env), Some(client_secret_env)) = (
+        server.oauth_token_url.clone(),
+        server.oauth_client_id_env.clone(),
+        server.oauth_client_secret_env.clone(),
+    ) else {
+        return Err(McpError::Protocol(
+            "oauth needs oauth_token_url, oauth_client_id_env and oauth_client_secret_env together"
+                .into(),
+        ));
+    };
+    if !token_url.starts_with("https://") && !cfg!(test) {
+        return Err(McpError::Protocol("oauth_token_url must use https".into()));
+    }
+    if !valid_env_name(&client_id_env) || !valid_env_name(&client_secret_env) {
+        return Err(McpError::Protocol(
+            "oauth client credentials must name environment variables, not contain values".into(),
+        ));
+    }
+    Ok(Some(OAuthConfig {
+        token_url,
+        client_id_env,
+        client_secret_env,
+        scope: server.oauth_scope.clone(),
+    }))
 }
 
 fn valid_env_name(name: &str) -> bool {
@@ -284,9 +337,104 @@ pub struct McpClient<P> {
     max_response_bytes: usize,
     http_session_id: Option<String>,
     child_hook: Option<agent_terminal::ChildHook>,
+    oauth: Option<OAuthConfig>,
+    oauth_token: Option<CachedToken>,
+}
+
+/// An access token kept in memory only, with its expiry.
+#[derive(Clone)]
+struct CachedToken {
+    value: String,
+    expires_at: std::time::Instant,
 }
 
 impl<P: McpPolicy> McpClient<P> {
+    /// Enables client-credentials OAuth for this HTTP server.
+    pub fn with_oauth(mut self, oauth: Option<OAuthConfig>) -> Self {
+        self.oauth = oauth;
+        self
+    }
+
+    /// Returns a valid access token, fetching one when the cache is empty or
+    /// close to expiry. The token endpoint is network access, so it passes the
+    /// same host policy as the MCP endpoint itself. Errors never echo the
+    /// response body or the credentials.
+    fn oauth_access_token(&mut self, cancellation: &CancellationToken) -> Result<String, McpError> {
+        if let Some(token) = &self.oauth_token {
+            if token.expires_at > std::time::Instant::now() + Duration::from_secs(30) {
+                return Ok(token.value.clone());
+            }
+        }
+        let oauth = self
+            .oauth
+            .clone()
+            .ok_or_else(|| McpError::Protocol("OAuth is not configured".into()))?;
+        if cancellation.is_cancelled() {
+            return Err(McpError::Cancelled);
+        }
+        let parsed = reqwest::Url::parse(&oauth.token_url)
+            .map_err(|_| McpError::Protocol("invalid oauth_token_url".into()))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| McpError::Protocol("oauth_token_url has no host".into()))?;
+        self.policy.authorize_network(host)?;
+        let client_id = std::env::var(&oauth.client_id_env).map_err(|_| {
+            McpError::Protocol(format!(
+                "environment variable {} is not set",
+                oauth.client_id_env
+            ))
+        })?;
+        let client_secret = std::env::var(&oauth.client_secret_env).map_err(|_| {
+            McpError::Protocol(format!(
+                "environment variable {} is not set",
+                oauth.client_secret_env
+            ))
+        })?;
+        let mut form = vec![
+            ("grant_type", "client_credentials".to_owned()),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ];
+        if let Some(scope) = &oauth.scope {
+            form.push(("scope", scope.clone()));
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(self.config.startup_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| McpError::Protocol(error.to_string()))?;
+        let response = client
+            .post(&oauth.token_url)
+            .form(&form)
+            .send()
+            .map_err(|_| McpError::Protocol("oauth token request failed".into()))?;
+        if !response.status().is_success() {
+            return Err(McpError::Protocol(format!(
+                "oauth token endpoint answered HTTP {}",
+                response.status()
+            )));
+        }
+        let body: Value = response
+            .json()
+            .map_err(|_| McpError::Protocol("oauth token response was not JSON".into()))?;
+        let value = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| McpError::Protocol("oauth response has no access_token".into()))?
+            .to_owned();
+        let lifetime = body
+            .get("expires_in")
+            .and_then(Value::as_u64)
+            .unwrap_or(300)
+            .min(86_400);
+        self.oauth_token = Some(CachedToken {
+            value: value.clone(),
+            expires_at: std::time::Instant::now() + Duration::from_secs(lifetime),
+        });
+        Ok(value)
+    }
+
     pub fn new(config: McpServerConfig, policy: P, max_response_bytes: usize) -> Self {
         let http_session_id = match &config.transport {
             McpTransport::StreamableHttp { session_id, .. } => session_id.clone(),
@@ -303,6 +451,8 @@ impl<P: McpPolicy> McpClient<P> {
             max_response_bytes,
             http_session_id,
             child_hook: None,
+            oauth: None,
+            oauth_token: None,
         }
     }
 
@@ -520,7 +670,10 @@ impl<P: McpPolicy> McpClient<P> {
         if let Some(session) = self.http_session_id.as_deref() {
             request = request.header("Mcp-Session-Id", session);
         }
-        if let Some(name) = auth_env {
+        if self.oauth.is_some() {
+            let token = self.oauth_access_token(cancellation)?;
+            request = request.bearer_auth(token);
+        } else if let Some(name) = auth_env {
             if let Ok(value) = std::env::var(name) {
                 request = request.bearer_auth(value);
             }
@@ -532,6 +685,10 @@ impl<P: McpPolicy> McpClient<P> {
                 McpError::Protocol(error.to_string())
             }
         })?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth.is_some() {
+            // Drop the token so the next request fetches a fresh one.
+            self.oauth_token = None;
+        }
         if let Some(session) = response
             .headers()
             .get("Mcp-Session-Id")
@@ -693,6 +850,8 @@ mod tests {
             max_response_bytes: 4096,
             http_session_id: None,
             child_hook: None,
+            oauth: None,
+            oauth_token: None,
         };
         client
             .initialize(&CancellationToken::default())
@@ -739,6 +898,8 @@ mod tests {
             max_response_bytes: 4096,
             http_session_id: None,
             child_hook: None,
+            oauth: None,
+            oauth_token: None,
         };
         assert!(matches!(
             client.initialize(&CancellationToken::default()),
@@ -989,5 +1150,125 @@ mod tests {
         assert!(outside.exists(), "control server did not write outside");
         let _ = std::fs::remove_file(&outside);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Serves one HTTP response per listed body on 127.0.0.1 and counts hits.
+    fn token_endpoint(
+        bodies: Vec<(u16, &'static str)>,
+    ) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let url = format!("http://{}/token", listener.local_addr().expect("addr"));
+        let handle = std::thread::spawn(move || {
+            let mut hits = 0;
+            for (status, body) in bodies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buffer = [0_u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buffer);
+                hits += 1;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+            hits
+        });
+        (url, handle)
+    }
+
+    fn oauth_client(token_url: String) -> McpClient<HostAllowlist<PermissionPolicy>> {
+        let engine = PermissionEngine::new(std::env::temp_dir(), PermissionMode::WorkspaceWrite)
+            .expect("engine");
+        let policy = HostAllowlist {
+            inner: PermissionPolicy::new(engine),
+            allowed_hosts: vec!["127.0.0.1".into()],
+        };
+        let config = McpServerConfig {
+            name: "remote".into(),
+            command: String::new(),
+            args: vec![],
+            cwd: None,
+            env_allowlist: vec![],
+            enabled: true,
+            tool_include: vec![],
+            tool_exclude: vec![],
+            startup_timeout: Duration::from_secs(5),
+            tool_timeout: Duration::from_secs(5),
+            permission_class: PermissionClass::ReadOnly,
+            transport: McpTransport::StreamableHttp {
+                url: "http://127.0.0.1:9/mcp".into(),
+                auth_env: None,
+                session_id: None,
+            },
+        };
+        McpClient::new(config, policy, 64 * 1024).with_oauth(Some(OAuthConfig {
+            token_url,
+            client_id_env: "AGENT_MCP_OAUTH_TEST_ID".into(),
+            client_secret_env: "AGENT_MCP_OAUTH_TEST_SECRET".into(),
+            scope: Some("read".into()),
+        }))
+    }
+
+    #[test]
+    fn oauth_token_is_fetched_once_then_cached_in_memory() {
+        std::env::set_var("AGENT_MCP_OAUTH_TEST_ID", "client-id-value");
+        std::env::set_var("AGENT_MCP_OAUTH_TEST_SECRET", "super-secret-value");
+        let (url, server) =
+            token_endpoint(vec![(200, r#"{"access_token":"tok-1","expires_in":3600}"#)]);
+        let mut client = oauth_client(url);
+        let cancel = CancellationToken::default();
+        assert_eq!(client.oauth_access_token(&cancel).expect("token"), "tok-1");
+        // The endpoint answers only once; a second call must come from the cache.
+        assert_eq!(client.oauth_access_token(&cancel).expect("cached"), "tok-1");
+        assert_eq!(server.join().expect("server"), 1);
+    }
+
+    #[test]
+    fn oauth_failure_never_reveals_the_secret() {
+        std::env::set_var("AGENT_MCP_OAUTH_TEST_ID", "client-id-value");
+        std::env::set_var("AGENT_MCP_OAUTH_TEST_SECRET", "super-secret-value");
+        let (url, server) = token_endpoint(vec![(
+            401,
+            r#"{"error":"invalid_client","echo":"super-secret-value"}"#,
+        )]);
+        let mut client = oauth_client(url);
+        let error = client
+            .oauth_access_token(&CancellationToken::default())
+            .expect_err("rejected");
+        let text = error.to_string();
+        assert!(text.contains("HTTP 401"), "{text}");
+        assert!(!text.contains("super-secret-value"), "{text}");
+        assert!(!text.contains("client-id-value"), "{text}");
+        let _ = server.join();
+    }
+
+    #[test]
+    fn oauth_config_rejects_literal_secrets_and_plain_names() {
+        let mut file = McpServerFile {
+            name: "x".into(),
+            command: String::new(),
+            args: vec![],
+            cwd: None,
+            enabled: true,
+            env_allowlist: vec![],
+            tool_include: vec![],
+            tool_exclude: vec![],
+            allowed_hosts: vec![],
+            transport: Some("streamable_http".into()),
+            url: Some("https://example.com/mcp".into()),
+            auth_env: None,
+            allow_network: false,
+            oauth_token_url: Some("https://auth.example.com/token".into()),
+            oauth_client_id_env: Some("sk-live-literal-123".into()),
+            oauth_client_secret_env: Some("CLIENT_SECRET".into()),
+            oauth_scope: None,
+        };
+        assert!(oauth_from_file(&file).is_err());
+        file.oauth_client_id_env = Some("CLIENT_ID".into());
+        assert!(oauth_from_file(&file).expect("valid").is_some());
+        file.oauth_client_secret_env = None;
+        assert!(oauth_from_file(&file).is_err());
     }
 }

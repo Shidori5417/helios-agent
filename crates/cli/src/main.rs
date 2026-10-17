@@ -324,6 +324,7 @@ struct McpRuntime {
     config: agent_mcp::McpServerConfig,
     allowed_hosts: Vec<String>,
     network_allowed: bool,
+    oauth: Option<agent_mcp::OAuthConfig>,
     advertised: Vec<String>,
     discovered_tools: Vec<agent_mcp::McpTool>,
     client: McpClient<HostAllowlist<PermissionPolicy>>,
@@ -361,6 +362,7 @@ impl RuntimeExecutor {
             let advertised = server.config.tool_include.clone();
             let allowed_hosts = server.allowed_hosts.clone();
             let network_allowed = server.network_allowed;
+            let oauth = server.oauth.clone();
             let hook = mcp_child_hook(workspace, network_allowed);
             let policy = HostAllowlist {
                 inner: PermissionPolicy::new(engine),
@@ -372,7 +374,10 @@ impl RuntimeExecutor {
                 config: server.config.clone(),
                 allowed_hosts,
                 network_allowed,
-                client: McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook),
+                oauth: oauth.clone(),
+                client: McpClient::new(server.config, policy, 64 * 1024)
+                    .with_child_hook(hook)
+                    .with_oauth(oauth),
                 advertised,
                 discovered_tools: Vec::new(),
                 discovered: false,
@@ -565,6 +570,7 @@ impl RuntimeExecutor {
             server.config = replacement.config;
             server.allowed_hosts = replacement.allowed_hosts;
             server.network_allowed = replacement.network_allowed;
+            server.oauth = replacement.oauth.clone();
         }
         let policy = HostAllowlist {
             inner: PermissionPolicy::new(
@@ -574,7 +580,8 @@ impl RuntimeExecutor {
             allowed_hosts: server.allowed_hosts.clone(),
         };
         server.client = McpClient::new(server.config.clone(), policy, 64 * 1024)
-            .with_child_hook(mcp_child_hook(&self.workspace, server.network_allowed));
+            .with_child_hook(mcp_child_hook(&self.workspace, server.network_allowed))
+            .with_oauth(server.oauth.clone());
         server.discovered = false;
         server.advertised.clear();
         server.discovered_tools.clear();
@@ -4459,7 +4466,9 @@ fn mcp_discover_server(id: &str, workspace: &Path, config_path: &Path) -> Result
     };
     let cancellation = CancellationToken::default();
     let hook = mcp_child_hook(workspace, server.network_allowed);
-    let mut client = McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook);
+    let mut client = McpClient::new(server.config, policy, 64 * 1024)
+        .with_child_hook(hook)
+        .with_oauth(server.oauth.clone());
     client
         .initialize(&cancellation)
         .map_err(|error| error.to_string())?;
@@ -9428,7 +9437,9 @@ fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result
         };
         let cancellation = CancellationToken::default();
         let hook = mcp_child_hook(&workspace, server.network_allowed);
-        let mut client = McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook);
+        let mut client = McpClient::new(server.config, policy, 64 * 1024)
+            .with_child_hook(hook)
+            .with_oauth(server.oauth.clone());
         client
             .initialize(&cancellation)
             .map_err(|error| error.to_string())?;
@@ -10442,6 +10453,7 @@ mod tests {
             },
             allowed_hosts: Vec::new(),
             network_allowed: false,
+            oauth: None,
         };
         let executor = RuntimeExecutor::new(
             builtin,

@@ -66,6 +66,12 @@ Stdio MCP servers get the same confinement, in every permission mode, because th
 
 Tests cover writes outside the workspace, reads of a credential-like directory outside the allowed roots, and TCP connections, with a control run showing the probe succeeds without the sandbox. Not yet covered: a full `cargo test` under the sandbox, and MCP servers and hooks, which spawn processes outside this path.
 
+## MCP OAuth (client credentials)
+
+HTTP MCP servers can authenticate with OAuth 2.0 client credentials. The `[[mcp_server]]` entry names three things: `oauth_token_url` (https only), `oauth_client_id_env` and `oauth_client_secret_env` (environment variable names; values are never accepted in the config), and optionally `oauth_scope`. Literal values are rejected. The access token is held in memory only, refreshed before it expires (expiry defaults to 300 s when the server omits `expires_in`), and dropped on a 401 so the next request fetches a new one. The token endpoint is network access, so it passes the server's host allowlist. Errors name the HTTP status but never the response body or the credentials.
+
+Scope limit: only client credentials is implemented. Interactive authorization-code flows with PKCE, which need a browser redirect, are not implemented and cannot be verified without a live authorization server.
+
 ## Web fetch
 
 `web_fetch` is the only tool with `PermissionClass::Network`. The engine's class policy still denies network; instead the tool is granted per host from `permissions.allowed_network_hosts` (managed with `permissions add-network-host`). It is not offered to the model unless that list is non-empty, and it is refused in read-only (plan) mode.

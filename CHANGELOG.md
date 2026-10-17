@@ -7,6 +7,10 @@
   workspace and the bytes must match the image signature. Images are sent as
   native parts for Anthropic, OpenAI Responses, chat completions and Gemini.
   The transcript keeps only an `[image attached]` marker, not the bytes.
+- HTTP MCP servers can authenticate with OAuth 2.0 client credentials
+  (`oauth_token_url`, and environment variable names for the client id and
+  secret). Tokens are kept in memory and refreshed before expiry. The
+  interactive authorization-code flow is not implemented.
 - `helios doctor` reports the OS sandbox state (enforced, disabled, or unavailable).
 - Linux: command execution (`shell`, `process`, `verify`, `git diff`) runs
   under a Landlock ruleset in WorkspaceWrite mode: writes and reads are
