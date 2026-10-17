@@ -339,6 +339,8 @@ pub struct AgentLoop<P> {
     hooks: Option<Box<dyn HookRunner>>,
     steering: Option<SteeringChannel>,
     system_prompt: Option<String>,
+    /// Source of ids for tool calls that the provider did not number.
+    next_call_id: u64,
 }
 
 impl<P> AgentLoop<P>
@@ -357,6 +359,7 @@ where
             hooks: None,
             steering: None,
             system_prompt: None,
+            next_call_id: 0,
         }
     }
 
@@ -371,13 +374,7 @@ where
 
     fn with_system_prefix(&self, mut messages: Vec<Message>) -> Vec<Message> {
         if let Some(prompt) = &self.system_prompt {
-            messages.insert(
-                0,
-                Message {
-                    role: Role::System,
-                    content: prompt.clone(),
-                },
-            );
+            messages.insert(0, Message::new(Role::System, prompt.clone()));
         }
         messages
     }
@@ -422,10 +419,10 @@ where
             return;
         };
         for instruction in steering.drain() {
-            self.session.messages.push(Message {
-                role: Role::System,
-                content: format!("[steering source=user] {instruction}"),
-            });
+            self.session.messages.push(Message::new(
+                Role::System,
+                format!("[steering source=user] {instruction}"),
+            ));
         }
     }
 
@@ -490,10 +487,9 @@ where
         sink: &mut impl EventSink,
     ) -> Result<String, CoreError> {
         self.session.objective = user_input.into();
-        self.session.messages.push(Message {
-            role: Role::User,
-            content: self.session.objective.clone(),
-        });
+        self.session
+            .messages
+            .push(Message::new(Role::User, self.session.objective.clone()));
         let start = Event::TurnStarted;
         sink.emit(start.clone());
         self.session.events.push(start);
@@ -535,10 +531,9 @@ where
         let limit = max_iterations.clamp(1, 16);
         let mut recovery_attempts = 0_usize;
         self.session.objective = user_input.into();
-        self.session.messages.push(Message {
-            role: Role::User,
-            content: self.session.objective.clone(),
-        });
+        self.session
+            .messages
+            .push(Message::new(Role::User, self.session.objective.clone()));
         let start = Event::TurnStarted;
         sink.emit(start.clone());
         self.session.events.push(start);
@@ -616,8 +611,8 @@ where
                     )
                     .source_hash;
                     selected.get(&hash).map(|content| Message {
-                        role: message.role.clone(),
                         content: content.clone(),
+                        ..message.clone()
                     })
                 })
                 .collect::<Vec<_>>();
@@ -630,10 +625,9 @@ where
                     &content,
                 )
                 .source_hash;
-                selected.get(&hash).map(|content| Message {
-                    role: Role::System,
-                    content: content.clone(),
-                })
+                selected
+                    .get(&hash)
+                    .map(|content| Message::new(Role::System, content.clone()))
             }));
             if input_tokens > self.context_budget || !plan.dropped.is_empty() {
                 let compact_request = CompactionRequest {
@@ -662,10 +656,10 @@ where
                             );
                             request_messages.insert(
                                 0,
-                                Message {
-                                    role: Role::System,
-                                    content: format!("{checkpoint}\nsummary: {summary}"),
-                                },
+                                Message::new(
+                                    Role::System,
+                                    format!("{checkpoint}\nsummary: {summary}"),
+                                ),
                             );
                             let event = Event::ContextCompacted(format!(
                                 "dropped {} context segments; compaction applied",
@@ -699,8 +693,18 @@ where
                 sink,
                 events: &mut self.session.events,
             };
-            let response = self.provider.complete_streaming(request, &mut forwarder)?;
-            self.session.messages.push(response.message.clone());
+            let mut response = self.provider.complete_streaming(request, &mut forwarder)?;
+            // Every call needs an id so its result can be linked back to it;
+            // adapters turn the linkage into each provider's native tool protocol.
+            for call in &mut response.tool_calls {
+                if call.id.is_none() {
+                    self.next_call_id += 1;
+                    call.id = Some(format!("call_{}", self.next_call_id));
+                }
+            }
+            let mut assistant = response.message.clone();
+            assistant.tool_calls = response.tool_calls.clone();
+            self.session.messages.push(assistant);
             if response.tool_calls.is_empty() {
                 self.run_hook(LifecycleEvent::Stop, sink)?;
                 self.run_hook(LifecycleEvent::AgentFinished, sink)?;
@@ -746,10 +750,9 @@ where
                             Event::ToolCompleted(format!("{}: error; retrying", call.name));
                         sink.emit(completed.clone());
                         self.session.events.push(completed);
-                        self.session.messages.push(Message {
-                            role: Role::Tool,
-                            content: feedback,
-                        });
+                        self.session
+                            .messages
+                            .push(Message::tool_result(call.id.clone(), feedback));
                         continue;
                     }
                     Err(error) => {
@@ -797,10 +800,9 @@ where
                 let completed = Event::ToolCompleted(format!("{}: {}", call.name, result.status));
                 sink.emit(completed.clone());
                 self.session.events.push(completed);
-                self.session.messages.push(Message {
-                    role: Role::Tool,
-                    content: result.output,
-                });
+                self.session
+                    .messages
+                    .push(Message::tool_result(call.id.clone(), result.output));
                 self.run_hook(LifecycleEvent::PostToolUse, sink)?;
                 self.run_hook(LifecycleEvent::AfterTool, sink)?;
             }
@@ -860,10 +862,7 @@ mod tests {
         let provider = ScriptedProvider {
             responses: vec![
                 ModelResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content: "calling".into(),
-                    },
+                    message: Message::new(Role::Assistant, "calling"),
                     tool_calls: vec![ToolCall {
                         id: Some("1".into()),
                         name: "read_file".into(),
@@ -871,10 +870,7 @@ mod tests {
                     }],
                 },
                 ModelResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content: "done".into(),
-                    },
+                    message: Message::new(Role::Assistant, "done"),
                     tool_calls: vec![],
                 },
             ],
@@ -896,10 +892,7 @@ mod tests {
     #[test]
     fn coding_loop_has_bounded_iterations() {
         let response = ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "again".into(),
-            },
+            message: Message::new(Role::Assistant, "again"),
             tool_calls: vec![ToolCall {
                 id: None,
                 name: "process".into(),
@@ -925,10 +918,7 @@ mod tests {
         fn complete(&mut self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
             self.seen.push(request);
             Ok(ModelResponse {
-                message: Message {
-                    role: Role::Assistant,
-                    content: "done".into(),
-                },
+                message: Message::new(Role::Assistant, "done"),
                 tool_calls: vec![],
             })
         }
@@ -968,14 +958,11 @@ mod tests {
         agent.restore_session(
             "objective",
             vec![
-                Message {
-                    role: Role::User,
-                    content: "short".into(),
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: "a very long assistant transcript that should be truncated".into(),
-                },
+                Message::new(Role::User, "short"),
+                Message::new(
+                    Role::Assistant,
+                    "a very long assistant transcript that should be truncated",
+                ),
             ],
         );
         let mut executor = RecordingExecutor { calls: 0 };
@@ -1029,10 +1016,7 @@ mod tests {
 
     fn tool_response(name: &str) -> ModelResponse {
         ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: "tool call".into(),
-            },
+            message: Message::new(Role::Assistant, "tool call"),
             tool_calls: vec![ToolCall {
                 id: Some(name.into()),
                 name: name.into(),
@@ -1048,10 +1032,7 @@ mod tests {
                 tool_response("apply_patch"),
                 tool_response("apply_patch"),
                 ModelResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content: "done".into(),
-                    },
+                    message: Message::new(Role::Assistant, "done"),
                     tool_calls: vec![],
                 },
             ],
@@ -1102,6 +1083,58 @@ mod tests {
     }
 
     #[test]
+    fn tool_calls_and_results_are_linked_by_id_in_provider_requests() {
+        let provider = ContextRecordingProvider { seen: Vec::new() };
+        // Second response has no tool calls: the loop ends after one tool round trip.
+        struct TwoStep {
+            inner: ContextRecordingProvider,
+            step: usize,
+        }
+        impl ModelProvider for TwoStep {
+            fn complete(&mut self, request: ModelRequest) -> Result<ModelResponse, ProviderError> {
+                self.inner.seen.push(request);
+                self.step += 1;
+                Ok(if self.step == 1 {
+                    ModelResponse {
+                        message: Message::new(Role::Assistant, ""),
+                        tool_calls: vec![ToolCall {
+                            id: None,
+                            name: "read_file".into(),
+                            arguments: serde_json::json!({"path": "a.rs"}),
+                        }],
+                    }
+                } else {
+                    ModelResponse {
+                        message: Message::new(Role::Assistant, "done"),
+                        tool_calls: vec![],
+                    }
+                })
+            }
+        }
+        let mut agent = AgentLoop::new(TwoStep {
+            inner: provider,
+            step: 0,
+        });
+        let mut executor = RecordingExecutor { calls: 0 };
+        let mut sink = VecEventSink::default();
+        agent
+            .run_coding_loop("inspect", &mut executor, 4, &mut sink)
+            .expect("loop");
+        let second = &agent.provider.inner.seen[1].messages;
+        let assistant = second
+            .iter()
+            .find(|message| !message.tool_calls.is_empty())
+            .expect("assistant message keeps its tool calls");
+        let id = assistant.tool_calls[0].id.clone().expect("generated id");
+        assert_eq!(assistant.content, "");
+        let result = second
+            .iter()
+            .find(|message| message.role == Role::Tool)
+            .expect("tool result");
+        assert_eq!(result.tool_call_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
     fn successful_call_resets_the_recovery_budget() {
         // Two failures, a success, then two more failures: five failures in
         // total would exceed a per-turn cap, but never three in a row.
@@ -1137,10 +1170,7 @@ mod tests {
                 tool_response("read_file"),
                 tool_response("read_file"),
                 ModelResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content: "done".into(),
-                    },
+                    message: Message::new(Role::Assistant, "done"),
                     tool_calls: vec![],
                 },
             ],
@@ -1257,10 +1287,7 @@ mod tests {
             responses: vec![
                 tool_response("read_file"),
                 ModelResponse {
-                    message: Message {
-                        role: Role::Assistant,
-                        content: "done".into(),
-                    },
+                    message: Message::new(Role::Assistant, "done"),
                     tool_calls: vec![],
                 },
             ],
@@ -1363,10 +1390,10 @@ mod tests {
             }));
         agent.restore_session(
             "objective",
-            vec![Message {
-                role: Role::Assistant,
-                content: "a long historical response that exceeds the tiny budget".into(),
-            }],
+            vec![Message::new(
+                Role::Assistant,
+                "a long historical response that exceeds the tiny budget",
+            )],
         );
         let mut executor = RecordingExecutor { calls: 0 };
         let mut sink = VecEventSink::default();

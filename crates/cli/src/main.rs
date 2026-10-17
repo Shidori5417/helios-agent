@@ -4717,12 +4717,7 @@ fn run_command_with_cancellation(
             .session_context_messages(record.id)
             .map_err(|error| error.to_string())?
             .into_iter()
-            .map(|(role, content)| {
-                Ok(Message {
-                    role: parse_role(&role)?,
-                    content,
-                })
-            })
+            .map(|(role, content)| Ok(Message::new(parse_role(&role)?, content)))
             .collect::<Result<Vec<_>, String>>()?;
         (record.id, record.objective, messages)
     } else {
@@ -5244,7 +5239,7 @@ fn run_provider<P: ModelProvider, E: ToolExecutor>(
         Ok(_) => database.transactional(|transaction| {
             transaction.execute("UPDATE turns SET status = 'complete', error = NULL WHERE id = ?1", rusqlite::params![turn_id])?;
             for message in &agent.session.messages[previous + 1..] {
-                transaction.execute("INSERT INTO messages(session_id, turn_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))", rusqlite::params![session_id, turn_id, role_name(&message.role), message.content])?;
+                transaction.execute("INSERT INTO messages(session_id, turn_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, strftime('%s','now'))", rusqlite::params![session_id, turn_id, role_name(&message.role), message.plain_text()])?;
             }
             journal_observability(transaction, session_id, turn_id, &sink.events, agent.session.context_plan.as_ref())?;
             Ok(())

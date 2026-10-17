@@ -237,23 +237,25 @@ fn system_note(message: &Message) -> String {
 /// `mcp.server.tool` / `lsp:name:tool`. Plain names pass through unchanged
 /// (keeping prompts stable); others are sanitised deterministically and
 /// de-duplicated so the response can be mapped back.
+fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect()
+}
+
 fn wire_tool_names(tools: &[agent_protocol::ToolDefinition]) -> Vec<String> {
     let mut used = std::collections::BTreeSet::new();
     tools
         .iter()
         .map(|tool| {
-            let base = tool
-                .name
-                .chars()
-                .map(|ch| {
-                    if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                        ch
-                    } else {
-                        '_'
-                    }
-                })
-                .take(64)
-                .collect::<String>();
+            let base = sanitize_tool_name(&tool.name);
             let mut candidate = if base.is_empty() {
                 "tool".to_owned()
             } else {
@@ -294,6 +296,90 @@ fn restore_tool_names(
         }
     }
     response
+}
+
+/// Renders tool linkage as plain text, for adapters without a native tool
+/// history and for calls/results that lost their partner.
+fn flatten_message(message: &Message) -> Message {
+    match message.role {
+        Role::Tool => Message::new(Role::User, format!("[tool result]\n{}", message.content)),
+        Role::Assistant if !message.tool_calls.is_empty() => {
+            Message::new(Role::Assistant, message.plain_text())
+        }
+        _ => message.clone(),
+    }
+}
+
+/// Guarantees that tool linkage in `messages` is complete: each assistant
+/// message with tool calls is followed by a result for every call id, and
+/// every id-bearing tool result answers such a message. The context planner
+/// can drop one side of a pair and resumed sessions only store flattened
+/// text; strict APIs reject orphans, so those are rendered as text instead.
+fn paired_history(messages: &[Message]) -> Vec<Message> {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.role == Role::Assistant && !message.tool_calls.is_empty() {
+            let mut end = index + 1;
+            while end < messages.len() && messages[end].role == Role::Tool {
+                end += 1;
+            }
+            let results = &messages[index + 1..end];
+            let answered = message.tool_calls.iter().all(|call| {
+                call.id.as_deref().is_some_and(|id| {
+                    results
+                        .iter()
+                        .any(|result| result.tool_call_id.as_deref() == Some(id))
+                })
+            });
+            if answered {
+                out.push(message.clone());
+                for result in results {
+                    let linked = result.tool_call_id.as_deref().is_some_and(|id| {
+                        message
+                            .tool_calls
+                            .iter()
+                            .any(|call| call.id.as_deref() == Some(id))
+                    });
+                    out.push(if linked {
+                        result.clone()
+                    } else {
+                        flatten_message(result)
+                    });
+                }
+            } else {
+                out.push(flatten_message(message));
+                out.extend(results.iter().map(flatten_message));
+            }
+            index = end;
+        } else {
+            out.push(if message.role == Role::Tool {
+                flatten_message(message)
+            } else {
+                message.clone()
+            });
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Original tool name -> wire-safe name for one request.
+fn wire_name_map(
+    tools: &[agent_protocol::ToolDefinition],
+) -> std::collections::BTreeMap<String, String> {
+    tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .zip(wire_tool_names(tools))
+        .collect()
+}
+
+fn wire_name_for(map: &std::collections::BTreeMap<String, String>, name: &str) -> String {
+    map.get(name)
+        .cloned()
+        .unwrap_or_else(|| sanitize_tool_name(name))
 }
 
 fn request_error() -> ProviderError {
@@ -356,10 +442,7 @@ impl StreamAccumulator {
             });
         }
         Ok(ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: self.text,
-            },
+            message: Message::new(Role::Assistant, self.text),
             tool_calls,
         })
     }
@@ -493,16 +576,48 @@ impl OpenAiProvider {
     }
 
     fn request_body(&self, request: &ModelRequest) -> Value {
-        let input = request.messages.iter().map(|message| {
-            json!({
-                "role": match message.role { Role::System => "system", Role::User => "user", Role::Assistant => "assistant", Role::Tool => "tool" },
-                "content": [{"type": "input_text", "text": message.content}]
-            })
-        }).collect::<Vec<_>>();
+        let names = wire_name_map(&request.tools);
+        let mut input: Vec<Value> = Vec::new();
+        for message in paired_history(&request.messages) {
+            match message.role {
+                Role::Assistant => {
+                    if !message.content.is_empty() {
+                        input.push(json!({
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": message.content}]
+                        }));
+                    }
+                    for call in &message.tool_calls {
+                        input.push(json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": wire_name_for(&names, &call.name),
+                            "arguments": call.arguments.to_string(),
+                        }));
+                    }
+                }
+                Role::Tool => input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id,
+                    "output": message.content,
+                })),
+                Role::System | Role::User => {
+                    if !message.content.is_empty() {
+                        input.push(json!({
+                            "role": if message.role == Role::System { "system" } else { "user" },
+                            "content": [{"type": "input_text", "text": message.content}]
+                        }));
+                    }
+                }
+            }
+        }
         let tools = wire_tools(&request.tools).iter().map(|tool| json!({
             "type": "function", "name": tool.name, "description": tool.description, "parameters": tool.input_schema
         })).collect::<Vec<_>>();
-        let mut body = json!({"model": self.model, "input": input, "tools": tools});
+        let mut body = json!({"model": self.model, "input": input});
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
         if let Some(effort) = self.tuning.effort() {
             body["reasoning"] = json!({ "effort": effort });
         }
@@ -596,10 +711,7 @@ fn parse_responses_body(body: Value) -> Result<ModelResponse, ProviderError> {
         }
     }
     Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: text,
-        },
+        message: Message::new(Role::Assistant, text),
         tool_calls,
     })
 }
@@ -711,24 +823,69 @@ impl AnthropicProvider {
         // tool definition, the system prompt, and the newest message, so each
         // turn re-reads the previous turn's prefix from cache.
         let cache = json!({"type": "ephemeral"});
-        let (system, conversation) = split_leading_system(&request.messages);
-        let last = conversation.len().saturating_sub(1);
-        let messages = conversation
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                let role = match message.role {
-                    Role::Assistant => "assistant",
-                    _ => "user",
-                };
-                let text = system_note(message);
-                if index == last && !text.is_empty() {
-                    json!({"role": role, "content": [{"type": "text", "text": text, "cache_control": cache}]})
-                } else {
-                    json!({"role": role, "content": text})
+        let paired = paired_history(&request.messages);
+        let (system, conversation) = split_leading_system(&paired);
+        let names = wire_name_map(&request.tools);
+        let mut messages: Vec<Value> = Vec::new();
+        // True while the last message is a user turn made of tool_result blocks.
+        let mut collecting_results = false;
+        for message in conversation {
+            match message.role {
+                Role::Assistant => {
+                    collecting_results = false;
+                    let mut blocks = Vec::new();
+                    if !message.content.is_empty() {
+                        blocks.push(json!({"type": "text", "text": message.content}));
+                    }
+                    for call in &message.tool_calls {
+                        blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call.id,
+                            "name": wire_name_for(&names, &call.name),
+                            "input": call.arguments,
+                        }));
+                    }
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    messages.push(json!({"role": "assistant", "content": blocks}));
                 }
-            })
-            .collect::<Vec<_>>();
+                Role::Tool => {
+                    let block = json!({
+                        "type": "tool_result",
+                        "tool_use_id": message.tool_call_id,
+                        "content": message.content,
+                    });
+                    match messages.last_mut() {
+                        Some(last) if collecting_results => {
+                            if let Some(blocks) = last["content"].as_array_mut() {
+                                blocks.push(block);
+                            }
+                        }
+                        _ => messages.push(json!({"role": "user", "content": [block]})),
+                    }
+                    collecting_results = true;
+                }
+                _ => {
+                    collecting_results = false;
+                    let text = system_note(message);
+                    if !text.is_empty() {
+                        messages.push(json!({"role": "user", "content": text}));
+                    }
+                }
+            }
+        }
+        // Cache breakpoint on the newest message: its last block, or its
+        // whole text turned into a block.
+        if let Some(last) = messages.last_mut() {
+            if let Some(blocks) = last["content"].as_array_mut() {
+                if let Some(block) = blocks.last_mut() {
+                    block["cache_control"] = cache.clone();
+                }
+            } else if let Some(text) = last["content"].as_str().map(str::to_owned) {
+                last["content"] = json!([{"type": "text", "text": text, "cache_control": cache}]);
+            }
+        }
         let mut tools = wire_tools(&request.tools).iter().map(|tool| json!({"name":tool.name,"description":tool.description,"input_schema":tool.input_schema})).collect::<Vec<_>>();
         if let Some(tool) = tools.last_mut() {
             tool["cache_control"] = cache.clone();
@@ -737,8 +894,10 @@ impl AnthropicProvider {
             .tuning
             .max_output_tokens
             .unwrap_or(ANTHROPIC_DEFAULT_MAX_TOKENS);
-        let mut body =
-            json!({"model":self.model,"max_tokens":max_tokens,"messages":messages,"tools":tools});
+        let mut body = json!({"model":self.model,"max_tokens":max_tokens,"messages":messages});
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
         if let Some(system) = system {
             body["system"] = json!([{"type": "text", "text": system, "cache_control": cache}]);
         }
@@ -816,10 +975,7 @@ fn parse_anthropic_body(body: Value) -> Result<ModelResponse, ProviderError> {
         }
     }
     Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: text,
-        },
+        message: Message::new(Role::Assistant, text),
         tool_calls: calls,
     })
 }
@@ -936,10 +1092,26 @@ impl GeminiProvider {
         })
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
-        let (system, conversation) = split_leading_system(&request.messages);
-        let contents = conversation.iter().map(|message| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":system_note(message)}]})).collect::<Vec<_>>();
+        // Tool history is sent as text: it works on every Gemini model without
+        // thought-signature bookkeeping for replayed function calls.
+        let flattened = request
+            .messages
+            .iter()
+            .map(flatten_message)
+            .collect::<Vec<_>>();
+        let (system, conversation) = split_leading_system(&flattened);
+        let contents = conversation
+            .iter()
+            .map(|message| (message, system_note(message)))
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(message, text)| json!({"role": if matches!(message.role, Role::Assistant) {"model"} else {"user"},"parts":[{"text":text}]}))
+            .collect::<Vec<_>>();
         let declarations = wire_tools(&request.tools).iter().map(|tool| json!({"name":tool.name,"description":tool.description,"parameters":tool.input_schema})).collect::<Vec<_>>();
-        let mut body = json!({"contents":contents,"tools":[{"functionDeclarations":declarations}],"generationConfig":{"responseMimeType":"text/plain"}});
+        let mut body =
+            json!({"contents":contents,"generationConfig":{"responseMimeType":"text/plain"}});
+        if !declarations.is_empty() {
+            body["tools"] = json!([{"functionDeclarations": declarations}]);
+        }
         if let Some(system) = system {
             body["systemInstruction"] = json!({"parts": [{"text": system}]});
         }
@@ -1020,10 +1192,7 @@ fn parse_gemini_body(body: Value) -> Result<ModelResponse, ProviderError> {
         }
     }
     Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: text,
-        },
+        message: Message::new(Role::Assistant, text),
         tool_calls: calls,
     })
 }
@@ -1120,9 +1289,42 @@ impl OpenAiCompatibleProvider {
         })
     }
     fn request_body(&self, request: &ModelRequest) -> Value {
-        let messages = request.messages.iter().map(|message| json!({"role":match message.role { Role::System=>"system",Role::Assistant=>"assistant",Role::Tool=>"tool",Role::User=>"user"},"content":message.content})).collect::<Vec<_>>();
+        let names = wire_name_map(&request.tools);
+        let messages = paired_history(&request.messages)
+            .iter()
+            .filter(|message| {
+                !(message.role == Role::Assistant
+                    && message.tool_calls.is_empty()
+                    && message.content.is_empty())
+            })
+            .map(|message| match message.role {
+                Role::Assistant if !message.tool_calls.is_empty() => json!({
+                    "role": "assistant",
+                    "content": if message.content.is_empty() { Value::Null } else { json!(message.content) },
+                    "tool_calls": message.tool_calls.iter().map(|call| json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": wire_name_for(&names, &call.name),
+                            "arguments": call.arguments.to_string(),
+                        }
+                    })).collect::<Vec<_>>(),
+                }),
+                Role::Tool => json!({
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id,
+                    "content": message.content,
+                }),
+                Role::System => json!({"role": "system", "content": message.content}),
+                Role::Assistant => json!({"role": "assistant", "content": message.content}),
+                Role::User => json!({"role": "user", "content": message.content}),
+            })
+            .collect::<Vec<_>>();
         let tools = wire_tools(&request.tools).iter().map(|tool| json!({"type":"function","function":{"name":tool.name,"description":tool.description,"parameters":tool.input_schema}})).collect::<Vec<_>>();
-        let mut body = json!({"model":self.model,"messages":messages,"tools":tools});
+        let mut body = json!({"model":self.model,"messages":messages});
+        if !tools.is_empty() {
+            body["tools"] = json!(tools);
+        }
         if let Some(limit) = self.tuning.max_output_tokens {
             body["max_tokens"] = json!(limit);
         }
@@ -1203,10 +1405,7 @@ fn parse_chat_body(body: Value) -> Result<ModelResponse, ProviderError> {
         })
         .unwrap_or_default();
     Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: text,
-        },
+        message: Message::new(Role::Assistant, text),
         tool_calls: calls,
     })
 }
@@ -1295,10 +1494,7 @@ mod tests {
         let mut provider = OpenAiProvider::with_credentials("test-model", "test-key", endpoint);
         let response = provider
             .complete(ModelRequest {
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "hello".into(),
-                }],
+                messages: vec![Message::new(Role::User, "hello")],
                 tools: vec![],
             })
             .expect("response");
@@ -1343,10 +1539,7 @@ mod tests {
             AnthropicProvider::with_credentials("claude-test", "anthropic-key", endpoint);
         let response = provider
             .complete(ModelRequest {
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "hello".into(),
-                }],
+                messages: vec![Message::new(Role::User, "hello")],
                 tools: vec![],
             })
             .expect("response");
@@ -1364,10 +1557,7 @@ mod tests {
         let mut provider = GeminiProvider::with_credentials("gemini-test", "gemini-key", endpoint);
         let response = provider
             .complete(ModelRequest {
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "hello".into(),
-                }],
+                messages: vec![Message::new(Role::User, "hello")],
                 tools: vec![],
             })
             .expect("response");
@@ -1388,10 +1578,7 @@ mod tests {
             OpenAiCompatibleProvider::with_credentials("generic-test", "generic-key", endpoint);
         let response = provider
             .complete(ModelRequest {
-                messages: vec![Message {
-                    role: Role::User,
-                    content: "hello".into(),
-                }],
+                messages: vec![Message::new(Role::User, "hello")],
                 tools: vec![],
             })
             .expect("response");
@@ -1540,18 +1727,9 @@ data: [DONE]
     fn tuning_request() -> ModelRequest {
         ModelRequest {
             messages: vec![
-                Message {
-                    role: Role::System,
-                    content: "system".into(),
-                },
-                Message {
-                    role: Role::User,
-                    content: "first".into(),
-                },
-                Message {
-                    role: Role::User,
-                    content: "latest".into(),
-                },
+                Message::new(Role::System, "system"),
+                Message::new(Role::User, "first"),
+                Message::new(Role::User, "latest"),
             ],
             tools: vec![
                 agent_protocol::ToolDefinition {
@@ -1595,10 +1773,7 @@ data: [DONE]
                 .chars()
                 .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')));
         let response = ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: String::new(),
-            },
+            message: Message::new(Role::Assistant, String::new()),
             tool_calls: vec![agent_protocol::ToolCall {
                 id: None,
                 name: "mcp_git_status_1".into(),
@@ -1624,6 +1799,165 @@ data: [DONE]
         let generic = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
             .request_body(&request);
         assert_eq!(generic["tools"][0]["function"]["name"], "mcp_fs_read");
+    }
+
+    /// system -> user -> assistant(calls a,b) -> results(a,b) -> user, with tools
+    /// named like MCP tools so the wire-name mapping is exercised as well.
+    fn tool_history() -> ModelRequest {
+        let call = |id: &str, name: &str| agent_protocol::ToolCall {
+            id: Some(id.into()),
+            name: name.into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        };
+        let mut assistant = Message::new(Role::Assistant, "");
+        assistant.tool_calls = vec![call("call_1", "read_file"), call("call_2", "mcp.fs.stat")];
+        ModelRequest {
+            messages: vec![
+                Message::new(Role::System, "rules"),
+                Message::new(Role::User, "inspect"),
+                assistant,
+                Message::tool_result(Some("call_1".into()), "file text"),
+                Message::tool_result(Some("call_2".into()), "stat text"),
+                Message::new(Role::User, "continue"),
+            ],
+            tools: vec![named_tool("read_file"), named_tool("mcp.fs.stat")],
+        }
+    }
+
+    #[test]
+    fn anthropic_sends_native_tool_use_and_one_merged_result_turn() {
+        let body = AnthropicProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&tool_history());
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 4, "{messages:#?}");
+        // assistant: tool_use blocks only (empty text is omitted), wire names
+        let uses = messages[1]["content"].as_array().expect("blocks");
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[0]["type"], "tool_use");
+        assert_eq!(uses[0]["id"], "call_1");
+        assert_eq!(uses[1]["name"], "mcp_fs_stat");
+        assert_eq!(uses[1]["input"]["path"], "a.rs");
+        // one user turn carries both tool_result blocks, in call order
+        let results = messages[2]["content"].as_array().expect("results");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["type"], "tool_result");
+        assert_eq!(results[0]["tool_use_id"], "call_1");
+        assert_eq!(results[1]["tool_use_id"], "call_2");
+        assert_eq!(results[1]["content"], "stat text");
+        // newest message carries the cache breakpoint
+        assert_eq!(
+            messages[3]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
+    #[test]
+    fn openai_responses_uses_function_call_items_and_output_text() {
+        let mut request = tool_history();
+        request
+            .messages
+            .insert(2, Message::new(Role::Assistant, "looking"));
+        let body =
+            OpenAiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        let input = body["input"].as_array().expect("input");
+        let kinds = input
+            .iter()
+            .map(|item| {
+                item["type"]
+                    .as_str()
+                    .or(item["role"].as_str())
+                    .unwrap_or("?")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                "system",
+                "user",
+                "assistant",
+                "function_call",
+                "function_call",
+                "function_call_output",
+                "function_call_output",
+                "user"
+            ]
+        );
+        // assistant text must be output_text; role "tool" never appears
+        assert_eq!(input[2]["content"][0]["type"], "output_text");
+        assert!(input.iter().all(|item| item["role"] != "tool"));
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[4]["name"], "mcp_fs_stat");
+        assert_eq!(input[4]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(input[5]["call_id"], "call_1");
+        assert_eq!(input[6]["output"], "stat text");
+    }
+
+    #[test]
+    fn chat_completions_pairs_tool_calls_with_tool_call_id() {
+        let body = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&tool_history());
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["content"].is_null());
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            messages[2]["tool_calls"][1]["function"]["name"],
+            "mcp_fs_stat"
+        );
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[3]["tool_call_id"], "call_1");
+        assert_eq!(messages[4]["tool_call_id"], "call_2");
+    }
+
+    #[test]
+    fn orphaned_tool_history_is_flattened_for_every_adapter() {
+        // The planner dropped the assistant message, leaving only the result.
+        let mut request = tool_history();
+        request.messages.remove(2);
+        let anthropic = AnthropicProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request)
+            .to_string();
+        let openai = OpenAiProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request)
+            .to_string();
+        let chat = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request)
+            .to_string();
+        for body in [&anthropic, &openai, &chat] {
+            assert!(!body.contains("tool_result\""), "{body}");
+            assert!(!body.contains("function_call_output"), "{body}");
+            assert!(!body.contains("tool_call_id"), "{body}");
+            assert!(body.contains("[tool result]"), "{body}");
+        }
+        // A call with a missing result is flattened together with its partner.
+        let mut request = tool_history();
+        request.messages.remove(4);
+        let chat = OpenAiCompatibleProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&request)
+            .to_string();
+        assert!(!chat.contains("tool_calls"), "{chat}");
+        assert!(chat.contains("[tool call read_file]"), "{chat}");
+    }
+
+    #[test]
+    fn gemini_flattens_tool_history_and_skips_empty_parts() {
+        let body = GeminiProvider::with_credentials("m", "k", "http://localhost")
+            .request_body(&tool_history());
+        let contents = body["contents"].as_array().expect("contents");
+        assert!(contents.iter().all(|item| item["parts"][0]["text"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty())));
+        let text = body.to_string();
+        assert!(text.contains("[tool call read_file]"));
+        assert!(text.contains("[tool result]"));
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "rules");
+        // no tools -> no empty functionDeclarations list
+        let mut request = tool_history();
+        request.tools.clear();
+        let body =
+            GeminiProvider::with_credentials("m", "k", "http://localhost").request_body(&request);
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
@@ -1654,20 +1988,12 @@ data: [DONE]
     #[test]
     fn later_system_messages_are_kept_as_notes_not_dropped() {
         let mut request = tuning_request();
-        request.messages.insert(
-            0,
-            Message {
-                role: Role::System,
-                content: "base".into(),
-            },
-        );
-        request.messages.insert(
-            3,
-            Message {
-                role: Role::System,
-                content: "memory".into(),
-            },
-        );
+        request
+            .messages
+            .insert(0, Message::new(Role::System, "base"));
+        request
+            .messages
+            .insert(3, Message::new(Role::System, "memory"));
         let anthropic = AnthropicProvider::with_credentials("m", "k", "http://localhost")
             .request_body(&request);
         assert_eq!(anthropic["system"][0]["text"], "base\n\nsystem");
@@ -1787,10 +2113,7 @@ impl ModelProvider for FakeProvider {
             .map(|message| format!("fake: {}", message.content))
             .unwrap_or_else(|| "fake: empty request".into());
         Ok(ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content,
-            },
+            message: Message::new(Role::Assistant, content),
             tool_calls: vec![],
         })
     }

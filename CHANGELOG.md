@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Tool calls are now a first-class part of the conversation: assistant
+  messages keep their calls, tool results carry the call id, and each provider
+  uses its native protocol (Anthropic `tool_use`/`tool_result` blocks, OpenAI
+  `function_call`/`function_call_output`, chat `tool_calls`/`tool_call_id`).
+  Orphaned or unpaired tool history is rendered as text instead of being sent
+  to strict APIs, and Gemini receives it as text.
+- Transcripts store tool calls as `[tool call NAME] {args}` lines.
 - Interactive TUI: `@path` file mentions with a fuzzy popup (bounded,
   symlink-safe index built on first use), Ctrl+R reverse history search and
   Shift+Tab to toggle plan (read-only) and workspace-write. The header now
