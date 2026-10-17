@@ -1,3 +1,4 @@
-// Keep the compatibility `agent-cli` entry point and the primary `helios`
-// executable on the same implementation without maintaining two parsers.
-include!("../main.rs");
+// The primary `helios` executable, sharing the implementation with `agent-cli`.
+fn main() -> std::process::ExitCode {
+    agent_cli::main()
+}

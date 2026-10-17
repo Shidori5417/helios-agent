@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Internal: the CLI body moved from `src/main.rs` into a library (`agent_cli`),
+  and both `agent-cli` and `helios` are thin wrappers. Behavior is unchanged,
+  pinned by a 53-case argv golden corpus (`crates/cli/tests/argv_golden.rs`).
 - LSP language servers now run inside the workspace OS sandbox with network
   denied, like MCP stdio servers. Previously they ran unconfined.
 - `agent_mcp::oauth_pkce` adds an authorization-code login with PKCE on a

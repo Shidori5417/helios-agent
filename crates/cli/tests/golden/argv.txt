@@ -1,0 +1,1368 @@
+== []
+exit: 1
+--- stdout
+--- stderr
+helios error: interactive mode requires a TTY; use `helios exec` for headless operation
+== ["--version"]
+exit: 0
+--- stdout
+helios 0.1.0
+--- stderr
+== ["-V"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown option: -V
+
+== ["--help"]
+exit: 0
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+== ["-h"]
+exit: 0
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+== ["help"]
+exit: 0
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+== ["help", "run"]
+exit: 0
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+== ["run", "--help"]
+exit: 0
+--- stdout
+Usage: helios run [OPTIONS] PROMPT
+
+Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config.
+--- stderr
+== ["r", "--help"]
+exit: 0
+--- stdout
+Usage: helios run [OPTIONS] PROMPT
+
+Runs one bounded agent turn; --provider defaults to fake and CLI flags override workspace config.
+--- stderr
+== ["exec", "-h"]
+exit: 0
+--- stdout
+Usage: helios exec [OPTIONS] PROMPT
+
+Headless execution; --output-format is text, json, or stream-json. No TUI or alternate screen is initialized.
+--- stderr
+== ["--model", "x", "--help"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown command: --model
+
+== ["models", "--json"]
+exit: 0
+--- stdout
+[
+  {
+    "capabilities": "context_window=None,tools,caching=false,compaction=false,reasoning=false,streaming=true",
+    "configured": false,
+    "model": null,
+    "provider": "fake"
+  },
+  {
+    "capabilities": "context_window=None,tools,caching=true,compaction=true,reasoning=true,streaming=true",
+    "configured": false,
+    "model": null,
+    "provider": "openai"
+  },
+  {
+    "capabilities": "context_window=None,tools,caching=true,compaction=false,reasoning=true,streaming=true",
+    "configured": false,
+    "model": null,
+    "provider": "anthropic"
+  },
+  {
+    "capabilities": "context_window=None,tools,caching=true,compaction=false,reasoning=true,streaming=true",
+    "configured": false,
+    "model": null,
+    "provider": "gemini"
+  },
+  {
+    "capabilities": "context_window=None,tools,caching=false,compaction=false,reasoning=false,streaming=true",
+    "configured": false,
+    "model": null,
+    "provider": "generic"
+  }
+]
+--- stderr
+== ["doctor", "--json"]
+exit: 0
+--- stdout
+{"binary":"helios","config":"<ROOT>/ws/.helios/config.toml","config_valid":true,"db_integrity":false,"db_present":false,"git_available":true,"keyring_available":false,"lsp_configured":0,"mcp_configured":0,"os_sandbox":"landlock abi=7","permission_mode":"WorkspaceWrite","plugins_dir_present":false,"provider_credentials":[{"env_present":false,"keyring_present":false,"provider":"openai"},{"env_present":false,"keyring_present":false,"provider":"anthropic"},{"env_present":false,"keyring_present":false,"provider":"gemini"},{"env_present":false,"keyring_present":false,"provider":"generic"}],"rg_available":true,"skills_dir_present":false,"terminal":"unknown","version":"0.1.0","workspace":"<ROOT>/ws"}
+--- stderr
+== ["init", "--force"]
+exit: 0
+--- stdout
+<ROOT>/ws/.helios/config.toml
+--- stderr
+== ["config", "path"]
+exit: 0
+--- stdout
+<ROOT>/ws/.helios/config.toml
+--- stderr
+== ["config", "get", "--key", "x"]
+exit: 1
+--- stdout
+--- stderr
+helios error: unknown config key: x
+== ["auth", "status", "openai"]
+exit: 0
+--- stdout
+provider=openai credential_source=keyring-unavailable
+--- stderr
+== ["completion", "generate", "bash"]
+exit: 0
+--- stdout
+_helios() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local opts="init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec resume models review sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff --workspace --provider --model --base-url --db-path --resume --image --config --registry --trust-store --query --key --content --kind --importance --id --limit --session --context-file --memory-query --json --output-format --force --token-stdin --output --input --confirm --confirm-workspace --event --stderr --tail --timeout --suite --baseline --max-regressions --runs --current --prefix --name --from --sha256 --compat-agent-cli --public-key-file --registry-id --source --allow-network --file --root --objective --scope --worktree --keep-worktree --ref --concurrency --max-iterations --max-tokens --max-tool-calls --wall-clock --tick-ms --channel-capacity --scroll-step --color"
+  if [[ "${COMP_WORDS[*]}" == *"--provider"* ]]; then
+    COMPREPLY=($(compgen -W "fake openai anthropic gemini generic openai-compatible" -- "${cur}"))
+  else
+    COMPREPLY=($(compgen -W "${opts}" -- "${cur}"))
+  fi
+}
+complete -F _helios helios
+complete -F _helios agent-cli
+--- stderr
+== ["completion", "generate", "zsh"]
+exit: 0
+--- stdout
+#compdef helios agent-cli
+_helios() {
+  _arguments \
+    '1:command:(init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec resume models review sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff)' \
+    '--workspace[workspace root]:path:_files' \
+    '--provider[provider adapter]:provider:(fake openai anthropic gemini generic openai-compatible)' \
+    '--model[model name]:model:' \
+    '--base-url[provider endpoint]:url:' \
+    '--db-path[SQLite database]:path:_files' \
+    '--config[workspace runtime config]:path:_files' \
+    '--registry[plugin registry path or HTTPS URL]:source:' \
+    '--trust-store[public key trust store]:path:_files' \
+    '--resume[session id or latest]:selector:' \
+    '--image[image file inside the workspace]:path:_files' \
+    '--session[session id or latest]:selector:' \
+    '--context-file[bounded workspace context file]:path:_files' \
+    '--memory-query[bounded workspace memory query]:query:' \
+    '--json[JSON output]' \
+    '--output-format[headless output format]:format:(text json stream-json)' \
+    '--query[FTS query]:query:' \
+    '--allow-network[allow configured MCP network host]' \
+    '--file[LSP workspace file]:path:_files' \
+    '--root[skills root]:path:_files' \
+    '--objective[subagent objective]:text:' \
+    '--scope[subagent scope]:path:_files' \
+    '--worktree[request worktree isolation]' \
+    '--keep-worktree[keep exact manager-owned worktree]' \
+    '--ref[explicit worktree base ref]:ref:' \
+    '--concurrency[subagent concurrency]:count:' \
+    '--max-iterations[subagent iteration budget]:count:' \
+    '--max-tokens[subagent token budget]:count:' \
+    '--max-tool-calls[subagent tool budget]:count:' \
+    '--wall-clock[subagent wall clock seconds]:count:' \
+    '*:prompt:_message'
+}
+_helios "$@"
+--- stderr
+== ["completion", "generate", "fish"]
+exit: 0
+--- stdout
+complete -c helios -l provider -r -f -a 'fake openai anthropic gemini generic openai-compatible'
+complete -c helios -l workspace -r -f
+complete -c helios -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec resume models review sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff'
+complete -c helios -l model -r -f
+complete -c helios -l base-url -r -f
+complete -c helios -l db-path -r -f
+complete -c helios -l resume -r -f
+complete -c helios -l config -r -f
+complete -c helios -l json
+complete -c helios -l output-format -r -f -a 'text json stream-json'
+complete -c helios -l prefix -r -f
+complete -c helios -l name -r -f
+complete -c helios -l output -r -f
+complete -c helios -l input -r -f
+complete -c helios -l query -r -f
+complete -c helios -l objective -r -f
+complete -c helios -l scope -r -f
+complete -c helios -l worktree
+complete -c helios -l ref -r -f
+complete -c helios -l token-stdin
+complete -c helios -l model -r -f
+complete -c agent-cli -l base-url -r -f
+complete -c agent-cli -l db-path -r -f
+complete -c agent-cli -l config -r -f
+complete -c agent-cli -l resume -r -f
+complete -c agent-cli -l query -r -f
+complete -c agent-cli -l session -r -f
+complete -c agent-cli -l context-file -r -f
+complete -c agent-cli -l memory-query -r -f
+complete -c agent-cli -l worktree
+complete -c agent-cli -l keep-worktree
+complete -c agent-cli -l ref -r -f
+complete -c agent-cli -l json
+complete -c agent-cli -l output-format -r -f -a 'text json stream-json'
+complete -c agent-cli -f -a 'init config auth doctor completion providers permissions mcp lsp hooks skills subagents tui status run exec resume models review sessions database audit jobs tasks agents eval perf self trust registry search context usage memory plugins verify diff'
+complete -c agent-cli -l prefix -r -f
+complete -c agent-cli -l name -r -f
+complete -c agent-cli -l from -r -f
+complete -c agent-cli -l sha256 -r -f
+complete -c agent-cli -l compat-agent-cli
+complete -c agent-cli -l public-key-file -r -f
+complete -c agent-cli -l registry-id -r -f
+complete -c agent-cli -l source -r -f
+complete -c agent-cli -l allow-network
+complete -c agent-cli -l file -r -f
+complete -c agent-cli -l root -r -f
+complete -c agent-cli -l objective -r -f
+complete -c agent-cli -l scope -r -f
+complete -c agent-cli -l worktree
+complete -c agent-cli -l concurrency -r -f
+complete -c agent-cli -l max-iterations -r -f
+complete -c agent-cli -l max-tokens -r -f
+complete -c agent-cli -l max-tool-calls -r -f
+complete -c agent-cli -l wall-clock -r -f
+complete -c agent-cli -l tick-ms -r -f
+complete -c agent-cli -l channel-capacity -r -f
+complete -c agent-cli -l scroll-step -r -f
+complete -c agent-cli -l color -r -f -a 'auto always never'
+complete -c agent-cli -l force
+complete -c agent-cli -l token-stdin
+complete -c agent-cli -l registry -r -f
+complete -c agent-cli -l trust-store -r -f
+--- stderr
+== ["completion", "install", "zsh", "--path", "out.zsh"]
+exit: 0
+--- stdout
+out.zsh
+--- stderr
+== ["search", "--query", "q"]
+exit: 0
+--- stdout
+--- stderr
+== ["search", "--query", "--db-path"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--db-path requires a value
+
+== ["search"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+search requires --query
+
+== ["--workspace", "{WS}", "config", "path"]
+exit: 0
+--- stdout
+<ROOT>/ws/.helios/config.toml
+--- stderr
+== ["config", "path", "--workspace", "{WS}"]
+exit: 0
+--- stdout
+<ROOT>/ws/.helios/config.toml
+--- stderr
+== ["--workspace"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--workspace requires a path
+
+== ["--workspace", "-x"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--workspace requires a path
+
+== ["--workspace", "/nonexistent-helios-dir", "config", "path"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+invalid --workspace: No such file or directory (os error 2)
+
+== ["hello", "world"]
+exit: 0
+--- stdout
+TurnStarted
+TurnCompleted
+--- stderr
+== ["frobnicate"]
+exit: 0
+--- stdout
+TurnStarted
+TurnCompleted
+--- stderr
+== ["not-a-command", "--help"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown command: not-a-command
+
+== ["exec", "--", "prompt"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown option: --
+
+== ["exec", "-prompt"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown option: -prompt
+
+== ["exec", "-5", "degrees"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown option: -5
+
+== ["exec", "run", "tests"]
+exit: 0
+--- stdout
+fake: tests
+--- stderr
+== ["run"]
+exit: 0
+--- stdout
+TurnStarted
+TurnCompleted
+--- stderr
+== ["exec"]
+exit: 0
+--- stdout
+fake: hello
+--- stderr
+== ["exec", ""]
+exit: 0
+--- stdout
+fake: 
+--- stderr
+== ["exec", "--output-format", "json", "p"]
+exit: 0
+--- stdout
+{"kind":"result","payload":{"errors":[],"result":"fake: p","status":"complete","tool_calls":0,"usage":{}},"schema_version":1,"sequence":0,"session_id":1,"timestamp":<TS>,"turn_id":1}
+--- stderr
+== ["exec", "--output-format", "yaml", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+unknown output format: yaml
+
+== ["run", "--output-format", "json", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--output-format is only available with exec
+
+== ["exec", "--tui", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+exec is headless and cannot initialize the TUI
+
+== ["--tui", "exec", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+exec is headless and cannot initialize the TUI
+
+== ["--db-path", "{WS}/s.db", "exec", "--output-format", "json", "p"]
+exit: 0
+--- stdout
+{"kind":"result","payload":{"errors":[],"result":"fake: p","status":"complete","tool_calls":0,"usage":{}},"schema_version":1,"sequence":0,"session_id":1,"timestamp":<TS>,"turn_id":1}
+--- stderr
+== ["--image", "a.png", "exec", "p"]
+exit: 1
+--- stdout
+--- stderr
+helios error: a.png: No such file or directory (os error 2)
+== ["exec", "--image", "a.png", "--image", "b.png", "p"]
+exit: 1
+--- stdout
+--- stderr
+helios error: a.png: No such file or directory (os error 2)
+== ["--provider", "-x", "exec", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--provider requires a value
+
+== ["--effort", "bogus", "exec", "p"]
+exit: 2
+--- stdout
+helios [run|exec] [OPTIONS] [PROMPT]
+
+No command opens the interactive TTY session; use exec for headless automation.
+
+Commands:
+  init         [--force]    initialize a workspace
+  config       ACTION       inspect or mutate typed configuration
+  auth         ACTION PROVIDER manage provider credentials
+  doctor                    inspect local runtime health
+  completion   ACTION SHELL generate or install shell completion
+  providers    ACTION       configure model providers
+  permissions  ACTION       configure execution permissions
+  mcp          ACTION       configure MCP servers
+  lsp          ACTION       configure language servers
+  hooks        ACTION       inspect and test hooks
+  skills       ACTION       discover and validate skills
+  subagents    ACTION       run isolated subagents
+  tui          ACTION       configure the terminal UI
+  status       [--json]     show consolidated runtime status
+  run          PROMPT       run one agent turn
+  exec         PROMPT       run one headless agent turn
+  resume       [latest|ID|TITLE] resume a workspace session in the interactive TTY
+  models       [--json]     list local provider/model metadata
+  review       [security|performance|tests] [--json] run a bounded read-only current-diff review
+  sessions     ACTION       inspect persisted sessions
+  database     ACTION       backup or restore the database
+  audit        ACTION       inspect bounded audit events
+  jobs         ACTION       manage background jobs
+  tasks        bg|list|show|status|cancel|adopt manage durable background agent tasks
+  agents       run|list|status|show|cancel|adopt run and inspect isolated subagents
+  eval         ACTION       run offline evaluations
+  perf         ACTION       measure offline performance
+  self         ACTION       manage the installed binary
+  trust        ACTION       manage public trust keys
+  registry     ACTION       inspect signed registries
+  plugins      ACTION       manage signed plugins
+  search       --query TEXT search persisted sessions
+  context      [--session ID] inspect selected context
+  usage        [--session ID] inspect normalized usage
+  memory       ACTION       manage bounded project memory
+  verify       -- COMMAND ARGS... run explicit verification argv
+  diff                      show a bounded read-only git diff
+
+Global options: --workspace PATH --provider NAME --model NAME --base-url URL --db-path PATH --resume ID|latest --tui --output-format text|json|stream-json (exec only)
+Use `helios COMMAND ACTION --help` for command-specific syntax. Secrets are never displayed.
+--- stderr
+--effort must be auto, minimal, low, medium, high, xhigh, or max
+
+== ["--effort", "auto", "exec", "p"]
+exit: 0
+--- stdout
+fake: p
+--- stderr
+== ["providers", "list"]
+exit: 0
+--- stdout
+{}
+--- stderr
+== ["mcp", "list"]
+exit: 0
+--- stdout
+[]
+--- stderr
+== ["status", "--json"]
+exit: 0
+--- stdout
+{"auth_source":"absent","config":"<ROOT>/ws/.helios/config.toml","config_valid":true,"db_present":false,"jobs":{"entries":0},"latest_report":null,"lsp":{"configured":0,"enabled":0},"mcp":{"configured":0,"enabled":0},"network_hosts":0,"permissions":"read-only","plugins":{"enabled":0,"installed":0},"provider_default":null,"provider_model":null,"secret_values_included":false,"sessions":{"active":0,"archived":0,"total":0},"skills":{"workspace":0},"trust":{"registry_state_present":false,"store_present":false},"version":"0.1.0","workspace":"<ROOT>/ws"}
+--- stderr
