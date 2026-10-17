@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `helios exec` no longer opens the default state database for session tool
+  overrides when `--db-path` is given. Previously text-mode runs could read and
+  write the default database regardless of the requested path.
+- The workspace sandbox allows `/dev/null` writes, so `2>/dev/null` redirections
+  work inside confined commands, and it allows moving directories between
+  writable parents. Plugin uninstall previously failed with EXDEV under the sandbox.
 - Child processes run with network denied now also refuse IPv4 and IPv6
   socket creation through a seccomp filter. This closes UDP and DNS, which
   Landlock cannot restrict. Covered by a probe test with a network-allowed control.
