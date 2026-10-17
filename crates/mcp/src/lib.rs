@@ -1,3 +1,5 @@
+pub mod oauth_pkce;
+
 use agent_sandbox::{PermissionClass, PermissionEngine, PermissionError};
 use agent_terminal::CancellationToken;
 use serde::{Deserialize, Serialize};

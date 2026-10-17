@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- LSP language servers now run inside the workspace OS sandbox with network
+  denied, like MCP stdio servers. Previously they ran unconfined.
+- `agent_mcp::oauth_pkce` adds an authorization-code login with PKCE on a
+  loopback redirect, tested against a local fake provider. It is library-level
+  only: no CLI command uses it and tokens are not stored.
 - `helios run|exec --image PATH` attaches PNG, JPEG, GIF or WebP images
   (at most 4, 5 MiB each) to the prompt. Paths must resolve inside the
   workspace and the bytes must match the image signature. Images are sent as

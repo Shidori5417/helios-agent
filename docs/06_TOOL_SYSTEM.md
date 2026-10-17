@@ -70,7 +70,7 @@ Tests cover writes outside the workspace, reads of a credential-like directory o
 
 HTTP MCP servers can authenticate with OAuth 2.0 client credentials. The `[[mcp_server]]` entry names three things: `oauth_token_url` (https only), `oauth_client_id_env` and `oauth_client_secret_env` (environment variable names; values are never accepted in the config), and optionally `oauth_scope`. Literal values are rejected. The access token is held in memory only, refreshed before it expires (expiry defaults to 300 s when the server omits `expires_in`), and dropped on a 401 so the next request fetches a new one. The token endpoint is network access, so it passes the server's host allowlist. Errors name the HTTP status but never the response body or the credentials.
 
-Scope limit: only client credentials is implemented. Interactive authorization-code flows with PKCE, which need a browser redirect, are not implemented and cannot be verified without a live authorization server.
+Scope limit: the configured runtime path implements only client credentials. `agent_mcp::oauth_pkce::login` implements the authorization-code flow with PKCE (S256, RFC 7636) on a loopback listener. It is tested against a local fake provider, but no CLI command calls it and its tokens are not persisted, so it is not yet usable by a user. It also needs a live authorization server to verify end to end.
 
 ## Web fetch
 
