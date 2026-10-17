@@ -1851,9 +1851,15 @@ pub(crate) fn mcp_discover_server(
     };
     let cancellation = CancellationToken::default();
     let hook = mcp_child_hook(workspace, server.network_allowed);
-    let mut client = McpClient::new(server.config, policy, 64 * 1024)
-        .with_child_hook(hook)
-        .with_oauth(server.oauth.clone());
+    let login_required = server.oauth_login.is_some();
+    let name = server.config.name.clone();
+    let mut client = attach_login(
+        McpClient::new(server.config, policy, 64 * 1024)
+            .with_child_hook(hook)
+            .with_oauth(server.oauth.clone()),
+        &name,
+        login_required,
+    );
     client
         .initialize(&cancellation)
         .map_err(|error| error.to_string())?;

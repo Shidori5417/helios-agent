@@ -48,6 +48,37 @@ pub struct LoadedMcpServer {
     pub network_allowed: bool,
     /// Client-credentials OAuth for HTTP servers; secrets come from env names.
     pub oauth: Option<OAuthConfig>,
+    /// Interactive authorization-code login (`helios mcp login`).
+    pub oauth_login: Option<OAuthLoginConfig>,
+}
+
+/// Settings for an interactive authorization-code login (PKCE). It is a public
+/// client: only the name of the environment variable holding the client id is
+/// configured, and there is no client secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OAuthLoginConfig {
+    pub authorization_url: String,
+    pub token_url: String,
+    pub client_id_env: String,
+    pub scope: Option<String>,
+}
+
+/// An access token obtained by an interactive login. The caller keeps it (the CLI
+/// stores it in the system keyring); the client only borrows it for Bearer auth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginToken {
+    pub value: String,
+    pub expires_at_unix: u64,
+}
+
+impl LoginToken {
+    /// Whether the token is still usable for at least `margin_seconds`.
+    pub fn valid_for(&self, margin_seconds: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        self.expires_at_unix > now.saturating_add(margin_seconds)
+    }
 }
 
 /// OAuth 2.0 client-credentials settings. Only the names of environment
@@ -90,6 +121,7 @@ pub struct McpServerFile {
     /// Let this stdio server open TCP connections (sandbox exception).
     #[serde(default)]
     pub allow_network: bool,
+    pub oauth_authorization_url: Option<String>,
     pub oauth_token_url: Option<String>,
     pub oauth_client_id_env: Option<String>,
     pub oauth_client_secret_env: Option<String>,
@@ -131,6 +163,7 @@ pub fn load_config(
                 ));
             }
             let oauth = oauth_from_file(&server)?;
+            let oauth_login = login_from_file(&server)?;
             let cwd = server
                 .cwd
                 .map(|cwd| workspace.join(cwd))
@@ -183,12 +216,56 @@ pub fn load_config(
                 allowed_hosts,
                 network_allowed: server.allow_network,
                 oauth,
+                oauth_login,
             })
         })
         .collect()
 }
 
+/// Interactive login is selected by `oauth_authorization_url`. It needs a token
+/// endpoint and a client id variable, and rejects a client secret.
+fn login_from_file(server: &McpServerFile) -> Result<Option<OAuthLoginConfig>, McpError> {
+    let Some(authorization_url) = server.oauth_authorization_url.clone() else {
+        return Ok(None);
+    };
+    if server.oauth_client_secret_env.is_some() {
+        return Err(McpError::Protocol(
+            "oauth_authorization_url selects a public-client login; remove oauth_client_secret_env"
+                .into(),
+        ));
+    }
+    let (Some(token_url), Some(client_id_env)) = (
+        server.oauth_token_url.clone(),
+        server.oauth_client_id_env.clone(),
+    ) else {
+        return Err(McpError::Protocol(
+            "oauth login needs oauth_token_url and oauth_client_id_env".into(),
+        ));
+    };
+    if (!authorization_url.starts_with("https://") || !token_url.starts_with("https://"))
+        && !cfg!(test)
+    {
+        return Err(McpError::Protocol(
+            "oauth login endpoints must use https".into(),
+        ));
+    }
+    if !valid_env_name(&client_id_env) {
+        return Err(McpError::Protocol(
+            "oauth client id must name an environment variable, not contain a value".into(),
+        ));
+    }
+    Ok(Some(OAuthLoginConfig {
+        authorization_url,
+        token_url,
+        client_id_env,
+        scope: server.oauth_scope.clone(),
+    }))
+}
+
 fn oauth_from_file(server: &McpServerFile) -> Result<Option<OAuthConfig>, McpError> {
+    if server.oauth_authorization_url.is_some() {
+        return Ok(None);
+    }
     let fields = [
         &server.oauth_token_url,
         &server.oauth_client_id_env,
@@ -341,6 +418,9 @@ pub struct McpClient<P> {
     child_hook: Option<agent_terminal::ChildHook>,
     oauth: Option<OAuthConfig>,
     oauth_token: Option<CachedToken>,
+    /// Set when the server uses interactive login; requests then need `login_token`.
+    login_required: bool,
+    login_token: Option<LoginToken>,
 }
 
 /// An access token kept in memory only, with its expiry.
@@ -354,6 +434,15 @@ impl<P: McpPolicy> McpClient<P> {
     /// Enables client-credentials OAuth for this HTTP server.
     pub fn with_oauth(mut self, oauth: Option<OAuthConfig>) -> Self {
         self.oauth = oauth;
+        self
+    }
+
+    /// Declares that this HTTP server needs an interactive login and supplies the
+    /// stored token, if any. Without a valid token, requests fail before any
+    /// network use and tell the user to run `helios mcp login`.
+    pub fn with_login(mut self, required: bool, token: Option<LoginToken>) -> Self {
+        self.login_required = required;
+        self.login_token = token;
         self
     }
 
@@ -455,6 +544,8 @@ impl<P: McpPolicy> McpClient<P> {
             child_hook: None,
             oauth: None,
             oauth_token: None,
+            login_required: false,
+            login_token: None,
         }
     }
 
@@ -675,6 +766,20 @@ impl<P: McpPolicy> McpClient<P> {
         if self.oauth.is_some() {
             let token = self.oauth_access_token(cancellation)?;
             request = request.bearer_auth(token);
+        } else if self.login_required {
+            let name = self.config.name.clone();
+            match self
+                .login_token
+                .as_ref()
+                .filter(|token| token.valid_for(30))
+            {
+                Some(token) => request = request.bearer_auth(&token.value),
+                None => {
+                    return Err(McpError::Protocol(format!(
+                    "not logged in to {name} (or the login expired); run `helios mcp login {name}`"
+                )))
+                }
+            }
         } else if let Some(name) = auth_env {
             if let Ok(value) = std::env::var(name) {
                 request = request.bearer_auth(value);
@@ -687,9 +792,14 @@ impl<P: McpPolicy> McpClient<P> {
                 McpError::Protocol(error.to_string())
             }
         })?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED && self.oauth.is_some() {
-            // Drop the token so the next request fetches a fresh one.
-            self.oauth_token = None;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            // Drop rejected tokens so the next request fetches or asks for a new one.
+            if self.oauth.is_some() {
+                self.oauth_token = None;
+            }
+            if self.login_required {
+                self.login_token = None;
+            }
         }
         if let Some(session) = response
             .headers()
@@ -854,6 +964,8 @@ mod tests {
             child_hook: None,
             oauth: None,
             oauth_token: None,
+            login_required: false,
+            login_token: None,
         };
         client
             .initialize(&CancellationToken::default())
@@ -902,6 +1014,8 @@ mod tests {
             child_hook: None,
             oauth: None,
             oauth_token: None,
+            login_required: false,
+            login_token: None,
         };
         assert!(matches!(
             client.initialize(&CancellationToken::default()),
@@ -1262,6 +1376,7 @@ mod tests {
             url: Some("https://example.com/mcp".into()),
             auth_env: None,
             allow_network: false,
+            oauth_authorization_url: None,
             oauth_token_url: Some("https://auth.example.com/token".into()),
             oauth_client_id_env: Some("sk-live-literal-123".into()),
             oauth_client_secret_env: Some("CLIENT_SECRET".into()),
@@ -1272,5 +1387,169 @@ mod tests {
         assert!(oauth_from_file(&file).expect("valid").is_some());
         file.oauth_client_secret_env = None;
         assert!(oauth_from_file(&file).is_err());
+    }
+
+    fn login_file() -> McpServerFile {
+        McpServerFile {
+            name: "x".into(),
+            command: String::new(),
+            args: vec![],
+            cwd: None,
+            enabled: true,
+            env_allowlist: vec![],
+            tool_include: vec![],
+            tool_exclude: vec![],
+            allowed_hosts: vec![],
+            transport: Some("streamable_http".into()),
+            url: Some("https://example.com/mcp".into()),
+            auth_env: None,
+            allow_network: false,
+            oauth_authorization_url: Some("https://auth.example.com/authorize".into()),
+            oauth_token_url: Some("https://auth.example.com/token".into()),
+            oauth_client_id_env: Some("CLIENT_ID".into()),
+            oauth_client_secret_env: None,
+            oauth_scope: Some("tools.read".into()),
+        }
+    }
+
+    #[test]
+    fn login_config_is_a_public_client_and_rejects_secrets_and_missing_parts() {
+        let mut file = login_file();
+        assert!(oauth_from_file(&file)
+            .expect("not client credentials")
+            .is_none());
+        let login = login_from_file(&file).expect("valid").expect("login");
+        assert_eq!(login.client_id_env, "CLIENT_ID");
+        assert_eq!(login.scope.as_deref(), Some("tools.read"));
+        file.oauth_client_secret_env = Some("CLIENT_SECRET".into());
+        assert!(
+            login_from_file(&file).is_err(),
+            "a public client has no secret"
+        );
+        file.oauth_client_secret_env = None;
+        file.oauth_client_id_env = Some("sk-live-literal-123".into());
+        assert!(
+            login_from_file(&file).is_err(),
+            "client id must be an env name"
+        );
+        file.oauth_client_id_env = Some("CLIENT_ID".into());
+        file.oauth_token_url = None;
+        assert!(
+            login_from_file(&file).is_err(),
+            "token endpoint is required"
+        );
+    }
+
+    fn http_config(url: String) -> McpServerConfig {
+        McpServerConfig {
+            name: "http".into(),
+            command: String::new(),
+            args: vec![],
+            cwd: None,
+            env_allowlist: vec![],
+            enabled: true,
+            tool_include: vec![],
+            tool_exclude: vec![],
+            startup_timeout: Duration::from_secs(1),
+            tool_timeout: Duration::from_secs(1),
+            permission_class: PermissionClass::ReadOnly,
+            transport: McpTransport::StreamableHttp {
+                url,
+                auth_env: None,
+                session_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn missing_or_expired_login_token_fails_before_any_request() {
+        for token in [
+            None,
+            Some(LoginToken {
+                value: "old".into(),
+                expires_at_unix: 1,
+            }),
+        ] {
+            // Port 9 refuses connections: reaching it would produce a different error.
+            let mut client = McpClient::new(
+                http_config("http://127.0.0.1:9".into()),
+                LocalNetworkPolicy,
+                4096,
+            )
+            .with_login(true, token);
+            let error = client
+                .initialize(&CancellationToken::default())
+                .expect_err("login needed");
+            assert!(
+                error.to_string().contains("helios mcp login http"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn login_token_is_sent_as_bearer_and_dropped_after_a_401() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = thread::spawn(move || {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = Vec::new();
+                let mut byte = [0_u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).expect("header");
+                    request.push(byte[0]);
+                }
+                let header = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                assert!(header.contains("authorization: bearer login-tok"));
+                let length = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content length");
+                let mut body = vec![0_u8; length];
+                stream.read_exact(&mut body).expect("body");
+                let (status, payload) = if index == 0 {
+                    (
+                        "200 OK",
+                        json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"mock"}}})
+                            .to_string(),
+                    )
+                } else {
+                    ("401 Unauthorized", "{}".to_owned())
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    payload.len()
+                )
+                .expect("respond");
+            }
+        });
+        let token = LoginToken {
+            value: "login-tok".into(),
+            expires_at_unix: u64::MAX / 2,
+        };
+        let mut client = McpClient::new(
+            http_config(format!("http://{address}")),
+            LocalNetworkPolicy,
+            4096,
+        )
+        .with_login(true, Some(token));
+        client
+            .initialize(&CancellationToken::default())
+            .expect("initialize with the stored token");
+        // The server answers 401 to the next request, so the token must be dropped.
+        let _ = client.discover_tools(&CancellationToken::default());
+        let error = client
+            .discover_tools(&CancellationToken::default())
+            .expect_err("login required again");
+        assert!(
+            error.to_string().contains("helios mcp login http"),
+            "{error}"
+        );
+        server.join().expect("server");
     }
 }

@@ -506,6 +506,19 @@ pub(crate) fn runtime_command(command: RuntimeCommand) -> Result<(), String> {
         if section == "mcp" && action == "auth" {
             return mcp_auth_command(&path);
         }
+        if section == "mcp" && matches!(action, "login" | "logout") {
+            let id = value_after(&args[1..], "--id")?
+                .or_else(|| args.get(1).cloned())
+                .ok_or("mcp login/logout requires an exact server id")?;
+            if !safe_control_id(&id) {
+                return Err("invalid server id".into());
+            }
+            return println_result(if action == "login" {
+                mcp_login_command(&id, &workspace_root()?, &path)
+            } else {
+                mcp_logout_command(&id)
+            });
+        }
         return runtime_server_array_command(section, &args, &path);
     }
     if section == "permissions" {

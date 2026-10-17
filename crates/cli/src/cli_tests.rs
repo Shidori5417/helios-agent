@@ -688,6 +688,7 @@ fn mcp_catalog_uses_qualified_names_and_excludes_disabled_servers() {
     fs::create_dir_all(&root).expect("root");
     let builtin = ToolRegistry::new(&root, PermissionMode::ReadOnly).expect("tools");
     let make_server = |name: &str, enabled: bool| agent_mcp::LoadedMcpServer {
+        oauth_login: None,
         config: agent_mcp::McpServerConfig {
             name: name.into(),
             command: "mock".into(),
@@ -909,4 +910,118 @@ fn image_signatures_cover_the_supported_formats() {
         Some("image/webp")
     );
     assert_eq!(image_media_type(b"<svg>"), None);
+}
+
+#[cfg(test)]
+mod mcp_login_tests {
+    use super::*;
+    use std::{collections::HashMap, sync::Mutex};
+
+    #[derive(Default)]
+    struct MemoryStore(Mutex<HashMap<String, String>>);
+    impl SecretStore for MemoryStore {
+        fn get(&self, account: &str) -> Result<Option<String>, String> {
+            Ok(self.0.lock().expect("lock").get(account).cloned())
+        }
+        fn set(&self, account: &str, token: &str) -> Result<(), String> {
+            self.0
+                .lock()
+                .expect("lock")
+                .insert(account.into(), token.into());
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<(), String> {
+            self.0.lock().expect("lock").remove(account);
+            Ok(())
+        }
+    }
+
+    fn token() -> agent_mcp::LoginToken {
+        agent_mcp::LoginToken {
+            value: "secret-access-token".into(),
+            expires_at_unix: 4_000_000_000,
+        }
+    }
+
+    #[test]
+    fn stored_login_tokens_round_trip_and_ignore_damaged_entries() {
+        let store = MemoryStore::default();
+        assert!(load_login_token(&store, "docs").is_none());
+        store
+            .set(&login_account("docs"), &encode_token(&token()))
+            .expect("store");
+        assert_eq!(load_login_token(&store, "docs"), Some(token()));
+        // The account is namespaced and per server.
+        assert!(load_login_token(&store, "other").is_none());
+        assert_eq!(login_account("docs"), "mcp-oauth:docs");
+        for damaged in [
+            "",
+            "not json",
+            r#"{"v":2,"access_token":"x","expires_at_unix":1}"#,
+            r#"{"v":1,"access_token":"x"}"#,
+        ] {
+            store.set(&login_account("bad"), damaged).expect("store");
+            assert!(load_login_token(&store, "bad").is_none(), "{damaged}");
+        }
+    }
+
+    #[test]
+    fn logout_removes_only_that_servers_token() {
+        let store = MemoryStore::default();
+        for name in ["docs", "wiki"] {
+            store
+                .set(&login_account(name), &encode_token(&token()))
+                .expect("store");
+        }
+        mcp_logout_with_store("docs", &store).expect("logout");
+        assert!(load_login_token(&store, "docs").is_none());
+        assert!(load_login_token(&store, "wiki").is_some());
+    }
+
+    fn login_config(dir: &Path, body: &str) -> PathBuf {
+        fs::create_dir_all(dir).expect("dir");
+        let path = dir.join("helios.toml");
+        fs::write(&path, body).expect("config");
+        path
+    }
+
+    #[test]
+    fn login_refuses_before_any_network_use() {
+        let dir = std::env::temp_dir().join(format!("helios-mcp-login-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = MemoryStore::default();
+        let workspace = dir.canonicalize().unwrap_or(dir.clone());
+        // No oauth_authorization_url: nothing to log in to.
+        let plain = login_config(
+            &dir,
+            "[[mcp_server]]\nname = \"plain\"\ntransport = \"http\"\nurl = \"https://mcp.example.com\"\nallowed_hosts = [\"mcp.example.com\"]\n",
+        );
+        let error = mcp_login_with_store("plain", &workspace, &plain, &store).expect_err("plain");
+        assert!(error.contains("nothing to log in to"), "{error}");
+        // The token endpoint host must be on the server's allowlist.
+        let denied = login_config(
+            &dir,
+            "[[mcp_server]]\nname = \"docs\"\ntransport = \"http\"\nurl = \"https://mcp.example.com\"\nallowed_hosts = [\"mcp.example.com\"]\noauth_authorization_url = \"https://auth.example.com/authorize\"\noauth_token_url = \"https://auth.example.com/token\"\noauth_client_id_env = \"HELIOS_TEST_CLIENT_ID\"\n",
+        );
+        let error = mcp_login_with_store("docs", &workspace, &denied, &store).expect_err("host");
+        assert!(error.contains("allowed_hosts"), "{error}");
+        // With the host allowed, the missing client id variable is reported next.
+        let missing = login_config(
+            &dir,
+            "[[mcp_server]]\nname = \"docs\"\ntransport = \"http\"\nurl = \"https://mcp.example.com\"\nallowed_hosts = [\"mcp.example.com\", \"auth.example.com\"]\noauth_authorization_url = \"https://auth.example.com/authorize\"\noauth_token_url = \"https://auth.example.com/token\"\noauth_client_id_env = \"HELIOS_TEST_CLIENT_ID_UNSET\"\n",
+        );
+        let error = mcp_login_with_store("docs", &workspace, &missing, &store).expect_err("env");
+        assert!(error.contains("HELIOS_TEST_CLIENT_ID_UNSET"), "{error}");
+        // An unavailable keyring is reported before the browser step, not after it.
+        let ready = login_config(
+            &dir,
+            "[[mcp_server]]\nname = \"docs\"\ntransport = \"http\"\nurl = \"https://mcp.example.com\"\nallowed_hosts = [\"mcp.example.com\", \"auth.example.com\"]\noauth_authorization_url = \"https://auth.example.com/authorize\"\noauth_token_url = \"https://auth.example.com/token\"\noauth_client_id_env = \"HELIOS_TEST_CLIENT_ID_SET\"\n",
+        );
+        env::set_var("HELIOS_TEST_CLIENT_ID_SET", "public-client-id");
+        let error = mcp_login_with_store("docs", &workspace, &ready, &UnavailableSecretStore)
+            .expect_err("keyring");
+        assert!(error.contains("unavailable"), "{error}");
+        assert!(load_login_token(&store, "docs").is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

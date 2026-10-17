@@ -6,7 +6,7 @@
 //! access token is returned to the caller only; it is not written to disk and
 //! never reaches model context.
 
-use crate::McpError;
+use crate::{LoginToken, McpError};
 use reqwest::Url;
 use sha2::{Digest, Sha256};
 use std::{
@@ -132,7 +132,10 @@ pub fn parse_callback(request_line: &str, expected_state: &str) -> Result<String
 
 /// Runs the whole login. `announce` receives the URL to open; it is called before
 /// the listener waits, so a caller can print it or launch a browser.
-pub fn login(request: &LoginRequest<'_>, announce: impl FnOnce(&str)) -> Result<String, McpError> {
+pub fn login(
+    request: &LoginRequest<'_>,
+    announce: impl FnOnce(&str),
+) -> Result<LoginToken, McpError> {
     require_https(request.authorize_url)?;
     require_https(request.token_url)?;
     run_login(request, announce)
@@ -145,7 +148,10 @@ fn require_https(endpoint: &str) -> Result<(), McpError> {
     }
 }
 
-fn run_login(request: &LoginRequest<'_>, announce: impl FnOnce(&str)) -> Result<String, McpError> {
+fn run_login(
+    request: &LoginRequest<'_>,
+    announce: impl FnOnce(&str),
+) -> Result<LoginToken, McpError> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
@@ -218,7 +224,7 @@ fn exchange(
     code: &str,
     redirect_uri: &str,
     verifier: &str,
-) -> Result<String, McpError> {
+) -> Result<LoginToken, McpError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(EXCHANGE_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
@@ -245,11 +251,25 @@ fn exchange(
     let body: serde_json::Value = response
         .json()
         .map_err(|_| McpError::Protocol("oauth token response was not JSON".into()))?;
-    body.get("access_token")
+    let value = body
+        .get("access_token")
         .and_then(serde_json::Value::as_str)
         .filter(|token| !token.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| McpError::Protocol("oauth response has no access_token".into()))
+        .ok_or_else(|| McpError::Protocol("oauth response has no access_token".into()))?;
+    // Same bounds as the client-credentials path: default 5 minutes, at most a day.
+    let lifetime = body
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(300)
+        .min(86_400);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    Ok(LoginToken {
+        value,
+        expires_at_unix: now.saturating_add(lifetime),
+    })
 }
 
 #[cfg(test)]
@@ -406,7 +426,12 @@ mod tests {
             });
         })
         .expect("login");
-        assert_eq!(token, "tok-123");
+        assert_eq!(token.value, "tok-123");
+        assert!(
+            token.valid_for(3_500),
+            "expires_in 3600 should leave about an hour"
+        );
+        assert!(!token.valid_for(3_700));
         let form = form_rx.recv().expect("form");
         let fields: std::collections::HashMap<_, _> = Url::parse(&format!("http://x/?{form}"))
             .expect("form url")

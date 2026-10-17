@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `helios mcp login <id>` and `helios mcp logout <id>`: interactive OAuth login
+  (authorization code with PKCE) for HTTP MCP servers. The access token is kept
+  in the system keyring, requests carry it as a Bearer token, and an expired or
+  missing login fails before any request. Configured with `oauth_authorization_url`.
+  Verified against a local fake provider only.
 - `helios exec` no longer opens the default state database for session tool
   overrides when `--db-path` is given. Previously text-mode runs could read and
   write the default database regardless of the requested path.

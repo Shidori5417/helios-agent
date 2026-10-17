@@ -63,6 +63,7 @@ mod args;
 mod helpers;
 mod interactive;
 mod jobs;
+mod mcp_login;
 mod ops;
 mod run;
 mod runtime_ext;
@@ -71,6 +72,7 @@ use args::*;
 use helpers::*;
 use interactive::*;
 use jobs::*;
+use mcp_login::*;
 use ops::*;
 use run::*;
 use runtime_ext::*;
@@ -298,6 +300,7 @@ struct McpRuntime {
     allowed_hosts: Vec<String>,
     network_allowed: bool,
     oauth: Option<agent_mcp::OAuthConfig>,
+    login_required: bool,
     advertised: Vec<String>,
     discovered_tools: Vec<agent_mcp::McpTool>,
     client: McpClient<HostAllowlist<PermissionPolicy>>,
@@ -336,6 +339,8 @@ impl RuntimeExecutor {
             let allowed_hosts = server.allowed_hosts.clone();
             let network_allowed = server.network_allowed;
             let oauth = server.oauth.clone();
+            let login_required = server.oauth_login.is_some();
+            let name = server.config.name.clone();
             let hook = mcp_child_hook(workspace, network_allowed);
             let policy = HostAllowlist {
                 inner: PermissionPolicy::new(engine),
@@ -348,9 +353,14 @@ impl RuntimeExecutor {
                 allowed_hosts,
                 network_allowed,
                 oauth: oauth.clone(),
-                client: McpClient::new(server.config, policy, 64 * 1024)
-                    .with_child_hook(hook)
-                    .with_oauth(oauth),
+                login_required,
+                client: attach_login(
+                    McpClient::new(server.config, policy, 64 * 1024)
+                        .with_child_hook(hook)
+                        .with_oauth(oauth),
+                    &name,
+                    login_required,
+                ),
                 advertised,
                 discovered_tools: Vec::new(),
                 discovered: false,
@@ -544,6 +554,7 @@ impl RuntimeExecutor {
             server.allowed_hosts = replacement.allowed_hosts;
             server.network_allowed = replacement.network_allowed;
             server.oauth = replacement.oauth.clone();
+            server.login_required = replacement.oauth_login.is_some();
         }
         let policy = HostAllowlist {
             inner: PermissionPolicy::new(
@@ -552,9 +563,13 @@ impl RuntimeExecutor {
             ),
             allowed_hosts: server.allowed_hosts.clone(),
         };
-        server.client = McpClient::new(server.config.clone(), policy, 64 * 1024)
-            .with_child_hook(mcp_child_hook(&self.workspace, server.network_allowed))
-            .with_oauth(server.oauth.clone());
+        server.client = attach_login(
+            McpClient::new(server.config.clone(), policy, 64 * 1024)
+                .with_child_hook(mcp_child_hook(&self.workspace, server.network_allowed))
+                .with_oauth(server.oauth.clone()),
+            &server.name,
+            server.login_required,
+        );
         server.discovered = false;
         server.advertised.clear();
         server.discovered_tools.clear();
@@ -865,7 +880,7 @@ fn print_command_help(path: &[String]) {
         "self" => ("helios self version|install|update|uninstall".into(), "Self-management is user-local and never uses sudo."),
         "self install" => ("helios self install [--prefix PATH] [--name NAME] [--compat-agent-cli]".into(), "Default prefix is ~/.local; installation is atomic and creates an identity marker."),
         "self update" => ("helios self update --from PATH --sha256 HEX".into(), "Local update requires an exact SHA-256; release update additionally requires external cosign verification."),
-        "mcp" => ("helios mcp list|add|remove|enable|disable|show|test".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
+        "mcp" => ("helios mcp list|add|remove|enable|disable|show|test|login|logout".into(), "MCP configuration is typed; HTTP requires explicit host/network policy."),
         "mcp add" => ("helios mcp add ID (--command CMD | --url HTTPS_URL) [--arg ARG] [--auth-env ENV]".into(), "Only argv and secret environment-name references are accepted; literal secrets and shell strings are rejected."),
         "permissions" => ("helios permissions show|set-mode|add-network-host|remove-network-host".into(), "Permission changes are atomic and feed the runtime policy."),
         "permissions set-mode" => ("helios permissions set-mode read-only|workspace-write".into(), "Changes the effective permission mode atomically."),
@@ -1435,9 +1450,15 @@ fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result
         };
         let cancellation = CancellationToken::default();
         let hook = mcp_child_hook(&workspace, server.network_allowed);
-        let mut client = McpClient::new(server.config, policy, 64 * 1024)
-            .with_child_hook(hook)
-            .with_oauth(server.oauth.clone());
+        let login_required = server.oauth_login.is_some();
+        let name = server.config.name.clone();
+        let mut client = attach_login(
+            McpClient::new(server.config, policy, 64 * 1024)
+                .with_child_hook(hook)
+                .with_oauth(server.oauth.clone()),
+            &name,
+            login_required,
+        );
         client
             .initialize(&cancellation)
             .map_err(|error| error.to_string())?;
