@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Linux: command execution (`shell`, `process`, `verify`, `git diff`) runs
+  under a Landlock ruleset in WorkspaceWrite mode: writes and reads are
+  confined to the workspace, temp, the tool spill dir and cargo caches, and
+  TCP connect/bind is denied. PTY commands are refused in this mode.
+  `HELIOS_OS_SANDBOX=off` disables it; unsupported kernels run unrestricted.
 - New `web_fetch` tool: https text pages from hosts listed in
   `permissions.allowed_network_hosts`, with no redirects, a 2 MiB body cap,
   HTML-to-text conversion, approval through the usual broker, and no

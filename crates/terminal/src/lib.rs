@@ -74,11 +74,32 @@ impl CancellationToken {
     }
 }
 
+/// Runs once in the child between fork and exec (Unix only; ignored
+/// elsewhere). It must only make async-signal-safe calls, e.g. applying a
+/// sandbox, and must not allocate.
+pub type ChildHook = std::sync::Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 pub fn run(
     spec: CommandSpec,
     cancellation: &CancellationToken,
 ) -> Result<CommandResult, TerminalError> {
+    run_with_hook(spec, cancellation, None)
+}
+
+/// Like [`run`], with a hook applied in the child before exec. A PTY command
+/// cannot take a hook, so it is refused instead of silently running unrestricted.
+pub fn run_with_hook(
+    spec: CommandSpec,
+    cancellation: &CancellationToken,
+    child_hook: Option<ChildHook>,
+) -> Result<CommandResult, TerminalError> {
     if spec.requires_pty {
+        if child_hook.is_some() {
+            return Err(TerminalError::Start(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "PTY commands cannot run under the OS sandbox",
+            )));
+        }
         return run_pty(spec, cancellation);
     }
     let mut command = Command::new(&spec.program);
@@ -91,13 +112,18 @@ pub fn run(
         .stderr(Stdio::piped());
     #[cfg(unix)]
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if let Some(hook) = &child_hook {
+                hook()?;
             }
             Ok(())
         });
     }
+    #[cfg(not(unix))]
+    let _ = child_hook;
     let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("stdout pipe");
     let stderr = child.stderr.take().expect("stderr pipe");

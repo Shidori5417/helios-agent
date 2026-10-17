@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+pub mod landlock;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionMode {
     ReadOnly,

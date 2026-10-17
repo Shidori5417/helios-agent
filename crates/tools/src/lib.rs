@@ -2,7 +2,7 @@ mod filter;
 mod web;
 
 use agent_sandbox::{PermissionClass, PermissionEngine, PermissionError, PermissionMode};
-use agent_terminal::{run, CancellationToken, CommandSpec, CommandStatus};
+use agent_terminal::{run_with_hook, CancellationToken, CommandSpec, CommandStatus};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -272,6 +272,8 @@ pub struct ToolRegistry {
     snapshot_hook: Option<SnapshotHook>,
     /// Hosts from `permissions.allowed_network_hosts`. Empty disables `web_fetch`.
     web_hosts: Vec<String>,
+    /// Kernel restriction applied to every child process (Linux, WorkspaceWrite).
+    os_sandbox: Option<std::sync::Arc<agent_sandbox::landlock::ChildSandbox>>,
 }
 
 impl agent_core::ToolExecutor for ToolRegistry {
@@ -350,15 +352,17 @@ impl agent_core::ToolExecutor for ToolRegistry {
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>, mode: PermissionMode) -> Result<Self, ToolError> {
         let root = root.into();
+        let spill_dir = tool_output_cache_dir(&root);
         Ok(Self {
             permissions: PermissionEngine::new(&root, mode)?,
             output_budget: 8 * 1024,
             timeout: Duration::from_secs(30),
-            spill_dir: tool_output_cache_dir(&root),
+            spill_dir: spill_dir.clone(),
             cancellation: CancellationToken::default(),
             approval: None,
             disabled: BTreeSet::new(),
             snapshot_hook: None,
+            os_sandbox: build_os_sandbox(&root, mode, &spill_dir),
             web_hosts: Vec::new(),
         })
     }
@@ -649,7 +653,7 @@ impl ToolRegistry {
                 })
             }
         };
-        let result = run(
+        let result = run_with_hook(
             CommandSpec {
                 program: "git".into(),
                 args: args.into_iter().map(String::from).collect(),
@@ -661,6 +665,7 @@ impl ToolRegistry {
                 env_allowlist: vec![],
             },
             &CancellationToken::default(),
+            self.child_hook(),
         )?;
         Ok(ToolOutcome {
             status: match result.status {
@@ -683,7 +688,7 @@ impl ToolRegistry {
                 tool: "verify".into(),
                 reason: "argv must not be empty".into(),
             })?;
-        let result = run(
+        let result = run_with_hook(
             CommandSpec {
                 program: program.clone(),
                 args: args.to_vec(),
@@ -695,6 +700,7 @@ impl ToolRegistry {
                 env_allowlist: vec![],
             },
             &CancellationToken::default(),
+            self.child_hook(),
         )?;
         Ok(VerificationResult {
             status: match result.status {
@@ -1073,6 +1079,16 @@ impl ToolRegistry {
         ))
     }
 
+    /// Whether child processes run under the kernel sandbox.
+    pub fn os_sandbox_active(&self) -> bool {
+        self.os_sandbox.is_some()
+    }
+
+    fn child_hook(&self) -> Option<agent_terminal::ChildHook> {
+        let sandbox = self.os_sandbox.clone()?;
+        Some(std::sync::Arc::new(move || sandbox.restrict_current()))
+    }
+
     /// Validates a `web_fetch` request against the allowlist and the mode.
     fn web_target(&self, args: &Value) -> Result<web::WebTarget, ToolError> {
         #[derive(Deserialize)]
@@ -1191,7 +1207,7 @@ impl ToolRegistry {
         };
         let program_name = input.program.clone();
         let input_args = input.args.clone();
-        let result = run(
+        let result = run_with_hook(
             CommandSpec {
                 program: input.program,
                 args: input.args,
@@ -1203,6 +1219,7 @@ impl ToolRegistry {
                 env_allowlist: vec![],
             },
             cancellation,
+            self.child_hook(),
         )
         .map_err(|error| match error {
             agent_terminal::TerminalError::Start(io) => ToolError::InvalidArguments {
@@ -1298,6 +1315,56 @@ fn bounded_with_spill(
         data: data[..floor_char_boundary(&data, limit)].to_owned(),
         truncated: true,
         spill_ref,
+    }
+}
+
+/// Builds the child-process sandbox for WorkspaceWrite on Linux. Writable:
+/// the workspace, temp dir, tool spill dir and cargo's download caches (never
+/// `~/.cargo` as a whole, which holds credentials). Readable: system roots,
+/// PATH entries, the rust toolchain and git configuration. Everything else in
+/// the home directory is denied. `HELIOS_OS_SANDBOX=off` disables it.
+fn build_os_sandbox(
+    root: &Path,
+    mode: PermissionMode,
+    spill_dir: &Path,
+) -> Option<std::sync::Arc<agent_sandbox::landlock::ChildSandbox>> {
+    if mode != PermissionMode::WorkspaceWrite
+        || std::env::var("HELIOS_OS_SANDBOX").is_ok_and(|value| value == "off")
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let _ = fs::create_dir_all(spill_dir);
+        let mut writable = vec![
+            root.to_path_buf(),
+            std::env::temp_dir(),
+            spill_dir.to_path_buf(),
+        ];
+        let mut readable = agent_sandbox::landlock::system_read_roots();
+        if let Some(path) = std::env::var_os("PATH") {
+            readable.extend(std::env::split_paths(&path));
+        }
+        if let Some(home) = &home {
+            writable.push(home.join(".cargo/registry"));
+            writable.push(home.join(".cargo/git"));
+            readable.push(home.join(".cargo/bin"));
+            readable.push(home.join(".cargo/config.toml"));
+            readable.push(home.join(".rustup"));
+            readable.push(home.join(".gitconfig"));
+            readable.push(home.join(".config/git"));
+        }
+        match agent_sandbox::landlock::ChildSandbox::new(&writable, &readable) {
+            Ok(Some(sandbox)) => Some(std::sync::Arc::new(sandbox)),
+            // Unsupported kernels run unrestricted; `os_sandbox_active` reports it.
+            Ok(None) | Err(_) => None,
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (root, spill_dir);
+        None
     }
 }
 
@@ -1746,6 +1813,100 @@ echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n
         );
         assert!(outcome.data.contains("Example Domain"), "{}", outcome.data);
         assert!(!outcome.data.contains("<html"));
+    }
+
+    /// Runs `sh -c` under the registry's sandbox and returns the exit code.
+    #[cfg(target_os = "linux")]
+    fn sandboxed_sh(registry: &ToolRegistry, script: &str) -> Result<ToolOutcome, ToolError> {
+        run_tool(
+            registry,
+            "shell",
+            json!({"program": "/bin/sh", "args": ["-c", script]}),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn os_sandbox_confines_child_processes_to_the_workspace_and_no_network() {
+        let root = root("os-sandbox");
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite).expect("registry");
+        if !registry.os_sandbox_active() {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        // A PTY cannot take the hook, so it must be refused rather than run free.
+        let pty = run_tool(
+            &registry,
+            "process",
+            json!({"program": "/bin/sh", "args": ["-c", "true"], "requires_pty": true}),
+        );
+        assert!(pty.is_err(), "PTY command ran outside the sandbox");
+
+        // Inside the workspace: allowed.
+        let inside =
+            sandboxed_sh(&registry, "echo ok > inside.txt && cat inside.txt").expect("run");
+        assert_eq!(inside.status, ToolStatus::Ok, "{}", inside.data);
+        assert!(inside.data.contains("ok"));
+
+        // Outside every allowed root: writes and reads are refused.
+        let outside = std::path::PathBuf::from("/var/tmp")
+            .join(format!("helios-os-sandbox-probe-{}", std::process::id()));
+        let _ = fs::remove_file(&outside);
+        let write =
+            sandboxed_sh(&registry, &format!("echo leak > {}", outside.display())).expect("run");
+        assert_eq!(write.status, ToolStatus::Error, "{}", write.data);
+        assert!(!outside.exists(), "sandbox let a write escape");
+
+        let secret_dir = std::path::PathBuf::from("/var/tmp")
+            .join(format!("helios-fake-home-{}", std::process::id()));
+        fs::create_dir_all(secret_dir.join(".ssh")).expect("fake credentials");
+        fs::write(secret_dir.join(".ssh/id_test"), "PRIVATE").expect("secret");
+        let read = sandboxed_sh(
+            &registry,
+            &format!("cat {}", secret_dir.join(".ssh/id_test").display()),
+        )
+        .expect("run");
+        let _ = fs::remove_dir_all(&secret_dir);
+        assert_eq!(read.status, ToolStatus::Error, "{}", read.data);
+        assert!(!read.data.contains("PRIVATE"));
+        let _ = fs::remove_file(&outside);
+
+        // TCP to a local listener must be refused by the sandbox, while the
+        // same probe succeeds without it (control), so the result is meaningful.
+        if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
+            let port = listener.local_addr().expect("addr").port();
+            let probe = format!(
+                "import socket\ntry:\n    socket.create_connection(('127.0.0.1', {port}), timeout=2)\n    print('connected')\nexcept OSError:\n    print('denied')\n"
+            );
+            let script = root.join("probe.py");
+            fs::write(&script, probe).expect("probe");
+            let sandboxed =
+                sandboxed_sh(&registry, &format!("python3 {}", script.display())).expect("run");
+            assert!(
+                sandboxed.data.contains("denied") && !sandboxed.data.contains("connected"),
+                "tcp connect was not denied: {}",
+                sandboxed.data
+            );
+            let control = agent_terminal::run(
+                agent_terminal::CommandSpec {
+                    program: "/usr/bin/env".into(),
+                    args: vec!["python3".into(), script.display().to_string()],
+                    cwd: root.clone(),
+                    timeout: Duration::from_secs(10),
+                    output_limit: 4096,
+                    spill_dir: root.join("spill"),
+                    requires_pty: false,
+                    env_allowlist: vec!["PATH".into()],
+                },
+                &CancellationToken::default(),
+            )
+            .expect("control run");
+            assert!(
+                control.stdout.text.contains("connected"),
+                "control probe must connect without the sandbox: {}",
+                control.stdout.text
+            );
+        }
     }
 
     #[test]

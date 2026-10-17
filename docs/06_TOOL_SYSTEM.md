@@ -52,6 +52,18 @@ Use a deterministic patch format. Validate path scope and preimage. Reject fuzzy
 
 `apply_patch` has two exact forms; a call must use exactly one. The snippet form (`old_text` / `new_text`, optional `replace_all`) replaces one unique occurrence and costs only the changed region in output tokens; zero matches is a patch conflict, several matches without `replace_all` is an invalid-argument error that asks for more context, and an empty `old_text` creates a missing file (parents are created inside the workspace). The whole-file form (`expected_content` / `replacement`) is kept for compatibility and requires the exact current content.
 
+## OS sandbox (Linux)
+
+Child processes started by `shell`, `process`, `verify` and `git diff` run under a Landlock ruleset when the registry is in WorkspaceWrite mode and the kernel supports Landlock (ABI 1 or later; ABI 4+ also denies TCP connect and bind). The rules are built in the parent before fork and applied in the child with `prctl(PR_SET_NO_NEW_PRIVS)` and `landlock_restrict_self`, which allocate nothing.
+
+- Writable: the workspace, the temp directory, the tool spill directory, and cargo's `registry` and `git` caches. `~/.cargo` as a whole is not writable because it holds `credentials.toml`.
+- Readable: system roots (`/usr`, `/etc`, `/proc`, `/dev`, and so on), PATH entries, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml`, and git configuration. Other home-directory data, such as `~/.ssh`, is denied.
+- Network: TCP connect and bind are denied for every child process. UDP is not restricted, so DNS lookups still happen.
+- PTY commands cannot take the restriction, so they are refused in this mode rather than run unrestricted.
+- Opt out with `HELIOS_OS_SANDBOX=off`. On kernels without Landlock the commands run unrestricted; the registry reports this through `os_sandbox_active()`.
+
+Tests cover writes outside the workspace, reads of a credential-like directory outside the allowed roots, and TCP connections, with a control run showing the probe succeeds without the sandbox. Not yet covered: a full `cargo test` under the sandbox, and MCP servers and hooks, which spawn processes outside this path.
+
 ## Web fetch
 
 `web_fetch` is the only tool with `PermissionClass::Network`. The engine's class policy still denies network; instead the tool is granted per host from `permissions.allowed_network_hosts` (managed with `permissions add-network-host`). It is not offered to the model unless that list is non-empty, and it is refused in read-only (plan) mode.
