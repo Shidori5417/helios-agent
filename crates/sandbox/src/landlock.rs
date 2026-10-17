@@ -28,6 +28,10 @@ const FS_MAKE_BLOCK: u64 = 1 << 11;
 const FS_ALL: u64 = (1 << 13) - 1;
 const FS_READ_ONLY: u64 = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR;
 const FS_READ_WRITE: u64 = FS_ALL & !(FS_MAKE_BLOCK | FS_MAKE_CHAR | FS_MAKE_SOCK | FS_MAKE_FIFO);
+// ABI 2: moving or linking entries across directories. Without handling it, the
+// kernel refuses cross-directory renames of directories with EXDEV, which breaks
+// ordinary tools such as plugin uninstall. Only writable roots receive it.
+const FS_REFER: u64 = 1 << 13;
 
 // Network access rights (ABI 4).
 const NET_BIND_TCP: u64 = 1 << 0;
@@ -116,8 +120,9 @@ impl ChildSandbox {
             Status::Unavailable => return Ok(None),
         };
         let network_blocked = abi >= 4 && !allow_network;
+        let refer = if abi >= 2 { FS_REFER } else { 0 };
         let attr = RulesetAttr {
-            handled_access_fs: FS_ALL,
+            handled_access_fs: FS_ALL | refer,
             handled_access_net: if network_blocked {
                 NET_BIND_TCP | NET_CONNECT_TCP
             } else {
@@ -153,7 +158,7 @@ impl ChildSandbox {
             socket_filter,
         };
         for path in writable {
-            sandbox.allow(path, FS_READ_WRITE)?;
+            sandbox.allow(path, FS_READ_WRITE | refer)?;
         }
         for path in readable {
             sandbox.allow(path, FS_READ_ONLY)?;
@@ -334,7 +339,12 @@ pub fn workspace_sandbox(
     allow_network: bool,
 ) -> io::Result<Option<ChildSandbox>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut writable = vec![root.to_path_buf(), std::env::temp_dir()];
+    // /dev/null is writable so `cmd 2>/dev/null` and `> /dev/null` redirections work.
+    let mut writable = vec![
+        root.to_path_buf(),
+        std::env::temp_dir(),
+        PathBuf::from("/dev/null"),
+    ];
     writable.extend(extra_writable.iter().cloned());
     let mut readable = system_read_roots();
     if let Some(path) = std::env::var_os("PATH") {
@@ -410,6 +420,70 @@ mod tests {
             .lines()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn directories_move_between_writable_parents_inside_the_sandbox() {
+        use std::os::unix::process::CommandExt;
+        if status() == Status::Unavailable {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("agent-sandbox-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("plugins/signed")).expect("source");
+        std::fs::create_dir_all(root.join("plugins/.trash")).expect("trash");
+        let sandbox = workspace_sandbox(&root, &[], false)
+            .expect("ruleset")
+            .expect("supported kernel");
+        let script = "import os, sys\nos.rename(sys.argv[1], sys.argv[2])\n";
+        let mut command = std::process::Command::new("python3");
+        command
+            .args(["-c", script])
+            .arg(root.join("plugins/signed"))
+            .arg(root.join("plugins/.trash/signed-1"))
+            .current_dir(&root);
+        // SAFETY: restrict_current performs only prctl and landlock syscalls.
+        unsafe {
+            command.pre_exec(move || sandbox.restrict_current());
+        }
+        let output = command.output().expect("run rename");
+        let moved = root.join("plugins/.trash/signed-1").is_dir();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            output.status.success() && moved,
+            "directory rename was refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn shell_redirections_to_dev_null_work_inside_the_workspace_sandbox() {
+        use std::os::unix::process::CommandExt;
+        if status() == Status::Unavailable {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("agent-sandbox-null-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("root");
+        let sandbox = workspace_sandbox(&root, &[], false)
+            .expect("ruleset")
+            .expect("supported kernel");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "echo discarded > /dev/null 2>/dev/null"])
+            .current_dir(&root);
+        // SAFETY: restrict_current performs only prctl and landlock syscalls.
+        unsafe {
+            command.pre_exec(move || sandbox.restrict_current());
+        }
+        let status = command.status().expect("run shell");
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            status.success(),
+            "redirect to /dev/null was refused: {status}"
+        );
     }
 
     #[cfg(all(
