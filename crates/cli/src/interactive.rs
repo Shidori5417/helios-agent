@@ -279,7 +279,7 @@ pub(crate) fn interactive_command_with_resume(selector: Option<String>) -> Resul
                     let registry = match ToolRegistry::new(&worker_workspace, policy.mode) {
                         Ok(registry) => registry
                             .with_disabled_tools(
-                                effective_disabled_tool_names_for_session(&worker_config, worker_session).unwrap_or_default(),
+                                effective_disabled_tool_names_for_session(&worker_config, worker_session, None).unwrap_or_default(),
                             )
                             .with_cancellation(worker_cancellation.clone())
                             .with_approval_broker(worker_approval),
@@ -1238,8 +1238,8 @@ pub(crate) fn interactive_tui_context(paths: &AppPaths) -> agent_tui::TuiContext
                 .flatten()
         })
     });
-    let disabled =
-        effective_disabled_tool_names_for_session(config_path, active_session).unwrap_or_default();
+    let disabled = effective_disabled_tool_names_for_session(config_path, active_session, None)
+        .unwrap_or_default();
     let tools = ToolRegistry::new(
         &paths.workspace,
         policy

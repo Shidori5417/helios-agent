@@ -310,6 +310,7 @@ pub(crate) fn disabled_tool_names(path: &Path) -> Result<Vec<String>, String> {
 pub(crate) fn effective_disabled_tool_names_for_session(
     project: &Path,
     session_id: Option<i64>,
+    db_path: Option<&Path>,
 ) -> Result<Vec<String>, String> {
     let paths = app_paths()?;
     let mut disabled = disabled_tool_names(&paths.global_config)?;
@@ -322,7 +323,8 @@ pub(crate) fn effective_disabled_tool_names_for_session(
         }
     }
     if let Some(session_id) = session_id {
-        let db = Database::open(&paths.db_path).map_err(|error| error.to_string())?;
+        let db_path = db_path.unwrap_or(&paths.db_path);
+        let db = Database::open(db_path).map_err(|error| error.to_string())?;
         if let Some(override_) = db
             .session_tool_override(session_id, &paths.workspace.display().to_string())
             .map_err(|error| error.to_string())?
@@ -667,7 +669,7 @@ pub(crate) fn tools_config_command(args: &[String], path: &Path) -> Result<(), S
         toml::Value::Table(Default::default())
     };
     if action == "list" || action == "info" {
-        let disabled = effective_disabled_tool_names_for_session(path, session_id)?;
+        let disabled = effective_disabled_tool_names_for_session(path, session_id, None)?;
         let requested = args.get(1).cloned();
         for definition in registry
             .definitions()

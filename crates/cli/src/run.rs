@@ -210,8 +210,11 @@ pub(crate) fn run_command_with_cancellation(
             });
         }
     }
-    let disabled_tools =
-        effective_disabled_tool_names_for_session(&runtime_config_path, Some(session_id))?;
+    let disabled_tools = effective_disabled_tool_names_for_session(
+        &runtime_config_path,
+        Some(session_id),
+        Some(&options.db_path),
+    )?;
     let checkpoint_id = database
         .create_checkpoint(
             session_id,
