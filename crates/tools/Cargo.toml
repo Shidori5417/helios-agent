@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+reqwest.workspace = true
 agent-core = { path = "../core" }
 agent-protocol = { path = "../protocol" }
 agent-sandbox = { path = "../sandbox" }

@@ -4832,6 +4832,7 @@ fn run_command_with_cancellation(
     let builtin = ToolRegistry::new(&workspace, permission_mode)
         .map_err(|error| error.to_string())?
         .with_disabled_tools(disabled_tools)
+        .with_web_allowed_hosts(&runtime_policy.allowed_network_hosts)
         .with_cancellation(cancellation.clone());
     let builtin = if let Some(hook) = snapshot_hook {
         builtin.with_snapshot_hook(hook)

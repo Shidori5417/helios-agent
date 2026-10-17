@@ -1,4 +1,5 @@
 mod filter;
+mod web;
 
 use agent_sandbox::{PermissionClass, PermissionEngine, PermissionError, PermissionMode};
 use agent_terminal::{run, CancellationToken, CommandSpec, CommandStatus};
@@ -269,13 +270,19 @@ pub struct ToolRegistry {
     approval: Option<ApprovalBroker>,
     disabled: BTreeSet<String>,
     snapshot_hook: Option<SnapshotHook>,
+    /// Hosts from `permissions.allowed_network_hosts`. Empty disables `web_fetch`.
+    web_hosts: Vec<String>,
 }
 
 impl agent_core::ToolExecutor for ToolRegistry {
     fn definitions(&self) -> Vec<agent_protocol::ToolDefinition> {
-        CORE_TOOL_NAMES
-            .iter()
-            .filter(|name| !self.disabled.contains(**name))
+        let mut names: Vec<&str> = CORE_TOOL_NAMES.to_vec();
+        if !self.web_hosts.is_empty() {
+            names.push("web_fetch");
+        }
+        names
+            .into_iter()
+            .filter(|name| !self.disabled.contains(*name))
             .filter_map(|name| self.metadata(name))
             .map(|metadata| agent_protocol::ToolDefinition {
                 name: metadata.id,
@@ -352,6 +359,7 @@ impl ToolRegistry {
             approval: None,
             disabled: BTreeSet::new(),
             snapshot_hook: None,
+            web_hosts: Vec::new(),
         })
     }
 
@@ -371,6 +379,21 @@ impl ToolRegistry {
         S: Into<String>,
     {
         self.disabled = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Enables `web_fetch` for exactly these hosts (lowercase, https only).
+    /// Without a non-empty list the tool is neither offered nor executable.
+    pub fn with_web_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.web_hosts = hosts
+            .into_iter()
+            .map(|host| host.as_ref().trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
         self
     }
 
@@ -443,6 +466,21 @@ impl ToolRegistry {
                     "additionalProperties": false
                 }),
                 true,
+                self.output_budget,
+                self.timeout,
+            ),
+            "web_fetch" => (
+                "Fetch a text page over https from an allowlisted host and return readable text (scripts and styles removed). Redirects are not followed; request the new URL explicitly if its host is also allowlisted.",
+                PermissionClass::Network,
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Absolute https URL with a default port, no credentials"}
+                    },
+                    "required": ["url"],
+                    "additionalProperties": false
+                }),
+                false,
                 self.output_budget,
                 self.timeout,
             ),
@@ -538,7 +576,18 @@ impl ToolRegistry {
         let metadata = self
             .metadata(name)
             .ok_or_else(|| ToolError::UnknownTool(name.into()))?;
-        let policy_result = self.permissions.authorize(metadata.permission_class);
+        // Network is never granted by the engine's class policy; it is granted
+        // per host here, before any approval is requested, so an unlisted host
+        // is refused without bothering the user.
+        let web_target = if metadata.permission_class == PermissionClass::Network {
+            Some(self.web_target(&args)?)
+        } else {
+            None
+        };
+        let policy_result = match web_target {
+            Some(_) => Ok(()),
+            None => self.permissions.authorize(metadata.permission_class),
+        };
         let interactive_approval = self
             .approval
             .as_ref()
@@ -564,6 +613,7 @@ impl ToolRegistry {
             "glob" => self.glob(args),
             "apply_patch" => self.apply_patch(args),
             "shell" | "process" => self.command(name, args, cancellation),
+            "web_fetch" => self.web_fetch(args, cancellation),
             "update_plan" => Ok(ToolOutcome {
                 status: ToolStatus::Ok,
                 summary: "plan accepted".into(),
@@ -1021,6 +1071,104 @@ impl ToolRegistry {
             note,
             self.output_budget,
         ))
+    }
+
+    /// Validates a `web_fetch` request against the allowlist and the mode.
+    fn web_target(&self, args: &Value) -> Result<web::WebTarget, ToolError> {
+        #[derive(Deserialize)]
+        struct Input {
+            url: String,
+        }
+        let input: Input = parse("web_fetch", args.clone())?;
+        if self.permissions.mode() == PermissionMode::ReadOnly {
+            return Err(ToolError::Permission(PermissionError::Denied {
+                class: PermissionClass::Network,
+            }));
+        }
+        let target =
+            web::parse_https_target(&input.url).map_err(|reason| ToolError::InvalidArguments {
+                tool: "web_fetch".into(),
+                reason,
+            })?;
+        if !self.web_hosts.iter().any(|host| *host == target.host) {
+            return Err(ToolError::Permission(PermissionError::Denied {
+                class: PermissionClass::Network,
+            }));
+        }
+        Ok(target)
+    }
+
+    fn web_fetch(
+        &self,
+        args: Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ToolOutcome, ToolError> {
+        let target = self.web_target(&args)?;
+        if cancellation.is_cancelled() {
+            return Ok(ToolOutcome {
+                status: ToolStatus::Cancelled,
+                summary: "web_fetch cancelled".into(),
+                data: String::new(),
+                truncated: false,
+                spill_ref: None,
+            });
+        }
+        let invalid = |reason: String| ToolError::InvalidArguments {
+            tool: "web_fetch".into(),
+            reason,
+        };
+        let client = reqwest::blocking::Client::builder()
+            .timeout(self.timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("helios-agent/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .map_err(|error| invalid(format!("HTTP client unavailable: {error}")))?;
+        // Errors name only the host: the path and query may carry private data.
+        let response = client.get(&target.url).send().map_err(|error| {
+            let kind = if error.is_timeout() {
+                "timed out"
+            } else {
+                "failed"
+            };
+            invalid(format!("request to {} {kind}", target.host))
+        })?;
+        let status = response.status();
+        if status.is_redirection() {
+            return Err(invalid(format!(
+                "{} answered with HTTP {status}; redirects are not followed",
+                target.host
+            )));
+        }
+        if !status.is_success() {
+            return Err(invalid(format!(
+                "{} answered with HTTP {status}",
+                target.host
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_owned();
+        if !web::is_textual(&content_type) {
+            return Err(invalid(format!(
+                "{} returned a non-text content type; web_fetch only reads text",
+                target.host
+            )));
+        }
+        let (bytes, body_truncated) = web::read_bounded(response)
+            .map_err(|error| invalid(format!("reading {} failed: {error}", target.host)))?;
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        let text = if content_type.to_ascii_lowercase().contains("html") {
+            web::html_to_text(&raw)
+        } else {
+            raw
+        };
+        let data = format!("source: {}\n{text}", target.host);
+        let mut outcome = bounded(ToolStatus::Ok, "web fetched", data, self.output_budget);
+        outcome.truncated |= body_truncated;
+        Ok(outcome)
     }
 
     fn command(
@@ -1518,6 +1666,86 @@ echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n
         let spill = outcome.spill_ref.expect("full output spill");
         let full = fs::read_to_string(spill).expect("spill");
         assert!(full.contains("ok line 3999"));
+    }
+
+    #[test]
+    fn web_fetch_is_offered_and_allowed_only_for_listed_hosts() {
+        use agent_core::ToolExecutor;
+        let root = root("web-policy");
+        let plain = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite).expect("registry");
+        assert!(!plain
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == "web_fetch"));
+        let denied = run_tool(&plain, "web_fetch", json!({"url": "https://example.com/"}))
+            .expect_err("no allowlist");
+        assert!(matches!(
+            denied,
+            ToolError::Permission(PermissionError::Denied {
+                class: PermissionClass::Network
+            })
+        ));
+
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_web_allowed_hosts(["Docs.RS"]);
+        assert!(registry
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == "web_fetch"));
+        let unlisted = run_tool(
+            &registry,
+            "web_fetch",
+            json!({"url": "https://example.com/"}),
+        )
+        .expect_err("unlisted host");
+        let mut failure_registry = registry.clone();
+        let failure = failure_registry
+            .execute_typed(&agent_protocol::ToolCall {
+                id: None,
+                name: "web_fetch".into(),
+                arguments: json!({"url": "https://example.com/"}),
+            })
+            .expect_err("unlisted host");
+        assert_eq!(failure.kind, agent_core::ToolFailureKind::PermissionDenied);
+        assert!(matches!(unlisted, ToolError::Permission(_)));
+
+        let read_only = ToolRegistry::new(&root, PermissionMode::ReadOnly)
+            .expect("registry")
+            .with_web_allowed_hosts(["docs.rs"]);
+        assert!(matches!(
+            run_tool(&read_only, "web_fetch", json!({"url": "https://docs.rs/"})),
+            Err(ToolError::Permission(_))
+        ));
+
+        let malformed = run_tool(&registry, "web_fetch", json!({"url": "http://docs.rs/"}))
+            .expect_err("plain http");
+        assert!(matches!(malformed, ToolError::InvalidArguments { .. }));
+    }
+
+    /// Makes a real HTTPS request; run explicitly with `--ignored` when the
+    /// environment has outbound access. Kept out of the default suite so the
+    /// offline benchmark stays deterministic.
+    #[test]
+    #[ignore = "requires outbound HTTPS"]
+    fn web_fetch_reads_an_allowlisted_page_as_text() {
+        let root = root("web-live");
+        let registry = ToolRegistry::new(&root, PermissionMode::WorkspaceWrite)
+            .expect("registry")
+            .with_web_allowed_hosts(["example.com"]);
+        let outcome = run_tool(
+            &registry,
+            "web_fetch",
+            json!({"url": "https://example.com/"}),
+        )
+        .expect("fetch");
+        assert!(
+            outcome.data.starts_with("source: example.com\n"),
+            "{}",
+            outcome.data
+        );
+        assert!(outcome.data.contains("Example Domain"), "{}", outcome.data);
+        assert!(!outcome.data.contains("<html"));
     }
 
     #[test]

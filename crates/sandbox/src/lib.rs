@@ -44,6 +44,10 @@ impl PermissionEngine {
         &self.root
     }
 
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
+    }
+
     pub fn authorize(&self, class: PermissionClass) -> Result<(), PermissionError> {
         let allowed = match class {
             PermissionClass::ReadOnly => true,

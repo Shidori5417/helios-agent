@@ -211,6 +211,7 @@ dependencies = [
  "agent-protocol",
  "agent-sandbox",
  "agent-terminal",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

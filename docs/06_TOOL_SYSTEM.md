@@ -52,6 +52,12 @@ Use a deterministic patch format. Validate path scope and preimage. Reject fuzzy
 
 `apply_patch` has two exact forms; a call must use exactly one. The snippet form (`old_text` / `new_text`, optional `replace_all`) replaces one unique occurrence and costs only the changed region in output tokens; zero matches is a patch conflict, several matches without `replace_all` is an invalid-argument error that asks for more context, and an empty `old_text` creates a missing file (parents are created inside the workspace). The whole-file form (`expected_content` / `replacement`) is kept for compatibility and requires the exact current content.
 
+## Web fetch
+
+`web_fetch` is the only tool with `PermissionClass::Network`. The engine's class policy still denies network; instead the tool is granted per host from `permissions.allowed_network_hosts` (managed with `permissions add-network-host`). It is not offered to the model unless that list is non-empty, and it is refused in read-only (plan) mode.
+
+Policy and limits: https only, default port only, no credentials, no IP literals, a DNS name must be on the list (case-insensitive, exact match). Redirects are never followed, so a redirect cannot reach an unlisted host. Bodies are read up to 2 MiB; only text media types are accepted, and HTML is reduced to text (scripts, styles and comments dropped). Each request goes through the normal approval broker when one is attached. Logs and errors name only the host, never the path or query. Output is bounded and spills like other tools. Requests carry only a `User-Agent`; no cookies are stored.
+
 ## Shell
 
 When a recognised build or test command (`cargo test|build|check|clippy`, `pytest`, `python -m pytest`, `go test|build|vet`, `npm|pnpm|yarn|bun test|run|build|lint`) produces more output than the budget, the result is condensed deterministically: only error, failure, location and summary lines are kept, with `… N line(s) omitted` markers. The full stream is always available through `spill_ref`. No model call is involved, and the rules are plain text matches, so they cannot hide a failure that matches a marker.

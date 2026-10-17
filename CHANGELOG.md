@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- New `web_fetch` tool: https text pages from hosts listed in
+  `permissions.allowed_network_hosts`, with no redirects, a 2 MiB body cap,
+  HTML-to-text conversion, approval through the usual broker, and no
+  network in read-only mode. Not offered to the model unless the list is set.
 - Shell output from recognised build/test commands (cargo, pytest, go, npm
   family) is condensed to failures and summaries when it exceeds the output
   budget; the full output stays in the spill file.
