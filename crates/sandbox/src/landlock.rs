@@ -81,16 +81,21 @@ unsafe impl Send for ChildSandbox {}
 unsafe impl Sync for ChildSandbox {}
 
 impl ChildSandbox {
-    /// Builds a ruleset that allows `writable` paths (read/write/create),
-    /// `readable` paths (read/execute), and denies all TCP connect and bind.
+    /// Builds a ruleset that allows `writable` paths (read/write/create) and
+    /// `readable` paths (read/execute). Unless `allow_network` is set, all TCP
+    /// connect and bind are denied.
     /// Paths that do not exist are skipped. Returns `Ok(None)` when the kernel
     /// does not support Landlock.
-    pub fn new(writable: &[PathBuf], readable: &[PathBuf]) -> io::Result<Option<Self>> {
+    pub fn new(
+        writable: &[PathBuf],
+        readable: &[PathBuf],
+        allow_network: bool,
+    ) -> io::Result<Option<Self>> {
         let abi = match status() {
             Status::Enforced { abi } => abi,
             Status::Unavailable => return Ok(None),
         };
-        let network_blocked = abi >= 4;
+        let network_blocked = abi >= 4 && !allow_network;
         let attr = RulesetAttr {
             handled_access_fs: FS_ALL,
             handled_access_net: if network_blocked {
@@ -202,6 +207,38 @@ impl Drop for ChildSandbox {
         // SAFETY: the ruleset fd is owned by this value and closed once.
         unsafe { libc::close(self.ruleset) };
     }
+}
+
+/// Workspace confinement shared by commands and MCP servers.
+///
+/// Writable: `root`, the temp dir, `extra_writable`, and the package-manager
+/// caches (`~/.cargo/{registry,git}`, `~/.npm`). `~/.cargo` as a whole is not
+/// writable because it holds `credentials.toml`. Readable: system roots, PATH
+/// entries, the rust toolchain and git configuration. Anything else in the home
+/// directory, such as `~/.ssh`, is denied.
+pub fn workspace_sandbox(
+    root: &Path,
+    extra_writable: &[PathBuf],
+    allow_network: bool,
+) -> io::Result<Option<ChildSandbox>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut writable = vec![root.to_path_buf(), std::env::temp_dir()];
+    writable.extend(extra_writable.iter().cloned());
+    let mut readable = system_read_roots();
+    if let Some(path) = std::env::var_os("PATH") {
+        readable.extend(std::env::split_paths(&path));
+    }
+    if let Some(home) = &home {
+        writable.push(home.join(".cargo/registry"));
+        writable.push(home.join(".cargo/git"));
+        writable.push(home.join(".npm"));
+        readable.push(home.join(".cargo/bin"));
+        readable.push(home.join(".cargo/config.toml"));
+        readable.push(home.join(".rustup"));
+        readable.push(home.join(".gitconfig"));
+        readable.push(home.join(".config/git"));
+    }
+    ChildSandbox::new(&writable, &readable, allow_network)
 }
 
 /// System locations a command normally needs to run: binaries, libraries,

@@ -62,6 +62,8 @@ Child processes started by `shell`, `process`, `verify` and `git diff` run under
 - PTY commands cannot take the restriction, so they are refused in this mode rather than run unrestricted.
 - Opt out with `HELIOS_OS_SANDBOX=off`. On kernels without Landlock the commands run unrestricted; the registry reports this through `os_sandbox_active()`.
 
+Stdio MCP servers get the same confinement, in every permission mode, because they are untrusted. Their TCP access is closed unless the `[[mcp_server]]` entry sets `allow_network = true`. Limitation: a server that needs its own package cache outside the workspace (for example `uv`) must be given a path through configuration, which is not supported yet, so such servers may fail to start.
+
 Tests cover writes outside the workspace, reads of a credential-like directory outside the allowed roots, and TCP connections, with a control run showing the probe succeeds without the sandbox. Not yet covered: a full `cargo test` under the sandbox, and MCP servers and hooks, which spawn processes outside this path.
 
 ## Web fetch

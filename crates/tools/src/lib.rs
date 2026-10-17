@@ -1335,31 +1335,12 @@ fn build_os_sandbox(
     }
     #[cfg(target_os = "linux")]
     {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
         let _ = fs::create_dir_all(spill_dir);
-        let mut writable = vec![
-            root.to_path_buf(),
-            std::env::temp_dir(),
-            spill_dir.to_path_buf(),
-        ];
-        let mut readable = agent_sandbox::landlock::system_read_roots();
-        if let Some(path) = std::env::var_os("PATH") {
-            readable.extend(std::env::split_paths(&path));
-        }
-        if let Some(home) = &home {
-            writable.push(home.join(".cargo/registry"));
-            writable.push(home.join(".cargo/git"));
-            readable.push(home.join(".cargo/bin"));
-            readable.push(home.join(".cargo/config.toml"));
-            readable.push(home.join(".rustup"));
-            readable.push(home.join(".gitconfig"));
-            readable.push(home.join(".config/git"));
-        }
-        match agent_sandbox::landlock::ChildSandbox::new(&writable, &readable) {
-            Ok(Some(sandbox)) => Some(std::sync::Arc::new(sandbox)),
-            // Unsupported kernels run unrestricted; `os_sandbox_active` reports it.
-            Ok(None) | Err(_) => None,
-        }
+        // Unsupported kernels run unrestricted; `os_sandbox_active` reports it.
+        agent_sandbox::landlock::workspace_sandbox(root, &[spill_dir.to_path_buf()], false)
+            .ok()
+            .flatten()
+            .map(std::sync::Arc::new)
     }
     #[cfg(not(target_os = "linux"))]
     {

@@ -7,6 +7,9 @@
   confined to the workspace, temp, the tool spill dir and cargo caches, and
   TCP connect/bind is denied. PTY commands are refused in this mode.
   `HELIOS_OS_SANDBOX=off` disables it; unsupported kernels run unrestricted.
+- Stdio MCP servers run under the same workspace confinement in every
+  permission mode. Their network stays closed unless `allow_network = true`
+  is set on the `[[mcp_server]]` entry.
 - New `web_fetch` tool: https text pages from hosts listed in
   `permissions.allowed_network_hosts`, with no redirects, a 2 MiB body cap,
   HTML-to-text conversion, approval through the usual broker, and no

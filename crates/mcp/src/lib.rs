@@ -42,6 +42,8 @@ pub struct McpServerConfig {
 pub struct LoadedMcpServer {
     pub config: McpServerConfig,
     pub allowed_hosts: Vec<String>,
+    /// Whether a stdio server may open network connections. Off by default.
+    pub network_allowed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -71,6 +73,9 @@ pub struct McpServerFile {
     pub transport: Option<String>,
     pub url: Option<String>,
     pub auth_env: Option<String>,
+    /// Let this stdio server open TCP connections (sandbox exception).
+    #[serde(default)]
+    pub allow_network: bool,
 }
 
 fn default_true() -> bool {
@@ -157,6 +162,7 @@ pub fn load_config(
                     transport,
                 },
                 allowed_hosts,
+                network_allowed: server.allow_network,
             })
         })
         .collect()
@@ -277,6 +283,7 @@ pub struct McpClient<P> {
     next_id: u64,
     max_response_bytes: usize,
     http_session_id: Option<String>,
+    child_hook: Option<agent_terminal::ChildHook>,
 }
 
 impl<P: McpPolicy> McpClient<P> {
@@ -295,7 +302,15 @@ impl<P: McpPolicy> McpClient<P> {
             next_id: 1,
             max_response_bytes,
             http_session_id,
+            child_hook: None,
         }
+    }
+
+    /// Applies `hook` in the child before exec (for example the workspace
+    /// sandbox). Stdio servers only; HTTP servers run in this process.
+    pub fn with_child_hook(mut self, hook: Option<agent_terminal::ChildHook>) -> Self {
+        self.child_hook = hook;
+        self
     }
 
     pub fn ensure_started(&mut self) -> Result<(), McpError> {
@@ -335,6 +350,15 @@ impl<P: McpPolicy> McpClient<P> {
         for name in &self.config.env_allowlist {
             if let Ok(value) = std::env::var(name) {
                 command.env(name, value);
+            }
+        }
+        #[cfg(unix)]
+        if let Some(hook) = self.child_hook.clone() {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: the hook only applies a prebuilt sandbox (syscalls, no
+            // allocation), which is the contract of `ChildHook`.
+            unsafe {
+                command.pre_exec(move || hook());
             }
         }
         let mut child = command.spawn()?;
@@ -668,6 +692,7 @@ mod tests {
             next_id: 1,
             max_response_bytes: 4096,
             http_session_id: None,
+            child_hook: None,
         };
         client
             .initialize(&CancellationToken::default())
@@ -713,6 +738,7 @@ mod tests {
             next_id: 1,
             max_response_bytes: 4096,
             http_session_id: None,
+            child_hook: None,
         };
         assert!(matches!(
             client.initialize(&CancellationToken::default()),
@@ -881,5 +907,87 @@ mod tests {
         let outside = std::env::temp_dir().join("agent-mcp-outside.toml");
         std::fs::write(&outside, "").expect("outside");
         assert!(load_config(&outside, &root).is_err());
+    }
+
+    /// A stdio "server" that tries to write outside the workspace and open a
+    /// TCP connection. Under the sandbox neither side effect may happen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stdio_server_is_confined_to_the_workspace() {
+        use agent_sandbox::landlock::{status, workspace_sandbox, Status};
+        if status() == Status::Unavailable {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("agent-mcp-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let root = root.canonicalize().expect("canonical");
+        let outside = std::path::PathBuf::from("/var/tmp")
+            .join(format!("agent-mcp-escape-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let port = listener.local_addr().expect("addr").port();
+        listener.set_nonblocking(true).expect("nonblocking");
+        let script = format!(
+            "echo leak > {} ; python3 -c \"import socket; socket.create_connection(('127.0.0.1',{port}),timeout=2)\" 2>/dev/null; echo done",
+            outside.display()
+        );
+        let config = McpServerConfig {
+            name: "probe".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            cwd: Some(root.clone()),
+            env_allowlist: vec!["PATH".into()],
+            enabled: true,
+            tool_include: vec![],
+            tool_exclude: vec![],
+            startup_timeout: Duration::from_secs(5),
+            tool_timeout: Duration::from_secs(5),
+            permission_class: PermissionClass::ReadOnly,
+            transport: McpTransport::Stdio,
+        };
+        let sandbox = workspace_sandbox(&root, &[], false)
+            .expect("ruleset")
+            .expect("supported kernel");
+        let hook: agent_terminal::ChildHook =
+            std::sync::Arc::new(move || sandbox.restrict_current());
+        let engine = PermissionEngine::new(&root, PermissionMode::WorkspaceWrite).expect("engine");
+        let mut client = McpClient::new(config, PermissionPolicy::new(engine), 64 * 1024)
+            .with_child_hook(Some(hook));
+        client.ensure_started().expect("spawn");
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(!outside.exists(), "MCP server escaped the workspace");
+        assert!(
+            listener.accept().is_err(),
+            "MCP server opened a TCP connection"
+        );
+        // Control: the same server without the hook does write outside, so the
+        // absence above is caused by the sandbox and not by the probe.
+        let control_engine =
+            PermissionEngine::new(&root, PermissionMode::WorkspaceWrite).expect("engine");
+        let mut control = McpClient::new(
+            McpServerConfig {
+                name: "control".into(),
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), format!("echo leak > {}", outside.display())],
+                cwd: Some(root.clone()),
+                env_allowlist: vec!["PATH".into()],
+                enabled: true,
+                tool_include: vec![],
+                tool_exclude: vec![],
+                startup_timeout: Duration::from_secs(5),
+                tool_timeout: Duration::from_secs(5),
+                permission_class: PermissionClass::ReadOnly,
+                transport: McpTransport::Stdio,
+            },
+            PermissionPolicy::new(control_engine),
+            64 * 1024,
+        );
+        control.ensure_started().expect("spawn control");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(outside.exists(), "control server did not write outside");
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

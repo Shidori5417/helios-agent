@@ -323,10 +323,25 @@ struct McpRuntime {
     enabled: bool,
     config: agent_mcp::McpServerConfig,
     allowed_hosts: Vec<String>,
+    network_allowed: bool,
     advertised: Vec<String>,
     discovered_tools: Vec<agent_mcp::McpTool>,
     client: McpClient<HostAllowlist<PermissionPolicy>>,
     discovered: bool,
+}
+
+/// Child hook confining a stdio MCP server to the workspace (Linux, Landlock).
+/// Servers are untrusted, so this applies in every permission mode; network
+/// stays closed unless the server's config sets `allow_network = true`.
+fn mcp_child_hook(workspace: &Path, network_allowed: bool) -> Option<agent_terminal::ChildHook> {
+    if env::var("HELIOS_OS_SANDBOX").is_ok_and(|value| value == "off") {
+        return None;
+    }
+    let sandbox = agent_sandbox::landlock::workspace_sandbox(workspace, &[], network_allowed)
+        .ok()
+        .flatten()?;
+    let sandbox = std::sync::Arc::new(sandbox);
+    Some(std::sync::Arc::new(move || sandbox.restrict_current()))
 }
 
 impl RuntimeExecutor {
@@ -345,6 +360,8 @@ impl RuntimeExecutor {
                 .map_err(|error| error.to_string())?;
             let advertised = server.config.tool_include.clone();
             let allowed_hosts = server.allowed_hosts.clone();
+            let network_allowed = server.network_allowed;
+            let hook = mcp_child_hook(workspace, network_allowed);
             let policy = HostAllowlist {
                 inner: PermissionPolicy::new(engine),
                 allowed_hosts: server.allowed_hosts,
@@ -354,7 +371,8 @@ impl RuntimeExecutor {
                 enabled: server.config.enabled,
                 config: server.config.clone(),
                 allowed_hosts,
-                client: McpClient::new(server.config, policy, 64 * 1024),
+                network_allowed,
+                client: McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook),
                 advertised,
                 discovered_tools: Vec::new(),
                 discovered: false,
@@ -546,6 +564,7 @@ impl RuntimeExecutor {
             server.enabled = replacement.config.enabled;
             server.config = replacement.config;
             server.allowed_hosts = replacement.allowed_hosts;
+            server.network_allowed = replacement.network_allowed;
         }
         let policy = HostAllowlist {
             inner: PermissionPolicy::new(
@@ -554,7 +573,8 @@ impl RuntimeExecutor {
             ),
             allowed_hosts: server.allowed_hosts.clone(),
         };
-        server.client = McpClient::new(server.config.clone(), policy, 64 * 1024);
+        server.client = McpClient::new(server.config.clone(), policy, 64 * 1024)
+            .with_child_hook(mcp_child_hook(&self.workspace, server.network_allowed));
         server.discovered = false;
         server.advertised.clear();
         server.discovered_tools.clear();
@@ -4431,7 +4451,8 @@ fn mcp_discover_server(id: &str, workspace: &Path, config_path: &Path) -> Result
         allowed_hosts: server.allowed_hosts.clone(),
     };
     let cancellation = CancellationToken::default();
-    let mut client = McpClient::new(server.config, policy, 64 * 1024);
+    let hook = mcp_child_hook(workspace, server.network_allowed);
+    let mut client = McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook);
     client
         .initialize(&cancellation)
         .map_err(|error| error.to_string())?;
@@ -9322,7 +9343,8 @@ fn configured_server_test(section: &str, args: &[String], path: &Path) -> Result
             },
         };
         let cancellation = CancellationToken::default();
-        let mut client = McpClient::new(server.config, policy, 64 * 1024);
+        let hook = mcp_child_hook(&workspace, server.network_allowed);
+        let mut client = McpClient::new(server.config, policy, 64 * 1024).with_child_hook(hook);
         client
             .initialize(&cancellation)
             .map_err(|error| error.to_string())?;
@@ -10334,6 +10356,7 @@ mod tests {
                 transport: agent_mcp::McpTransport::Stdio,
             },
             allowed_hosts: Vec::new(),
+            network_allowed: false,
         };
         let executor = RuntimeExecutor::new(
             builtin,
