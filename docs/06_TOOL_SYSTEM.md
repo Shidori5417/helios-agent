@@ -58,7 +58,7 @@ Child processes started by `shell`, `process`, `verify` and `git diff` run under
 
 - Writable: the workspace, the temp directory, the tool spill directory, and cargo's `registry` and `git` caches. `~/.cargo` as a whole is not writable because it holds `credentials.toml`.
 - Readable: system roots (`/usr`, `/etc`, `/proc`, `/dev`, and so on), PATH entries, `~/.rustup`, `~/.cargo/bin`, `~/.cargo/config.toml`, and git configuration. Other home-directory data, such as `~/.ssh`, is denied.
-- Network: TCP connect and bind are denied for every child process. UDP is not restricted, so DNS lookups still happen.
+- Network: when network is off, TCP connect and bind are denied by Landlock, and a seccomp filter refuses `socket` for AF_INET and AF_INET6 (EPERM). That also closes UDP and DNS. AF_UNIX stays available. The seccomp filter covers x86_64 and aarch64 only; other architectures keep the Landlock TCP rule and no socket filter.
 - PTY commands cannot take the restriction, so they are refused in this mode rather than run unrestricted.
 - Opt out with `HELIOS_OS_SANDBOX=off`. On kernels without Landlock the commands run unrestricted; the registry reports this through `os_sandbox_active()`.
 

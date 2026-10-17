@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Child processes run with network denied now also refuse IPv4 and IPv6
+  socket creation through a seccomp filter. This closes UDP and DNS, which
+  Landlock cannot restrict. Covered by a probe test with a network-allowed control.
 - Internal: the CLI body moved from `src/main.rs` into a library (`agent_cli`),
   and both `agent-cli` and `helios` are thin wrappers. Behavior is unchanged,
   pinned by a 53-case argv golden corpus (`crates/cli/tests/argv_golden.rs`).

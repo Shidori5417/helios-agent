@@ -39,6 +39,23 @@ struct RulesetAttr {
     handled_access_net: u64,
 }
 
+/// One classic-BPF instruction, as the kernel's `struct sock_filter`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SockFilter {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+/// The kernel's `struct sock_fprog`; points at a filter the caller keeps alive.
+#[repr(C)]
+struct SockFprog {
+    len: u16,
+    filter: *const SockFilter,
+}
+
 #[repr(C, packed)]
 struct PathBeneathAttr {
     allowed_access: u64,
@@ -73,6 +90,9 @@ pub fn status() -> Status {
 pub struct ChildSandbox {
     ruleset: i32,
     network_blocked: bool,
+    /// Seccomp filter that refuses IPv4/IPv6 socket creation. It also covers UDP
+    /// and DNS, which Landlock's TCP-only rights cannot restrict.
+    socket_filter: Option<Box<[SockFilter]>>,
 }
 
 // SAFETY: the ruleset is an immutable kernel object identified by an fd that
@@ -122,9 +142,15 @@ impl ChildSandbox {
         if ruleset < 0 {
             return Err(io::Error::last_os_error());
         }
+        let socket_filter = if allow_network {
+            None
+        } else {
+            network_socket_filter()
+        };
         let sandbox = ChildSandbox {
             ruleset,
             network_blocked,
+            socket_filter,
         };
         for path in writable {
             sandbox.allow(path, FS_READ_WRITE)?;
@@ -197,6 +223,22 @@ impl ChildSandbox {
             if libc::syscall(SYS_LANDLOCK_RESTRICT_SELF, self.ruleset, 0u32) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            if let Some(filter) = &self.socket_filter {
+                let program = SockFprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_ptr(),
+                };
+                if libc::prctl(
+                    libc::PR_SET_SECCOMP,
+                    SECCOMP_MODE_FILTER,
+                    &program as *const SockFprog,
+                    0,
+                    0,
+                ) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+            }
         }
         Ok(())
     }
@@ -207,6 +249,76 @@ impl Drop for ChildSandbox {
         // SAFETY: the ruleset fd is owned by this value and closed once.
         unsafe { libc::close(self.ruleset) };
     }
+}
+
+// Seccomp constants (linux/seccomp.h and linux/filter.h).
+const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+// Offsets into `struct seccomp_data`: nr, arch, args[0] (low 32 bits).
+const SECCOMP_DATA_NR: u32 = 0;
+const SECCOMP_DATA_ARCH: u32 = 4;
+const SECCOMP_DATA_ARG0: u32 = 16;
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_RET_K: u16 = 0x06;
+
+#[cfg(target_arch = "x86_64")]
+const AUDIT_ARCH: u32 = 0xC000_003E;
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH: u32 = 0xC000_00B7;
+
+/// Refuses `socket(AF_INET|AF_INET6, ...)` with EPERM and kills the process if the
+/// syscall ABI is not the one the filter was built for. Other families, including
+/// AF_UNIX, are allowed. Returns `None` on architectures without a filter.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn network_socket_filter() -> Option<Box<[SockFilter]>> {
+    const AF_INET: u32 = 2;
+    const AF_INET6: u32 = 10;
+    let jump = |jt: u8, jf: u8, k: u32| SockFilter {
+        code: BPF_JMP_JEQ_K,
+        jt,
+        jf,
+        k,
+    };
+    let load = |offset: u32| SockFilter {
+        code: BPF_LD_W_ABS,
+        jt: 0,
+        jf: 0,
+        k: offset,
+    };
+    let ret = |value: u32| SockFilter {
+        code: BPF_RET_K,
+        jt: 0,
+        jf: 0,
+        k: value,
+    };
+    // Jump offsets are relative to the next instruction.
+    let program = vec![
+        load(SECCOMP_DATA_ARCH),                     // 0
+        jump(0, 7, AUDIT_ARCH),                      // 1: wrong ABI -> 9 (kill)
+        load(SECCOMP_DATA_NR),                       // 2
+        jump(0, 4, libc::SYS_socket as u32),         // 3: not socket -> 8 (allow)
+        load(SECCOMP_DATA_ARG0),                     // 4
+        jump(1, 0, AF_INET),                         // 5: AF_INET -> 7 (deny)
+        jump(0, 1, AF_INET6),                        // 6: AF_INET6 -> 7, else 8
+        ret(SECCOMP_RET_ERRNO | libc::EPERM as u32), // 7: deny
+        ret(SECCOMP_RET_ALLOW),                      // 8
+        ret(SECCOMP_RET_KILL_PROCESS),               // 9
+    ];
+    Some(program.into_boxed_slice())
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn network_socket_filter() -> Option<Box<[SockFilter]>> {
+    None
 }
 
 /// Workspace confinement shared by commands and MCP servers.
@@ -270,5 +382,74 @@ mod tests {
     fn struct_layouts_match_the_kernel_abi() {
         assert_eq!(std::mem::size_of::<RulesetAttr>(), 16);
         assert_eq!(std::mem::size_of::<PathBeneathAttr>(), 12);
+        assert_eq!(std::mem::size_of::<SockFilter>(), 8);
+        assert_eq!(std::mem::size_of::<SockFprog>(), 16);
+    }
+
+    /// Runs a Python probe under `sandbox` and returns its stdout lines.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn probe_under(sandbox: ChildSandbox, script: &str) -> Vec<String> {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("python3");
+        command.args(["-c", script]);
+        // SAFETY: restrict_current only issues prctl/syscall calls with scalar or
+        // pre-built arguments, which is what a pre_exec hook may do.
+        unsafe {
+            command.pre_exec(move || sandbox.restrict_current());
+        }
+        let output = command.output().expect("run probe");
+        assert!(
+            output.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn network_off_refuses_inet_sockets_including_udp_while_unix_still_works() {
+        if status() == Status::Unavailable {
+            eprintln!("skipped: kernel does not provide Landlock");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("agent-sandbox-net-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("root");
+        let probe = r#"import socket
+for name, family in (("ipv4", socket.AF_INET), ("ipv6", socket.AF_INET6)):
+    try:
+        socket.socket(family, socket.SOCK_DGRAM)
+        print(name, "allowed")
+    except PermissionError:
+        print(name, "denied")
+    except OSError:
+        print(name, "unsupported")
+socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+print("unix", "allowed")
+"#;
+        let readable = system_read_roots();
+        let denied = ChildSandbox::new(std::slice::from_ref(&root), &readable, false)
+            .expect("ruleset")
+            .expect("supported kernel");
+        assert_eq!(
+            probe_under(denied, probe),
+            vec!["ipv4 denied", "ipv6 denied", "unix allowed"]
+        );
+        // Control: with network allowed the same probe creates the IPv4 socket,
+        // so the denials above come from the filter and not from the probe.
+        let allowed = ChildSandbox::new(std::slice::from_ref(&root), &readable, true)
+            .expect("ruleset")
+            .expect("supported kernel");
+        assert_eq!(probe_under(allowed, probe)[0], "ipv4 allowed");
+        let _ = std::fs::remove_dir_all(root);
     }
 }
