@@ -835,13 +835,19 @@ impl ToolRegistry {
         let scope = self.scope("search_files", input.path.as_deref())?;
         let root = self.permissions.root();
         let (files, scan_cut) = walk_files(&scope);
+        // Pre-parse the glob filter once outside the file scan loop.
+        let mut glob_buf = String::new();
+        let parsed_glob = input
+            .glob
+            .as_deref()
+            .map(|pattern| ParsedGlob::parse(pattern, &mut glob_buf));
         let mut out = String::new();
         let mut results = 0_usize;
         let mut limit_hit = false;
         'files: for file in files {
             let relative = relative_display(root, &file);
-            if let Some(pattern) = &input.glob {
-                if !glob_match(pattern, &relative) {
+            if let Some(ref matcher) = parsed_glob {
+                if !matcher.matches(&relative) {
                     continue;
                 }
             }
@@ -900,12 +906,16 @@ impl ToolRegistry {
         let scope = self.scope("glob", input.path.as_deref())?;
         let root = self.permissions.root();
         let (files, scan_cut) = walk_files(&scope);
+        // Pre-parse the glob pattern once so each candidate path is matched
+        // without re-splitting or allocating the pattern across thousands of files.
+        let mut glob_buf = String::new();
+        let parsed_glob = ParsedGlob::parse(&input.pattern, &mut glob_buf);
         let mut out = Vec::new();
         let mut used = 0_usize;
         let mut limit_hit = false;
         for file in files {
             let relative = relative_display(root, &file);
-            if !glob_match(&input.pattern, &relative) {
+            if !parsed_glob.matches(&relative) {
                 continue;
             }
             if out.len() >= MAX_GLOB_RESULTS || used + relative.len() + 1 > self.output_budget {
@@ -1571,31 +1581,68 @@ fn validate_glob(tool: &str, pattern: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-/// Matches a workspace-relative path against a glob. `**` spans directories,
-/// `*`/`?` stay inside one name, and a pattern without `/` matches at any depth.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    fn segments(pattern: &[&str], path: &[&str]) -> bool {
-        match pattern.split_first() {
-            None => path.is_empty(),
-            Some((&"**", rest)) => (0..=path.len()).any(|skip| segments(rest, &path[skip..])),
-            Some((head, rest)) => path
-                .split_first()
-                .is_some_and(|(name, tail)| name_match(head, name) && segments(rest, tail)),
-        }
+/// Pre-parsed glob representation that caches pattern segments to eliminate
+/// redundant string splitting and prefix normalization during file searches.
+#[derive(Clone, Debug)]
+struct ParsedGlob<'a> {
+    segments: Vec<&'a str>,
+}
+
+impl<'a> ParsedGlob<'a> {
+    /// Parses a glob pattern into path segments. If the pattern contains no '/',
+    /// it matches at any depth by prepending `**`.
+    fn parse(pattern: &'a str, buffer: &'a mut String) -> Self {
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        let s = if pattern.contains('/') {
+            pattern
+        } else {
+            *buffer = format!("**/{pattern}");
+            buffer.as_str()
+        };
+        let segments = s.split('/').collect();
+        Self { segments }
     }
-    fn name_match(pattern: &str, name: &str) -> bool {
-        let pattern = pattern.chars().collect::<Vec<_>>();
-        let name = name.chars().collect::<Vec<_>>();
+
+    /// Evaluates whether a workspace-relative path matches this pre-parsed glob.
+    fn matches(&self, path: &str) -> bool {
+        let path_segments: Vec<&str> = path.split('/').collect();
+        match_segments(&self.segments, &path_segments)
+    }
+}
+
+/// Recursively matches pattern segments against path segments.
+fn match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| match_segments(rest, &path[skip..])),
+        Some((head, rest)) => path
+            .split_first()
+            .is_some_and(|(name, tail)| name_match(head, name) && match_segments(rest, tail)),
+    }
+}
+
+/// Matches a single path component against a wildcard pattern with `*` and `?`.
+/// Fast-paths trivial matches (`*` and identity) and ASCII byte comparison
+/// to avoid heap-allocating character vectors on every component match.
+fn name_match(pattern: &str, name: &str) -> bool {
+    // Bolt: Fast-path common trivial wildcard and exact equality cases.
+    if pattern == "*" || pattern == name {
+        return true;
+    }
+    // Bolt: When both strings are ASCII, compare bytes directly without heap-allocating `Vec<char>`.
+    if pattern.is_ascii() && name.is_ascii() {
+        let pattern = pattern.as_bytes();
+        let name = name.as_bytes();
         let (mut p, mut n) = (0, 0);
         let mut star: Option<(usize, usize)> = None;
         while n < name.len() {
             if p < pattern.len()
-                && (pattern[p] == '?' || pattern[p] == name[n])
-                && pattern[p] != '*'
+                && (pattern[p] == b'?' || pattern[p] == name[n])
+                && pattern[p] != b'*'
             {
                 p += 1;
                 n += 1;
-            } else if p < pattern.len() && pattern[p] == '*' {
+            } else if p < pattern.len() && pattern[p] == b'*' {
                 star = Some((p, n));
                 p += 1;
             } else if let Some((star_p, star_n)) = star {
@@ -1606,19 +1653,37 @@ fn glob_match(pattern: &str, path: &str) -> bool {
                 return false;
             }
         }
-        pattern[p..].iter().all(|ch| *ch == '*')
+        return pattern[p..].iter().all(|ch| *ch == b'*');
     }
-    let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-    let expanded;
-    let pattern = if pattern.contains('/') {
-        pattern
-    } else {
-        expanded = format!("**/{pattern}");
-        expanded.as_str()
-    };
-    let pattern = pattern.split('/').collect::<Vec<_>>();
-    let path = path.split('/').collect::<Vec<_>>();
-    segments(&pattern, &path)
+    // Fallback for multi-byte Unicode characters.
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let name = name.chars().collect::<Vec<_>>();
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) && pattern[p] != '*' {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, n));
+            p += 1;
+        } else if let Some((star_p, star_n)) = star {
+            p = star_p + 1;
+            n = star_n + 1;
+            star = Some((star_p, star_n + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|ch| *ch == '*')
+}
+
+/// Matches a workspace-relative path against a glob. `**` spans directories,
+/// `*`/`?` stay inside one name, and a pattern without `/` matches at any depth.
+pub fn glob_match(pattern: &str, path: &str) -> bool {
+    let mut buf = String::new();
+    let parsed = ParsedGlob::parse(pattern, &mut buf);
+    parsed.matches(path)
 }
 
 fn bounded_spill(data: &str) -> Option<PathBuf> {
@@ -1997,6 +2062,11 @@ echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n
             run_tool(&registry, "glob", json!({"pattern": "src/deep/?.txt"})).expect("glob");
         assert_eq!(single.data, "src/deep/c.txt");
         assert!(run_tool(&registry, "glob", json!({"pattern": ""})).is_err());
+
+        // Multi-byte Unicode wildcard support
+        assert!(glob_match("世*界", "世a界"));
+        assert!(glob_match("世?界", "世a界"));
+        assert!(!glob_match("世?界", "世ab界"));
     }
 
     #[test]
