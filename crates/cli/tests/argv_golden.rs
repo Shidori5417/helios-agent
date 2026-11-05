@@ -158,7 +158,21 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
-    out
+    // OS sandbox status in doctor output depends on the kernel environment (e.g. Landlock availability).
+    let mut normalized_sandbox = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(index) = rest.find("\"os_sandbox\":") {
+        let (head, tail) = rest.split_at(index + "\"os_sandbox\":".len());
+        normalized_sandbox.push_str(head);
+        if let Some(end_quote) = tail.strip_prefix('"').and_then(|t| t.find('"')) {
+            normalized_sandbox.push_str("\"<OS_SANDBOX>\"");
+            rest = &tail[1 + end_quote + 1..];
+        } else {
+            break;
+        }
+    }
+    normalized_sandbox.push_str(rest);
+    normalized_sandbox
 }
 
 fn render(corpus: &[&[&str]]) -> String {
@@ -205,9 +219,13 @@ fn argv_surface_matches_golden_snapshot() {
                 expected.lines().count().min(actual.lines().count()),
                 |line| line,
             );
+        let exp_line = expected.lines().nth(first_diff).unwrap_or("<none>");
+        let act_line = actual.lines().nth(first_diff).unwrap_or("<none>");
         panic!(
-            "argv surface changed (first differing line {}). Review, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
-            first_diff + 1
+            "argv surface changed (first differing line {}).\nExpected: {}\nActual:   {}\nReview, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
+            first_diff + 1,
+            exp_line,
+            act_line,
         );
     }
 }
