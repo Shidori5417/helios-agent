@@ -366,7 +366,7 @@ exit: 0
 == ["doctor", "--json"]
 exit: 0
 --- stdout
-{"binary":"helios","config":"<ROOT>/ws/.helios/config.toml","config_valid":true,"db_integrity":false,"db_present":false,"git_available":true,"keyring_available":false,"lsp_configured":0,"mcp_configured":0,"os_sandbox":"<OS_SANDBOX>","permission_mode":"WorkspaceWrite","plugins_dir_present":false,"provider_credentials":[{"env_present":false,"keyring_present":false,"provider":"openai"},{"env_present":false,"keyring_present":false,"provider":"anthropic"},{"env_present":false,"keyring_present":false,"provider":"gemini"},{"env_present":false,"keyring_present":false,"provider":"generic"}],"rg_available":true,"skills_dir_present":false,"terminal":"unknown","version":"0.1.0","workspace":"<ROOT>/ws"}
+{"binary":"helios","config":"<ROOT>/ws/.helios/config.toml","config_valid":true,"db_integrity":false,"db_present":false,"git_available":true,"keyring_available":false,"lsp_configured":0,"mcp_configured":0,"os_sandbox":"<OS_SANDBOX>","permission_mode":"WorkspaceWrite","plugins_dir_present":false,"provider_credentials":[{"env_present":false,"keyring_present":false,"provider":"openai"},{"env_present":false,"keyring_present":false,"provider":"anthropic"},{"env_present":false,"keyring_present":false,"provider":"gemini"},{"env_present":false,"keyring_present":false,"provider":"generic"}],"rg_available":<RG_AVAILABLE>,"skills_dir_present":false,"terminal":"unknown","version":"0.1.0","workspace":"<ROOT>/ws"}
 --- stderr
 == ["init", "--force"]
 exit: 0

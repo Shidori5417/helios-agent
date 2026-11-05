@@ -159,20 +159,37 @@ fn normalize(text: &str, root: &Path) -> String {
     }
     out.push_str(rest);
     // OS sandbox status in doctor output depends on the kernel environment (e.g. Landlock availability).
-    let mut normalized_sandbox = String::with_capacity(out.len());
+    let mut normalized = String::with_capacity(out.len());
     let mut rest = out.as_str();
     while let Some(index) = rest.find("\"os_sandbox\":") {
         let (head, tail) = rest.split_at(index + "\"os_sandbox\":".len());
-        normalized_sandbox.push_str(head);
+        normalized.push_str(head);
         if let Some(end_quote) = tail.strip_prefix('"').and_then(|t| t.find('"')) {
-            normalized_sandbox.push_str("\"<OS_SANDBOX>\"");
+            normalized.push_str("\"<OS_SANDBOX>\"");
             rest = &tail[1 + end_quote + 1..];
         } else {
             break;
         }
     }
-    normalized_sandbox.push_str(rest);
-    normalized_sandbox
+    normalized.push_str(rest);
+    // rg_available depends on whether ripgrep is installed on the host runner.
+    let mut out_final = String::with_capacity(normalized.len());
+    let mut rest = normalized.as_str();
+    while let Some(index) = rest.find("\"rg_available\":") {
+        let (head, tail) = rest.split_at(index + "\"rg_available\":".len());
+        out_final.push_str(head);
+        if let Some(tail_after_bool) = tail
+            .strip_prefix("true")
+            .or_else(|| tail.strip_prefix("false"))
+        {
+            out_final.push_str("<RG_AVAILABLE>");
+            rest = tail_after_bool;
+        } else {
+            break;
+        }
+    }
+    out_final.push_str(rest);
+    out_final
 }
 
 fn render(corpus: &[&[&str]]) -> String {
