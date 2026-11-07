@@ -239,18 +239,20 @@ impl Composer {
         if query.contains(char::is_whitespace) {
             return Vec::new();
         }
-        let query = query.to_ascii_lowercase();
-        let name =
-            |command: &PaletteCommand| command.name.trim_start_matches('/').to_ascii_lowercase();
-        let mut matches: Vec<&PaletteCommand> = commands
-            .iter()
-            .filter(|command| name(command).starts_with(&query))
-            .collect();
-        matches.extend(commands.iter().filter(|command| {
-            let name = name(command);
-            !name.starts_with(&query) && name.contains(&query)
-        }));
-        matches
+        // Single-pass partitioning with zero allocations for case conversions.
+        // Prefix hits come first, followed by substring hits.
+        let mut prefixes = Vec::new();
+        let mut substrings = Vec::new();
+        for command in commands {
+            let name = command.name.trim_start_matches('/');
+            if starts_with_ignore_ascii_case(name, query) {
+                prefixes.push(command);
+            } else if contains_ignore_ascii_case(name, query) {
+                substrings.push(command);
+            }
+        }
+        prefixes.extend(substrings);
+        prefixes
     }
 
     /// Visible popup window (at most `POPUP_ROWS`) with the selected flag.
@@ -506,6 +508,24 @@ impl Composer {
         }
         self.cursor = position;
     }
+}
+
+pub(crate) fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+pub(crate) fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 fn truncate_at_boundary(value: &str, max: usize) -> &str {
