@@ -159,7 +159,7 @@ fn normalize(text: &str, root: &Path) -> String {
     }
     out.push_str(rest);
 
-    // OS sandbox availability depends on kernel features (Landlock) and varies across environments.
+    // OS sandbox availability depends on kernel features (Landlock ABI) and varies across environments.
     let text = out;
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
