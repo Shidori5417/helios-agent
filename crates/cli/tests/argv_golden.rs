@@ -158,6 +158,24 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
+
+    // OS sandbox availability depends on kernel features (Landlock) and varies across environments.
+    let text = out;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(index) = rest.find("\"os_sandbox\":") {
+        let (head, tail) = rest.split_at(index + "\"os_sandbox\":".len());
+        out.push_str(head);
+        if let Some(after_quote) = tail.strip_prefix('"') {
+            if let Some(end_quote) = after_quote.find('"') {
+                out.push_str("\"<OS_SANDBOX>\"");
+                rest = &after_quote[end_quote + 1..];
+                continue;
+            }
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
     out
 }
 
