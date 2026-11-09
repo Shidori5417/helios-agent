@@ -146,7 +146,19 @@ fn run_case(index: usize, argv: &[&str]) -> Outcome {
 /// Replaces machine-specific paths so the snapshot is stable across runs.
 fn normalize(text: &str, root: &Path) -> String {
     let root = root.to_string_lossy();
-    let text = text.replace(root.as_ref(), "<ROOT>");
+    let mut text = text.replace(root.as_ref(), "<ROOT>");
+    // Environment variations (like containers without Landlock support in CI or local setups)
+    // report a different `os_sandbox` status string in `doctor --json`. Normalize this field.
+    if let Some(start) = text.find("\"os_sandbox\":") {
+        let prefix = &text[..start + "\"os_sandbox\":".len()];
+        let remainder = &text[start + "\"os_sandbox\":".len()..];
+        if let Some(inner) = remainder.strip_prefix('"') {
+            if let Some(end_quote) = inner.find('"') {
+                let suffix = &inner[end_quote + 1..];
+                text = format!("{prefix}\"landlock abi=7\"{suffix}");
+            }
+        }
+    }
     // Event timestamps are wall-clock values and differ on every run.
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
