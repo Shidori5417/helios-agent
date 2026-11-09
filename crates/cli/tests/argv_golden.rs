@@ -146,19 +146,7 @@ fn run_case(index: usize, argv: &[&str]) -> Outcome {
 /// Replaces machine-specific paths so the snapshot is stable across runs.
 fn normalize(text: &str, root: &Path) -> String {
     let root = root.to_string_lossy();
-    let mut text = text.replace(root.as_ref(), "<ROOT>");
-    // Environment variations (like containers without Landlock support in CI or local setups)
-    // report a different `os_sandbox` status string in `doctor --json`. Normalize this field.
-    if let Some(start) = text.find("\"os_sandbox\":") {
-        let prefix = &text[..start + "\"os_sandbox\":".len()];
-        let remainder = &text[start + "\"os_sandbox\":".len()..];
-        if let Some(inner) = remainder.strip_prefix('"') {
-            if let Some(end_quote) = inner.find('"') {
-                let suffix = &inner[end_quote + 1..];
-                text = format!("{prefix}\"landlock abi=7\"{suffix}");
-            }
-        }
-    }
+    let text = text.replace(root.as_ref(), "<ROOT>");
     // Event timestamps are wall-clock values and differ on every run.
     let mut out = String::with_capacity(text.len());
     let mut rest = text.as_str();
@@ -170,7 +158,38 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
-    out
+    // OS sandbox status in doctor output depends on the kernel environment (e.g. Landlock availability).
+    let mut normalized = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(index) = rest.find("\"os_sandbox\":") {
+        let (head, tail) = rest.split_at(index + "\"os_sandbox\":".len());
+        normalized.push_str(head);
+        if let Some(end_quote) = tail.strip_prefix('"').and_then(|t| t.find('"')) {
+            normalized.push_str("\"<OS_SANDBOX>\"");
+            rest = &tail[1 + end_quote + 1..];
+        } else {
+            break;
+        }
+    }
+    normalized.push_str(rest);
+    // rg_available depends on whether ripgrep is installed on the host runner.
+    let mut out_final = String::with_capacity(normalized.len());
+    let mut rest = normalized.as_str();
+    while let Some(index) = rest.find("\"rg_available\":") {
+        let (head, tail) = rest.split_at(index + "\"rg_available\":".len());
+        out_final.push_str(head);
+        if let Some(tail_after_bool) = tail
+            .strip_prefix("true")
+            .or_else(|| tail.strip_prefix("false"))
+        {
+            out_final.push_str("<RG_AVAILABLE>");
+            rest = tail_after_bool;
+        } else {
+            break;
+        }
+    }
+    out_final.push_str(rest);
+    out_final
 }
 
 fn render(corpus: &[&[&str]]) -> String {
@@ -217,9 +236,13 @@ fn argv_surface_matches_golden_snapshot() {
                 expected.lines().count().min(actual.lines().count()),
                 |line| line,
             );
+        let exp_line = expected.lines().nth(first_diff).unwrap_or("<none>");
+        let act_line = actual.lines().nth(first_diff).unwrap_or("<none>");
         panic!(
-            "argv surface changed (first differing line {}). Review, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
-            first_diff + 1
+            "argv surface changed (first differing line {}).\nExpected: {}\nActual:   {}\nReview, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
+            first_diff + 1,
+            exp_line,
+            act_line,
         );
     }
 }
