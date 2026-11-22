@@ -179,7 +179,9 @@ impl ApprovalBroker {
             }
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession) => {
-                    return Ok(request.risk != "high")
+                    // High-risk approvals are honoured for this call only;
+                    // `decide` never records them as session grants.
+                    return Ok(true);
                 }
                 Ok(ApprovalDecision::Deny) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return Ok(false)
@@ -2244,6 +2246,36 @@ echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n
             second.is_err(),
             "different preimage must not inherit approval"
         );
+    }
+
+    #[test]
+    fn approved_high_risk_request_is_allowed_once_and_prompts_again() {
+        let (events, receiver) = mpsc::sync_channel(8);
+        let broker = ApprovalBroker::new(events).with_timeout(Duration::from_secs(5));
+        for decision in [ApprovalDecision::AllowSession, ApprovalDecision::AllowOnce] {
+            let worker = {
+                let broker = broker.clone();
+                std::thread::spawn(move || {
+                    broker.request_approval(
+                        PermissionClass::Process,
+                        "process: echo hi",
+                        &CancellationToken::default(),
+                    )
+                })
+            };
+            let agent_protocol::Event::PermissionRequested(text) =
+                receiver.recv().expect("request")
+            else {
+                panic!("request")
+            };
+            assert!(text.contains("risk=high"));
+            let id = text
+                .split(';')
+                .find_map(|part| part.strip_prefix("id=")?.parse().ok())
+                .unwrap();
+            assert!(broker.decide(id, decision));
+            assert!(worker.join().expect("join").expect("approval"));
+        }
     }
 
     #[test]

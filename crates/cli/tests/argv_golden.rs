@@ -158,6 +158,18 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
+    // The Landlock ABI level depends on the host kernel, not on the CLI surface.
+    let text = out;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text.as_str();
+    while let Some(index) = rest.find("landlock abi=") {
+        let (head, tail) = rest.split_at(index + "landlock abi=".len());
+        out.push_str(head);
+        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+        out.push_str("<N>");
+        rest = &tail[digits..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -201,10 +213,7 @@ fn argv_surface_matches_golden_snapshot() {
             .lines()
             .zip(actual.lines())
             .position(|(left, right)| left != right)
-            .map_or(
-                expected.lines().count().min(actual.lines().count()),
-                |line| line,
-            );
+            .unwrap_or_else(|| expected.lines().count().min(actual.lines().count()));
         panic!(
             "argv surface changed (first differing line {}). Review, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
             first_diff + 1
