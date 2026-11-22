@@ -158,18 +158,26 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
-    // The Landlock ABI level depends on the host kernel, not on the CLI surface.
-    let text = out;
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text.as_str();
-    while let Some(index) = rest.find("landlock abi=") {
-        let (head, tail) = rest.split_at(index + "landlock abi=".len());
-        out.push_str(head);
-        let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
-        out.push_str("<N>");
-        rest = &tail[digits..];
+    // Host-dependent `doctor` probes (kernel sandbox level, installed tools)
+    // say nothing about the CLI surface and differ between machines and CI.
+    let mut text = out;
+    for key in [
+        "os_sandbox",
+        "git_available",
+        "rg_available",
+        "keyring_available",
+    ] {
+        let needle = format!("\"{key}\":");
+        let Some(index) = text.find(&needle) else {
+            continue;
+        };
+        let start = index + needle.len();
+        let end = text[start..]
+            .find([',', '}'])
+            .map_or(text.len(), |offset| start + offset);
+        text.replace_range(start..end, "\"<HOST>\"");
     }
-    out.push_str(rest);
+    let out = text;
     out
 }
 
