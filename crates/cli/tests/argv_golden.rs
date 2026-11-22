@@ -177,8 +177,7 @@ fn normalize(text: &str, root: &Path) -> String {
             .map_or(text.len(), |offset| start + offset);
         text.replace_range(start..end, "\"<HOST>\"");
     }
-    let out = text;
-    out
+    text
 }
 
 fn render(corpus: &[&[&str]]) -> String {
