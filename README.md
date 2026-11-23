@@ -1,6 +1,7 @@
 # Helios
 
 [![CI](https://github.com/Shidori5417/helios-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Shidori5417/helios-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A provider-neutral coding agent for the terminal, written in Rust. It runs a bounded agent loop with permission-checked tools, a ratatui TUI, headless JSON output, durable SQLite sessions and lazy MCP/LSP/plugin extensions. Linux-first (Arch).
 
