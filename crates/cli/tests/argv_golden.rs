@@ -158,7 +158,26 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
-    out
+    // Host-dependent `doctor` probes (kernel sandbox level, installed tools)
+    // say nothing about the CLI surface and differ between machines and CI.
+    let mut text = out;
+    for key in [
+        "os_sandbox",
+        "git_available",
+        "rg_available",
+        "keyring_available",
+    ] {
+        let needle = format!("\"{key}\":");
+        let Some(index) = text.find(&needle) else {
+            continue;
+        };
+        let start = index + needle.len();
+        let end = text[start..]
+            .find([',', '}'])
+            .map_or(text.len(), |offset| start + offset);
+        text.replace_range(start..end, "\"<HOST>\"");
+    }
+    text
 }
 
 fn render(corpus: &[&[&str]]) -> String {
@@ -201,10 +220,7 @@ fn argv_surface_matches_golden_snapshot() {
             .lines()
             .zip(actual.lines())
             .position(|(left, right)| left != right)
-            .map_or(
-                expected.lines().count().min(actual.lines().count()),
-                |line| line,
-            );
+            .unwrap_or_else(|| expected.lines().count().min(actual.lines().count()));
         panic!(
             "argv surface changed (first differing line {}). Review, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
             first_diff + 1
