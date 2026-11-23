@@ -218,12 +218,19 @@ fn truncate(content: &str, tokens: u64, policy: TruncationPolicy) -> String {
     if bytes >= content.len() || policy == TruncationPolicy::None {
         return content.to_owned();
     }
-    let head = bytes / 2;
-    let tail = bytes.saturating_sub(head);
+    let mut head = bytes / 2;
+    while !content.is_char_boundary(head) {
+        head -= 1;
+    }
+    let tail = bytes.saturating_sub(bytes / 2);
+    let mut tail_start = content.len().saturating_sub(tail);
+    while !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
     format!(
         "{}\n...[truncated]...\n{}",
         &content[..head],
-        &content[content.len().saturating_sub(tail)..]
+        &content[tail_start..]
     )
 }
 
@@ -475,5 +482,15 @@ mod tests {
         assert!(summary.contains("- step 19"));
         assert!(summary.contains('…'));
         assert!(summary.len() < 2_000);
+    }
+
+    #[test]
+    fn head_tail_truncation_respects_multibyte_boundaries() {
+        for text in ["€".repeat(100), "çğıöşü İstanbul ".repeat(20)] {
+            for tokens in 0..12 {
+                let out = truncate(&text, tokens, TruncationPolicy::HeadTail);
+                assert!(out.contains("[truncated]"));
+            }
+        }
     }
 }
