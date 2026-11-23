@@ -850,54 +850,28 @@ impl ToolRegistry {
             let Some(content) = read_searchable(&file) else {
                 continue;
             };
-            // Performance optimization: fast-path check whole file before line-by-line scanning.
-            // In typical repositories, >95% of searched files do not match the query.
-            // Performing a file-level contains check skips line iteration and allocations.
-            // For case-insensitive search, lowercasing the whole file once rather than per-line
-            // avoids allocating a new String for every line (~6-7x overall speedup).
-            if ignore_case {
-                let content_lower = content.to_lowercase();
-                if !content_lower.contains(&needle) {
+            // Lowercase the whole file once (not once per line) and skip files
+            // without any hit before walking lines.
+            let lowered = ignore_case.then(|| content.to_lowercase());
+            let haystack = lowered.as_deref().unwrap_or(&content);
+            if !haystack.contains(&needle) {
+                continue;
+            }
+            for (index, (text, searched)) in content.lines().zip(haystack.lines()).enumerate() {
+                if !searched.contains(&needle) {
                     continue;
                 }
-                for (index, (text, text_lower)) in
-                    content.lines().zip(content_lower.lines()).enumerate()
-                {
-                    if !text_lower.contains(&needle) {
-                        continue;
-                    }
-                    let line = format!(
-                        "{relative}:{}:{}\n",
-                        index + 1,
-                        cap_chars(text, MAX_SEARCH_LINE_CHARS)
-                    );
-                    if results >= max_results || out.len() + line.len() > self.output_budget {
-                        limit_hit = true;
-                        break 'files;
-                    }
-                    out.push_str(&line);
-                    results += 1;
+                let line = format!(
+                    "{relative}:{}:{}\n",
+                    index + 1,
+                    cap_chars(text, MAX_SEARCH_LINE_CHARS)
+                );
+                if results >= max_results || out.len() + line.len() > self.output_budget {
+                    limit_hit = true;
+                    break 'files;
                 }
-            } else {
-                if !content.contains(&needle) {
-                    continue;
-                }
-                for (index, text) in content.lines().enumerate() {
-                    if !text.contains(&needle) {
-                        continue;
-                    }
-                    let line = format!(
-                        "{relative}:{}:{}\n",
-                        index + 1,
-                        cap_chars(text, MAX_SEARCH_LINE_CHARS)
-                    );
-                    if results >= max_results || out.len() + line.len() > self.output_budget {
-                        limit_hit = true;
-                        break 'files;
-                    }
-                    out.push_str(&line);
-                    results += 1;
-                }
+                out.push_str(&line);
+                results += 1;
             }
         }
         if limit_hit {
