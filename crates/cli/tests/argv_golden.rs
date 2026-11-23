@@ -158,38 +158,26 @@ fn normalize(text: &str, root: &Path) -> String {
         rest = &tail[digits..];
     }
     out.push_str(rest);
-    // OS sandbox status in doctor output depends on the kernel environment (e.g. Landlock availability).
-    let mut normalized = String::with_capacity(out.len());
-    let mut rest = out.as_str();
-    while let Some(index) = rest.find("\"os_sandbox\":") {
-        let (head, tail) = rest.split_at(index + "\"os_sandbox\":".len());
-        normalized.push_str(head);
-        if let Some(end_quote) = tail.strip_prefix('"').and_then(|t| t.find('"')) {
-            normalized.push_str("\"<OS_SANDBOX>\"");
-            rest = &tail[1 + end_quote + 1..];
-        } else {
-            break;
-        }
+    // Host-dependent `doctor` probes (kernel sandbox level, installed tools)
+    // say nothing about the CLI surface and differ between machines and CI.
+    let mut text = out;
+    for key in [
+        "os_sandbox",
+        "git_available",
+        "rg_available",
+        "keyring_available",
+    ] {
+        let needle = format!("\"{key}\":");
+        let Some(index) = text.find(&needle) else {
+            continue;
+        };
+        let start = index + needle.len();
+        let end = text[start..]
+            .find([',', '}'])
+            .map_or(text.len(), |offset| start + offset);
+        text.replace_range(start..end, "\"<HOST>\"");
     }
-    normalized.push_str(rest);
-    // rg_available depends on whether ripgrep is installed on the host runner.
-    let mut out_final = String::with_capacity(normalized.len());
-    let mut rest = normalized.as_str();
-    while let Some(index) = rest.find("\"rg_available\":") {
-        let (head, tail) = rest.split_at(index + "\"rg_available\":".len());
-        out_final.push_str(head);
-        if let Some(tail_after_bool) = tail
-            .strip_prefix("true")
-            .or_else(|| tail.strip_prefix("false"))
-        {
-            out_final.push_str("<RG_AVAILABLE>");
-            rest = tail_after_bool;
-        } else {
-            break;
-        }
-    }
-    out_final.push_str(rest);
-    out_final
+    text
 }
 
 fn render(corpus: &[&[&str]]) -> String {
@@ -232,17 +220,10 @@ fn argv_surface_matches_golden_snapshot() {
             .lines()
             .zip(actual.lines())
             .position(|(left, right)| left != right)
-            .map_or(
-                expected.lines().count().min(actual.lines().count()),
-                |line| line,
-            );
-        let exp_line = expected.lines().nth(first_diff).unwrap_or("<none>");
-        let act_line = actual.lines().nth(first_diff).unwrap_or("<none>");
+            .unwrap_or_else(|| expected.lines().count().min(actual.lines().count()));
         panic!(
-            "argv surface changed (first differing line {}).\nExpected: {}\nActual:   {}\nReview, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
-            first_diff + 1,
-            exp_line,
-            act_line,
+            "argv surface changed (first differing line {}). Review, then regenerate with HELIOS_UPDATE_GOLDEN=1 if intended.",
+            first_diff + 1
         );
     }
 }
