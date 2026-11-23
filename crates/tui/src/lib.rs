@@ -4,6 +4,7 @@ mod mention;
 pub mod status;
 
 pub use assist::ReverseSearch;
+use composer::contains_ignore_ascii_case;
 pub use composer::{Composer, ComposerAction};
 
 use agent_protocol::Event;
@@ -750,14 +751,14 @@ impl TuiModel {
         let Some(overlay) = &self.overlay else {
             return Vec::new();
         };
-        let query = overlay.query.to_ascii_lowercase();
+        let query = &overlay.query;
         overlay
             .commands
             .iter()
             .filter(|command| {
                 query.is_empty()
-                    || command.name.to_ascii_lowercase().contains(&query)
-                    || command.description.to_ascii_lowercase().contains(&query)
+                    || contains_ignore_ascii_case(&command.name, query)
+                    || contains_ignore_ascii_case(&command.description, query)
             })
             .collect()
     }
@@ -902,14 +903,14 @@ impl TuiModel {
             }
         }
         if overlay.kind == OverlayKind::Checkpoints && key.code == KeyCode::Char('p') {
-            let query = overlay.query.to_ascii_lowercase();
+            let query = &overlay.query;
             if let Some(command) = overlay
                 .commands
                 .iter()
                 .filter(|command| {
                     query.is_empty()
-                        || command.name.to_ascii_lowercase().contains(&query)
-                        || command.description.to_ascii_lowercase().contains(&query)
+                        || contains_ignore_ascii_case(&command.name, query)
+                        || contains_ignore_ascii_case(&command.description, query)
                 })
                 .nth(overlay.selected)
             {
@@ -943,14 +944,14 @@ impl TuiModel {
                 overlay.selected = overlay.selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Tab => {
-                let query = overlay.query.to_ascii_lowercase();
+                let query = &overlay.query;
                 let count = overlay
                     .commands
                     .iter()
                     .filter(|command| {
                         query.is_empty()
-                            || command.name.to_ascii_lowercase().contains(&query)
-                            || command.description.to_ascii_lowercase().contains(&query)
+                            || contains_ignore_ascii_case(&command.name, query)
+                            || contains_ignore_ascii_case(&command.description, query)
                     })
                     .count();
                 if count > 0 {
@@ -966,14 +967,14 @@ impl TuiModel {
                 overlay.selected = 0;
             }
             KeyCode::Enter => {
-                let query = overlay.query.to_ascii_lowercase();
+                let query = &overlay.query;
                 let selected = overlay
                     .commands
                     .iter()
                     .filter(|command| {
                         query.is_empty()
-                            || command.name.to_ascii_lowercase().contains(&query)
-                            || command.description.to_ascii_lowercase().contains(&query)
+                            || contains_ignore_ascii_case(&command.name, query)
+                            || contains_ignore_ascii_case(&command.description, query)
                     })
                     .nth(overlay.selected)
                     .cloned();
