@@ -850,13 +850,15 @@ impl ToolRegistry {
             let Some(content) = read_searchable(&file) else {
                 continue;
             };
-            for (index, text) in content.lines().enumerate() {
-                let hit = if ignore_case {
-                    text.to_lowercase().contains(&needle)
-                } else {
-                    text.contains(&needle)
-                };
-                if !hit {
+            // Lowercase the whole file once (not once per line) and skip files
+            // without any hit before walking lines.
+            let lowered = ignore_case.then(|| content.to_lowercase());
+            let haystack = lowered.as_deref().unwrap_or(&content);
+            if !haystack.contains(&needle) {
+                continue;
+            }
+            for (index, (text, searched)) in content.lines().zip(haystack.lines()).enumerate() {
+                if !searched.contains(&needle) {
                     continue;
                 }
                 let line = format!(
@@ -1981,6 +1983,23 @@ echo 'E   AssertionError: expected 2'\necho '=== 1 failed in 0.1s ==='\nexit 1\n
         )
         .expect("search");
         assert_eq!(filtered.data.trim(), "docs/b.md:1:match here");
+
+        // Verify non-matching file is skipped and multiple matches in a file are correctly reported
+        let multiline = run_tool(
+            &registry,
+            "search_files",
+            json!({"query": "here", "path": "docs/b.md"}),
+        )
+        .expect("search");
+        assert_eq!(multiline.data.trim(), "docs/b.md:1:match here");
+
+        let non_matching = run_tool(
+            &registry,
+            "search_files",
+            json!({"query": "nonexistent_term"}),
+        )
+        .expect("search");
+        assert_eq!(non_matching.data.trim(), "");
     }
 
     #[test]
