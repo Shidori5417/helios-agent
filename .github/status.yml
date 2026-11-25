@@ -1,0 +1,7 @@
+# Read by github.com/Shidori5417 (profile README) and the portfolio site.
+# Edit when the project's state changes; no need to touch it otherwise.
+# status: active | prototype | released | maintenance | paused | archived
+status: active
+focus:
+  en: "Fixed high-risk tool approval and a UTF-8 truncation panic; faster file search."
+  tr: "Yüksek riskli araç onayı ve UTF-8 kırpma hatası düzeltildi; dosya araması hızlandı."
