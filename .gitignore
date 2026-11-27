@@ -19,9 +19,16 @@
 *.p12
 *.pfx
 *.secret
-*credentials*
-*secret*
-*token*
+# Match secret *files*, not source files such as src/token.rs or src/secrets.rs.
+credentials.json
+credentials.*.json
+secrets.json
+secrets.*.json
+secrets.toml
+secrets.yaml
+secrets.yml
+*.token
+.token
 
 # Local benchmark/performance output
 perf-report*.json

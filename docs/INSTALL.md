@@ -2,7 +2,8 @@
 
 ## Source build
 
-Install the Arch development packages from `docs/13_ARCH_LINUX.md`, then run:
+There is no tagged release or published binary yet (the GitHub Releases page
+is empty), so building from source is the supported install path. Install the Arch development packages from `docs/13_ARCH_LINUX.md`, then run:
 
 ```sh
 cargo build --release --locked
@@ -35,9 +36,13 @@ install -Dm755 target/release/agent-cli ~/.local/bin/agent-cli
 
 ## Verify a release artifact
 
-Release artifacts include `SHA256SUMS`, an SPDX JSON SBOM, and a Sigstore
-keyless bundle. Verify the checksum first, then verify the bundle with the
-OIDC issuer used by GitHub Actions:
+No GitHub Release has been published yet, so there is nothing public to verify
+today. The manual `Release` workflow (`.github/workflows/release.yml`, run with
+`workflow_dispatch` and a tag or ref) builds the Linux x86_64 binary and uploads
+`SHA256SUMS`, an SPDX JSON SBOM, and a Sigstore keyless bundle as a **workflow
+run artifact** named `helios-linux-x86_64`; it does not create a GitHub Release.
+Download that artifact from the Actions run, verify the checksum first, then
+verify the bundle with the OIDC issuer used by GitHub Actions:
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -59,10 +64,11 @@ replacing the SHA and comment together. Workflow tokens default to
 ## Arch package
 
 Copy `packaging/arch/PKGBUILD` to a clean build directory and run `makepkg -si`.
-The current private-repository package uses a Git source with Arch's explicit
-`SKIP` VCS checksum convention; configure Git credentials before building. For
-a future tagged archive, replace the source with the downloaded release tarball
-and record its independently verified SHA-256 before distributing the package.
+The package builds the current `main` branch from a Git source with Arch's
+explicit `SKIP` VCS checksum convention, so `pkgver` (`0.1.0`) is the version
+recorded in `Cargo.toml`, not a tag. Once a tagged release exists, replace the
+source with the downloaded release tarball and record its independently
+verified SHA-256 before distributing the package.
 The template never pipes network content into a shell and uses Cargo's locked
 dependency set.
 

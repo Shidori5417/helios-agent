@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+> No git tag or GitHub Release exists yet. `0.1.0` below is the version recorded
+> in `Cargo.toml` (and `packaging/arch/PKGBUILD`); the entries under Unreleased
+> landed after the date given for it.
+
 - `helios mcp login <id>` and `helios mcp logout <id>`: interactive OAuth login
   (authorization code with PKCE) for HTTP MCP servers. The access token is kept
   in the system keyring, requests carry it as a Bearer token, and an expired or
