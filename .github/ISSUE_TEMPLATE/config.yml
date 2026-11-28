@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Shidori5417/helios-agent/blob/main/SECURITY.md
+    about: Please do not file security issues publicly; follow the instructions in SECURITY.md.

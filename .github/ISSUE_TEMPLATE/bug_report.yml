@@ -1,0 +1,26 @@
+name: Bug report
+description: Something in Helios Agent does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For security issues do **not** open a public issue; see [SECURITY.md](https://github.com/Shidori5417/helios-agent/blob/main/SECURITY.md).
+        Never paste API keys, keyring values, cookies or private keys.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: The exact command, what you expected and what you got (non-secret stderr only).
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`helios doctor --json` output"
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: "git commit SHA or `helios --version`"

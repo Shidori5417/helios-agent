@@ -20,7 +20,7 @@ A provider-neutral coding agent for the terminal, written in Rust. It runs a bou
 
 ## Install
 
-Requires a Rust stable toolchain (and `ripgrep`, `git`).
+Requires a Rust stable toolchain (and `ripgrep`, `git`). There is no tagged release or prebuilt binary yet, so install from source.
 
 ```bash
 cargo build --release --locked
@@ -62,7 +62,7 @@ cargo run -p agent-evals --bin agent-eval -- --report /tmp/agent-eval-report.jso
 
 ## Docs
 
-The original design blueprint (product spec, architecture, threat model, roadmap) is kept in [docs/BLUEPRINT.md](docs/BLUEPRINT.md) with the numbered documents in `docs/`. Release history: [CHANGELOG.md](CHANGELOG.md).
+The original design blueprint (product spec, architecture, threat model, roadmap) is kept in [docs/BLUEPRINT.md](docs/BLUEPRINT.md) with the numbered documents in `docs/`. Release history: [CHANGELOG.md](CHANGELOG.md). Support and issue reporting: [docs/SUPPORT.md](docs/SUPPORT.md). Security reports: [SECURITY.md](SECURITY.md). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
